@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-
-def parse_int(value: str) -> int:
-    return int(value, 0)
+from release_catalog import APPLICATIONS, BOARDS, ROOT
+from release_identity import firmware_version, source_identity
+from release_images import verify_component
 
 
 def image_size(path: Path) -> int:
@@ -19,30 +19,31 @@ def image_size(path: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device", required=True, choices=BOARDS)
     parser.add_argument("--launcher", required=True, type=Path)
-    parser.add_argument("--launcher-slot-size", default="0x100000", type=parse_int)
     parser.add_argument("--standalone", required=True, type=Path)
-    parser.add_argument("--standalone-slot-size", default="0x400000", type=parse_int)
     parser.add_argument("--rnode", required=True, type=Path)
-    parser.add_argument("--rnode-slot-size", default="0x300000", type=parse_int)
     args = parser.parse_args()
 
     failed = False
-    checks = (
-        ("Launcher", args.launcher, args.launcher_slot_size),
-        ("Standalone", args.standalone, args.standalone_slot_size),
-        ("RNode", args.rnode, args.rnode_slot_size),
-    )
+    revision, dirty = source_identity(ROOT)
+    version = firmware_version(ROOT)
+    partitions = BOARDS[args.device].partitions()
+    checks = ((name, getattr(args, name), partitions[name].size)
+              for name in ("launcher", *APPLICATIONS))
 
     for name, path, slot_size in checks:
         size = image_size(path)
         margin = slot_size - size
         print(f"{name}: {size} bytes, slot {slot_size} bytes, margin {margin} bytes")
-        if margin < 0:
+        try:
+            verify_component(path.read_bytes(), args.device, name, version, revision, dirty, slot_size)
+        except ValueError as error:
+            print(f"error: {error}")
             failed = True
 
     if failed:
-        print("error: at least one image is too large for its OTA slot")
+        print("error: at least one application is invalid or exceeds its OTA slot")
         return 1
 
     return 0

@@ -1,6 +1,9 @@
 use super::*;
 use core::ffi::CStr;
 
+#[path = "tx_lifetime_tests.rs"]
+mod tx_lifetime;
+
 #[test]
 fn version_is_valid_cstring() {
     let p = rs_handheld_rns_version();
@@ -777,6 +780,7 @@ fn placement_writer_covers_every_lite_field() {
     let node = Tiny::new_const(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID);
     let LiteNode {
         config: _,
+        clock_ms: _,
         transport_id: _,
         own_destinations: _,
         announce_admission: _,
@@ -789,14 +793,34 @@ fn placement_writer_covers_every_lite_field() {
         links,
         request_tags,
         outbound,
+        last_delivery_identity: _,
+        retained_owner_mode: _,
+        discoveries,
+        interface_facts: _,
         stats: _,
     } = node;
+    let rns_lite_core::discovery::Discoveries {
+        entries: _,
+        last_identity: _,
+    } = discoveries;
     let PacketHashTable { entries: _ } = packet_hashes;
-    let PathTable { entries: _ } = paths;
+    let PathTable {
+        entries: _,
+        generations: _,
+        last_generation: _,
+    } = paths;
     let AnnounceCache { entries: _ } = announce_cache;
     let AnnounceSchedule { entries: _ } = announce_schedule;
-    let ReverseTable { entries: _ } = reverse;
-    let LinkTable { entries: _ } = links;
+    let ReverseTable {
+        entries: _,
+        generations: _,
+        last_generation: _,
+    } = reverse;
+    let LinkTable {
+        entries: _,
+        generations: _,
+        last_generation: _,
+    } = links;
     let RequestTagTable { entries: _ } = request_tags;
     let Queue {
         entries: _,
@@ -2622,7 +2646,8 @@ fn link_register_routes_link_frame_local() {
     let ctx = loaded_ctx();
     let _node = open_transport_into(ctx, 0);
     let link_id = [0x5A; 16];
-    // Distinct payload per call so the transport hashlist doesn't dedup identical frames.
+    // Unknown Links retain normal transport hash dedup. Registered endpoint
+    // Links defer it until their owner checks interface and authentication.
     let frame = |tag: u8| -> Vec<u8> {
         let mut v = Vec::new();
         v.push(0x0C); // flags: Data, Header1, Broadcast, Link(0b11<<2), ctx 0
@@ -2666,6 +2691,26 @@ fn link_register_routes_link_frame_local() {
     assert_eq!(action2, INGEST_LOCAL_FRAME);
     assert_eq!(local2.destination_hash, link_id);
 
+    for interface in [0, 1, 1] {
+        let raw = frame(2);
+        assert_eq!(
+            unsafe {
+                rs_handheld_rns_packet_ingest(
+                    ctx,
+                    raw.as_ptr(),
+                    raw.len(),
+                    interface,
+                    2000,
+                    &mut action2,
+                    core::ptr::null_mut(),
+                    &mut local2,
+                )
+            },
+            RsHandheldStatus::Ok
+        );
+        assert_eq!(action2, INGEST_LOCAL_FRAME);
+    }
+
     // After unregister, back to non-local.
     assert_eq!(
         unsafe { rs_handheld_rns_link_unregister(ctx, &link_id) },
@@ -2678,6 +2723,22 @@ fn link_register_routes_link_frame_local() {
         RsHandheldStatus::Ok
     );
     assert_ne!(action3, INGEST_LOCAL_FRAME);
+    assert_eq!(
+        call(ctx, &frame(3), &mut action3, &mut local3),
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(action3, 1); // Duplicate after unregister
+    // Re-registering restores endpoint ownership even for a previously hashed
+    // frame. The application owner still authenticates and deduplicates it.
+    assert_eq!(
+        unsafe { rs_handheld_rns_link_register(ctx, &link_id) },
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(
+        call(ctx, &frame(3), &mut action3, &mut local3),
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(action3, INGEST_LOCAL_FRAME);
     unsafe { rs_handheld_rns_shutdown(ctx) };
 }
 
@@ -3559,4 +3620,224 @@ fn freshness_rejected_announce_surfaces_no_event_and_changes_no_peer_state() {
     unsafe { rs_handheld_rns_shutdown(learner) };
     unsafe { rs_handheld_rns_shutdown(fresh_peer) };
     unsafe { rs_handheld_rns_shutdown(stale_peer) };
+}
+
+#[test]
+fn retained_outbound_capacity_exclusive_mode_and_partial_transfer() {
+    let ctx = loaded_ctx();
+    let _node = open_transport_into(ctx, 1);
+    let dest = [0x31; 16];
+    let tag = [0x42; 16];
+    assert_eq!(
+        unsafe { rs_handheld_rns_request_path(ctx, &dest, &tag, 0, 1000) },
+        RsHandheldStatus::Ok
+    );
+    let mut raw = [0u8; 600];
+    let mut len = 999;
+    let mut identity = 0;
+    let mut targets = 0;
+    let mut generations = [11u32, 12, 0, 0, 0, 0, 0];
+    let mut token = [0; 104];
+    let select = |capacity,
+                  transfer,
+                  raw: &mut [u8; 600],
+                  len: &mut usize,
+                  identity: &mut u64,
+                  targets: &mut u8,
+                  generations: &mut [u32; 7],
+                  token: &mut [u8; 104]| unsafe {
+        rs_handheld_rns_outbound_select(
+            ctx,
+            0,
+            0,
+            generations,
+            transfer,
+            raw.as_mut_ptr(),
+            capacity,
+            len,
+            identity,
+            targets,
+            generations,
+            token,
+        )
+    };
+    assert_eq!(
+        select(
+            8,
+            0,
+            &mut raw,
+            &mut len,
+            &mut identity,
+            &mut targets,
+            &mut generations,
+            &mut token
+        ),
+        RsHandheldStatus::ErrCapacity
+    );
+    assert_eq!(len, 0);
+    assert_eq!(identity, 0);
+    assert_eq!(
+        select(
+            600,
+            0,
+            &mut raw,
+            &mut len,
+            &mut identity,
+            &mut targets,
+            &mut generations,
+            &mut token
+        ),
+        RsHandheldStatus::Ok
+    );
+    assert!(len > 0 && identity != 0);
+    assert_eq!(targets, 3);
+    let original = raw;
+    let original_len = len;
+    let original_token = token;
+    let original_identity = identity;
+    let mut iface = 0;
+    let mut reason = 0;
+    assert_eq!(
+        unsafe {
+            rs_handheld_rns_poll_outbound(
+                ctx,
+                raw.as_mut_ptr(),
+                600,
+                &mut len,
+                &mut iface,
+                &mut reason,
+            )
+        },
+        RsHandheldStatus::ErrNotReady
+    );
+    assert_eq!(
+        unsafe {
+            rs_handheld_rns_poll_outbound_leased(
+                ctx,
+                raw.as_mut_ptr(),
+                600,
+                &mut len,
+                &mut iface,
+                &mut reason,
+                &mut token,
+            )
+        },
+        RsHandheldStatus::ErrNotReady
+    );
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_ack(ctx, identity, 2) },
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(
+        select(
+            600,
+            1,
+            &mut raw,
+            &mut len,
+            &mut identity,
+            &mut targets,
+            &mut generations,
+            &mut token
+        ),
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(identity, original_identity);
+    assert_eq!(targets, 1);
+    assert_eq!(token, original_token);
+    assert_eq!(&raw[..len], &original[..original_len]);
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_ack(ctx, identity, 1) },
+        RsHandheldStatus::ErrRetry
+    );
+    assert_eq!(
+        select(
+            600,
+            0,
+            &mut raw,
+            &mut len,
+            &mut identity,
+            &mut targets,
+            &mut generations,
+            &mut token
+        ),
+        RsHandheldStatus::Ok
+    );
+    assert_eq!((len, identity, targets), (0, 0, 0));
+    unsafe { rs_handheld_rns_shutdown(ctx) };
+}
+
+#[test]
+fn retained_outbound_ffi_retirement_and_invalid_transfer_do_not_consume() {
+    let ctx = loaded_ctx();
+    let _node = open_transport_into(ctx, 1);
+    let dest = [0x31; 16];
+    let tag = [0x42; 16];
+    assert_eq!(
+        unsafe { rs_handheld_rns_request_path(ctx, &dest, &tag, 0, 1000) },
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_retire_interface(ctx, 1) },
+        RsHandheldStatus::Ok
+    );
+    let mut raw = [0; 600];
+    let mut len = 0;
+    let mut identity = 0;
+    let mut targets = 0;
+    let generations = [11, 99, 0, 0, 0, 0, 0];
+    let mut output_generations = [0; 7];
+    let mut token = [0; 104];
+    assert_eq!(
+        unsafe {
+            rs_handheld_rns_outbound_select(
+                ctx,
+                1,
+                0,
+                &generations,
+                1,
+                raw.as_mut_ptr(),
+                600,
+                &mut len,
+                &mut identity,
+                &mut targets,
+                &mut output_generations,
+                &mut token,
+            )
+        },
+        RsHandheldStatus::ErrInvalidArg
+    );
+    assert_eq!(
+        unsafe {
+            rs_handheld_rns_outbound_select(
+                ctx,
+                0,
+                0,
+                &generations,
+                0,
+                raw.as_mut_ptr(),
+                600,
+                &mut len,
+                &mut identity,
+                &mut targets,
+                &mut output_generations,
+                &mut token,
+            )
+        },
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(targets, 1);
+    assert_ne!(identity, 0);
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_ack(ctx, identity, 0x80) },
+        RsHandheldStatus::ErrInvalidArg
+    );
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_ack(ctx, identity, 1) },
+        RsHandheldStatus::Ok
+    );
+    assert_eq!(
+        unsafe { rs_handheld_rns_outbound_retire_interface(ctx, 7) },
+        RsHandheldStatus::ErrInvalidArg
+    );
+    unsafe { rs_handheld_rns_shutdown(ctx) };
 }

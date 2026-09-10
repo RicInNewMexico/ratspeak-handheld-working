@@ -2,625 +2,419 @@
 #include "Theme.h"
 #include "LvTheme.h"
 #include "LvInput.h"
-#include "UIManager.h"
 #include "LxmFaceAvatar.h"
-#include <Arduino.h>
-#include <time.h>
-#include <algorithm>
 #include "fonts/fonts.h"
+#include "reticulum/MessageStatusDetail.h"
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <ctime>
+#include <limits>
 
 namespace {
-
-constexpr int kRowH = 58;
-constexpr int kRailW = 5;
-constexpr int kChatAvatar = 32;
-constexpr int kChatTextX = 54;
-constexpr int kEmptyW = 272;
-constexpr int kEmptyH = 104;
-bool isPendingStatus(LXMFStatus status) {
-    return status == LXMFStatus::QUEUED || status == LXMFStatus::SENDING;
+constexpr int RowHeight = 70;
+constexpr int AvatarSize = 32;
+constexpr int TextX = 54;
+void peerText(const uint8_t* peer, char (&out)[33]) {
+    constexpr char hex[] = "0123456789abcdef";
+    for (size_t i=0;i<16;++i) { out[2*i]=hex[peer[i]>>4]; out[2*i+1]=hex[peer[i]&15]; }
+    out[32]=0;
 }
-
-uint32_t statusColor(LXMFStatus status) {
-    switch (status) {
-        case LXMFStatus::DELIVERED: return Theme::SUCCESS;
-        case LXMFStatus::SENT:      return Theme::TEXT_MUTED;
-        case LXMFStatus::FAILED:    return Theme::ERROR_CLR;
-        case LXMFStatus::QUEUED:
-        case LXMFStatus::SENDING:   return Theme::WARNING_CLR;
-        default:                    return Theme::TEXT_MUTED;
+const char* statusText(uint8_t status) {
+    switch (static_cast<LXMFStatus>(status)) {
+        case LXMFStatus::QUEUED: return "QUEUED";
+        case LXMFStatus::SENDING: return "SENDING";
+        case LXMFStatus::SENT: return "SENT";
+        case LXMFStatus::DELIVERED: return "DELIVERED";
+        case LXMFStatus::FAILED: return "FAILED";
+        case LXMFStatus::UNCONFIRMED: return "UNCONFIRMED";
+        default: return "";
     }
 }
-
-const char* statusLabel(LXMFStatus status) {
-    switch (status) {
-        case LXMFStatus::DELIVERED: return "SENT";
-        case LXMFStatus::SENT:      return "SENT";
-        case LXMFStatus::FAILED:    return "FAILED";
-        case LXMFStatus::SENDING:   return "SENDING";
-        case LXMFStatus::QUEUED:    return "QUEUED";
-        default:                    return "";
-    }
+lv_obj_t* label(lv_obj_t* parent, const lv_font_t* font, uint32_t color, int x, int y, int width) {
+    auto* result=lv_label_create(parent);
+    lv_obj_set_style_text_font(result,font,0);
+    lv_obj_set_style_text_color(result,lv_color_hex(color),0);
+    lv_obj_set_pos(result,x,y);lv_obj_set_width(result,width);
+    lv_label_set_long_mode(result,LV_LABEL_LONG_CLIP);
+    return result;
+}
 }
 
-std::string shortText(const std::string& text, size_t maxLen) {
-    if (text.size() <= maxLen) return text;
-    if (maxLen <= 3) return text.substr(0, maxLen);
-    return text.substr(0, maxLen - 3) + "...";
+bool LvMessagesScreen::bound() const {
+    if (!_active || !_screen || !_service) return false;
+    const auto& window=_service->conversationWindow();
+    return window.visible() && window.statusReady() && _boundRevision==window.revision() &&
+        _boundIdentity==window.identityGeneration() && _boundIdentity==_service->status().generation;
 }
-
-std::string chatPreviewText(const std::string& text, size_t maxLen) {
-    if (text.empty()) return text;
-
-    std::string firstLine;
-    firstLine.reserve(std::min(text.size(), maxLen));
-    bool truncated = false;
-    for (char c : text) {
-        if (c == '\r' || c == '\n') {
-            truncated = true;
-            break;
-        }
-        firstLine += (c == '\t') ? ' ' : c;
-    }
-
-    while (!firstLine.empty() && firstLine.back() == ' ') {
-        firstLine.pop_back();
-    }
-
-    if (firstLine.size() > maxLen) {
-        firstLine = shortText(firstLine, maxLen);
-    } else if (truncated && firstLine.size() + 3 <= maxLen) {
-        firstLine += "...";
-    } else if (truncated && firstLine.size() > 3) {
-        firstLine = firstLine.substr(0, maxLen - 3) + "...";
-    }
-
-    return firstLine;
+void LvMessagesScreen::notice(const char* text) {
+    if (_ui) _ui->lvStatusBar().showToast(text,1500);
 }
-
-std::string displayNameForPeer(handheld::NodeView* am, const std::string& peerHex) {
-    if (am) {
-        std::string peerName = am->lookupName(peerHex);
-        if (!peerName.empty()) return shortText(peerName, 18);
-    }
-    return shortText(peerHex, 12);
-}
-
-bool formatClock(double ts, char* out, size_t outLen) {
-    if (!out || outLen == 0 || ts <= 1700000000) return false;
-    time_t t = (time_t)ts;
-    struct tm converted;
-    struct tm* tm = localtime_r(&t, &converted);
-    if (!tm) return false;
-    snprintf(out, outLen, "%02d:%02d", tm->tm_hour, tm->tm_min);
-    return true;
-}
-
-}  // namespace
-
 void LvMessagesScreen::createUI(lv_obj_t* parent) {
-    _screen = parent;
-    lv_obj_set_layout(parent, 0);
-    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_scroll_to_x(parent, 0, LV_ANIM_OFF);
-    lv_obj_scroll_to_y(parent, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(parent, lv_color_hex(Theme::BG), 0);
-    lv_obj_set_style_pad_all(parent, 0, 0);
-
-    _lblEmpty = lv_obj_create(parent);
-    lv_obj_set_size(_lblEmpty, kEmptyW, kEmptyH);
-    lv_obj_set_style_bg_color(_lblEmpty, lv_color_hex(Theme::BG_ELEVATED), 0);
-    lv_obj_set_style_bg_opa(_lblEmpty, LV_OPA_80, 0);
-    lv_obj_set_style_border_color(_lblEmpty, lv_color_hex(Theme::BORDER), 0);
-    lv_obj_set_style_border_width(_lblEmpty, 1, 0);
-    lv_obj_set_style_radius(_lblEmpty, 6, 0);
-    lv_obj_set_style_pad_all(_lblEmpty, 0, 0);
-    lv_obj_clear_flag(_lblEmpty, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_center(_lblEmpty);
-
-    lv_obj_t* emptyIcon = lv_label_create(_lblEmpty);
-    lv_obj_set_style_text_font(emptyIcon, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(emptyIcon, lv_color_hex(Theme::PRIMARY), 0);
-    lv_label_set_text(emptyIcon, LV_SYMBOL_ENVELOPE);
-    lv_obj_align(emptyIcon, LV_ALIGN_TOP_MID, 0, 15);
-
-    lv_obj_t* emptyTitle = lv_label_create(_lblEmpty);
-    lv_obj_set_style_text_font(emptyTitle, &lv_font_rsdeck_14, 0);
-    lv_obj_set_style_text_color(emptyTitle, lv_color_hex(Theme::TEXT_PRIMARY), 0);
-    lv_label_set_text(emptyTitle, "No conversations");
-    lv_obj_align(emptyTitle, LV_ALIGN_TOP_MID, 0, 34);
-
-    lv_obj_t* emptySub = lv_label_create(_lblEmpty);
-    lv_obj_set_style_text_font(emptySub, &lv_font_rsdeck_12, 0);
-    lv_obj_set_style_text_color(emptySub, lv_color_hex(Theme::TEXT_SECONDARY), 0);
-    lv_label_set_text(emptySub, "LXMF inbox is clear");
-    lv_obj_align(emptySub, LV_ALIGN_TOP_MID, 0, 56);
-
-    lv_obj_t* emptyLine = lv_obj_create(_lblEmpty);
-    lv_obj_set_size(emptyLine, 160, 1);
-    lv_obj_set_style_bg_color(emptyLine, lv_color_hex(Theme::DIVIDER), 0);
-    lv_obj_set_style_bg_opa(emptyLine, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(emptyLine, 0, 0);
-    lv_obj_align(emptyLine, LV_ALIGN_BOTTOM_MID, 0, -18);
-
-    _list = lv_obj_create(parent);
-    lv_obj_set_size(_list, lv_pct(100), lv_pct(100));
-    lv_obj_add_style(_list, LvTheme::styleList(), 0);
-    lv_obj_add_style(_list, LvTheme::styleScrollbar(), LV_PART_SCROLLBAR);
-    lv_obj_set_layout(_list, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(_list, LV_FLEX_FLOW_COLUMN);
-
-    _lastConvCount = -1;
+    _screen=parent;
+    lv_obj_set_layout(parent,0);lv_obj_clear_flag(parent,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(parent,0,0);lv_obj_set_style_bg_color(parent,lv_color_hex(Theme::BG),0);
+    _caption=label(parent,&lv_font_rsdeck_10,Theme::TEXT_SECONDARY,8,2,Theme::CONTENT_W-16);
+    _list=lv_obj_create(parent);
+    lv_obj_set_pos(_list,0,19);lv_obj_set_size(_list,Theme::CONTENT_W,Theme::CONTENT_H-51);
+    lv_obj_add_style(_list,LvTheme::styleList(),0);
+    lv_obj_add_style(_list,LvTheme::styleScrollbar(),LV_PART_SCROLLBAR);
+    lv_obj_set_layout(_list,LV_LAYOUT_FLEX);lv_obj_set_flex_flow(_list,LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_event_cb(_list,[](lv_event_t* event) {
+        auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+        // Programmatic layout/restore must never turn an anchored view into a
+        // following view. Pointer, wheel and keyboard scrolling have an indev.
+        if (lv_indev_get_act()) self->reportViewport();
+    },LV_EVENT_SCROLL,this);
+    _empty=label(parent,&lv_font_rsdeck_14,Theme::TEXT_SECONDARY,12,55,Theme::CONTENT_W-24);
+    lv_obj_set_style_text_align(_empty,LV_TEXT_ALIGN_CENTER,0);
+    static const char* captions[]={"Prev","Next","First","Refresh"};
+    for (size_t i=0;i<4;++i) {
+        auto* button=lv_btn_create(parent);_navigation[i]=button;
+        lv_obj_set_pos(button,4+i*(Theme::CONTENT_W-8)/4,Theme::CONTENT_H-29);
+        lv_obj_set_size(button,(Theme::CONTENT_W-8)/4-3,26);
+        lv_obj_add_style(button,LvTheme::styleListBtn(),0);
+        lv_obj_add_style(button,LvTheme::styleListBtnFocused(),LV_STATE_FOCUSED);
+        lv_obj_set_style_pad_all(button,0,0);lv_obj_set_user_data(button,reinterpret_cast<void*>(i));
+        auto* text=label(button,&lv_font_rsdeck_12,Theme::TEXT_PRIMARY,0,0,(Theme::CONTENT_W-8)/4-3);
+        lv_label_set_text_static(text,captions[i]);lv_obj_center(text);
+        lv_obj_add_event_cb(button,[](lv_event_t* event) {
+            auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+            self->navigate(static_cast<Navigation>(reinterpret_cast<uintptr_t>(lv_obj_get_user_data(lv_event_get_target(event)))));
+        },LV_EVENT_CLICKED,this);
+        lv_group_add_obj(LvInput::group(),button);
+    }
+    updateCaptions();
 }
-
 void LvMessagesScreen::onEnter() {
-    _lastConvCount = -1;
+    _active=true;
 #if !HAS_SCROLLWHEEL
-    _focusActive = false;
+    _focusActive=false;
 #endif
     hideActionMenu();
-    rebuildList();
+    if (_service) _service->watchConversations();
+    refreshUI();
 }
-
+void LvMessagesScreen::detachRows() {
+    _binding=true;
+    if (_screen && _list) lv_obj_clean(_list);
+    for (auto& row:_rows) row={};
+    _rowCount=0;_boundRevision=0;_boundIdentity=0;_namesResolved=0;
+    _binding=false;
+}
 void LvMessagesScreen::onExit() {
-    hideActionMenu();
-}
-
-void LvMessagesScreen::refreshUI() {
-    if (!_lxmf) return;
-    if (_lpState != LP_NONE) return;
-    int count = (int)_lxmf->conversations().size();
-    int unread = _lxmf->unreadCount();
-    int queued = _lxmf->queuedCount();
-    uint32_t revision = _lxmf->storeRevision();
-    int savedContacts = savedContactCount();
-    if (count != _lastConvCount || unread != _lastUnreadTotal ||
-        queued != _lastQueuedCount || revision != _lastStoreRevision ||
-        savedContacts != _lastSavedContactCount) {
-        rebuildList();
+    if (bound()) reportViewport();
+    _active=false;hideActionMenu();detachRows();
+    if (_service) {
+        auto& window=_service->conversationWindow();
+        _service->closeConversations();
+        window.acknowledgePublication(window.revision());
     }
 }
-
-void LvMessagesScreen::rebuildList() {
-    if (!_lxmf || !_list) return;
-    unsigned long startMs = millis();
-
-    const auto& convs = _lxmf->conversations();
-    int count = (int)convs.size();
-    _lastConvCount = count;
-    _lastUnreadTotal = _lxmf->unreadCount();
-    _lastQueuedCount = _lxmf->queuedCount();
-    _lastStoreRevision = _lxmf->storeRevision();
-    _lastSavedContactCount = savedContactCount();
-    _sortedPeers.clear();
-    _sortedConvs.clear();
-
-    lv_obj_clean(_list);
-    _avatarBuffers.clear();
-
-    if (count == 0) {
-        showEmptyState();
+void LvMessagesScreen::destroyUI() {
+    onExit();_list=nullptr;_caption=nullptr;_empty=nullptr;
+    for (auto& button:_navigation) button=nullptr;
+    LvScreen::destroyUI();
+}
+void LvMessagesScreen::refreshUI() {
+    if (!_screen || !_service) return;
+    auto& window=_service->conversationWindow();
+    if (!_active || !window.visible() || window.identityGeneration()!=_service->status().generation) {
+        hideActionMenu();detachRows();
+        window.acknowledgePublication(window.revision());
+    } else if (window.statusReady() && (_boundRevision!=window.revision() || _boundIdentity!=window.identityGeneration())) {
+        hideActionMenu();bindRows();
+    }
+    if (bound() && _statusRevision!=window.statusRevision()) updateStatuses();
+    if (bound() && _nodeRevision!=(_am?_am->revision():0)) updateNames();
+    updateCaptions();
+    if (bound() && !window.loading() && _lpState==LP_NONE) pollName();
+}
+void LvMessagesScreen::bindRows() {
+    auto& window=_service->conversationWindow();
+    detachRows();_binding=true;
+    _boundRevision=window.revision();_boundIdentity=window.identityGeneration();
+    _nodeRevision=_am?_am->revision():0;
+    _rowCount=static_cast<uint8_t>(window.count());
+    for (size_t i=0;i<_rowCount;++i) {
+        const auto& value=*window.row(i);auto& widgets=_rows[i];
+        char peer[33];peerText(value.peer,peer);
+        widgets.row=lv_obj_create(_list);
+        auto* row=widgets.row;
+        lv_obj_set_size(row,Theme::CONTENT_W,RowHeight);
+        lv_obj_add_style(row,LvTheme::styleListBtn(),0);
+        lv_obj_add_style(row,LvTheme::styleListBtnFocused(),LV_STATE_FOCUSED);
+        lv_obj_set_style_pad_all(row,0,0);lv_obj_clear_flag(row,LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(row,lv_color_hex(value.unreadCount?Theme::PRIMARY_SUBTLE:Theme::BG),0);
+        lv_obj_set_user_data(row,reinterpret_cast<void*>(i));
+        lv_obj_add_flag(row,LV_OBJ_FLAG_CLICKABLE);
+        // The first child is the existing unread/pending/contact status rail.
+        auto* rail=lv_obj_create(row);
+        lv_obj_set_pos(rail,0,0);lv_obj_set_size(rail,4,RowHeight);
+        lv_obj_set_style_border_width(rail,0,0);lv_obj_set_style_radius(rail,0,0);
+        lv_obj_set_style_pad_all(rail,0,0);lv_obj_set_style_bg_opa(rail,LV_OPA_COVER,0);
+        lv_obj_clear_flag(rail,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row,[](lv_event_t* event) {
+            auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+            self->openRow(reinterpret_cast<uintptr_t>(lv_obj_get_user_data(lv_event_get_target(event))));
+        },LV_EVENT_CLICKED,this);
+        lv_obj_add_event_cb(row,[](lv_event_t* event) {
+            auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+            self->showActionMenu(reinterpret_cast<uintptr_t>(lv_obj_get_user_data(lv_event_get_target(event))));
+        },LV_EVENT_LONG_PRESSED,this);
+        lv_obj_add_event_cb(row,[](lv_event_t* event) {
+            auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+            if (self->_binding || !self->bound()) return;
+            auto* target=lv_event_get_target(event);
+            self->_service->conversationWindow().select(reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target)));
+            lv_obj_scroll_to_view(target,LV_ANIM_OFF);self->reportViewport();
+        },LV_EVENT_FOCUSED,this);
+        lv_group_add_obj(LvInput::group(),row);
+        // LVGL owns each bounded avatar buffer until its canvas is deleted.
+        if (auto* pixels=lv_mem_alloc(LxmFaceAvatar::bufferSize(AvatarSize))) {
+            auto avatar=LxmFaceAvatar::create(row,12,16,AvatarSize,pixels,Theme::PRIMARY_SUBTLE,
+                                              value.unreadCount?Theme::PRIMARY:Theme::BORDER);
+            lv_obj_add_event_cb(avatar.canvas,[](lv_event_t* event) { lv_mem_free(lv_event_get_user_data(event)); },LV_EVENT_DELETE,pixels);
+            LxmFaceAvatar::render(avatar.canvas,String(peer));
+        }
+        widgets.name=label(row,&lv_font_rsdeck_14,Theme::TEXT_PRIMARY,TextX,4,Theme::CONTENT_W-TextX-58);
+        lv_label_set_long_mode(widgets.name,LV_LABEL_LONG_DOT);
+        const auto* node=_am?_am->findNodeByHex(peer):nullptr;
+        if (node && !node->name.empty()) {
+            lv_label_set_text(widgets.name,node->name.c_str());_namesResolved|=uint64_t{1}<<i;
+        } else { char fallback[13];std::memcpy(fallback,peer,12);fallback[12]=0;lv_label_set_text(widgets.name,fallback); }
+        if (value.timestamp>1700000000 && value.timestamp<static_cast<double>(std::numeric_limits<time_t>::max())) {
+            const time_t stamp=static_cast<time_t>(value.timestamp);struct tm result;
+            if (localtime_r(&stamp,&result)) {
+                char clock[8];snprintf(clock,sizeof(clock),"%02d:%02d",result.tm_hour,result.tm_min);
+                auto* time=label(row,&lv_font_rsdeck_10,Theme::TEXT_MUTED,Theme::CONTENT_W-47,6,43);
+                lv_label_set_text(time,clock);
+            }
+        }
+        widgets.preview=label(row,&lv_font_rsdeck_12,Theme::TEXT_SECONDARY,TextX,25,Theme::CONTENT_W-TextX-8);
+        // CLIP never mutates borrowed bytes; DOT is forbidden for bank pointers.
+        lv_label_set_text_static(widgets.preview,(value.flags&Row::Unavailable)?"Message unavailable":
+            value.previewLength?value.preview:"No preview");
+        if (value.flags&Row::PreviewTruncated) {
+            lv_obj_set_width(widgets.preview,Theme::CONTENT_W-TextX-23);
+            auto* more=label(row,&lv_font_rsdeck_12,Theme::TEXT_MUTED,Theme::CONTENT_W-19,25,15);
+            lv_label_set_text_static(more,"...");
+        }
+        widgets.status=label(row,&lv_font_rsdeck_10,Theme::TEXT_MUTED,TextX,46,Theme::CONTENT_W-TextX-8);
+    }
+    updateStatuses();
+    lv_obj_update_layout(_list);
+    const auto selected=window.selectedIndex();
+    if (selected<_rowCount) lv_group_focus_obj(_rows[selected].row);
+    lv_obj_scroll_to_y(_list,window.scrollOffset(),LV_ANIM_OFF);
+#if !HAS_SCROLLWHEEL
+    if (!_focusActive) {
+        auto* focused=lv_group_get_focused(LvInput::group());
+        if (focused) lv_obj_clear_state(focused,LV_STATE_FOCUSED|LV_STATE_FOCUS_KEY);
+    }
+#endif
+    _binding=false;
+    window.acknowledgePublication(_boundRevision);
+}
+void LvMessagesScreen::updateStatuses() {
+    if (!_service) return;
+    const auto& window=_service->conversationWindow();
+    for (size_t i=0;i<_rowCount;++i) {
+        const auto* value=window.row(i);if (!value) continue;
+        char text[128]={};const char* detail=nullptr;
+        if (value->flags&Row::Unavailable) detail="Read failed; refresh to retry";
+        else if (value->flags&Row::StatusUnavailable) detail="Status unavailable";
+        else detail=messageStatusDetail(static_cast<LXMFStatus>(value->status),value->flags&Row::StatusPending,
+            value->error,value->flags&Row::TxSuppressed);
+        const char* state=(value->flags&Row::HasOutgoing)?statusText(value->status):"";
+        if (detail) snprintf(text,sizeof(text),"%s%s%s",state,*state?" · ":"",detail);
+        else if (value->unreadCount) snprintf(text,sizeof(text),"%u new%s%s",unsigned(value->unreadCount),*state?" · ":"",state);
+        else snprintf(text,sizeof(text),"%s%s",state,(value->flags&Row::PreviewTruncated)?(*state?" · Read full in chat":"Read full in chat"):"");
+        lv_label_set_text(_rows[i].status,text);
+        const auto color=(value->flags&(Row::Unavailable|Row::StatusUnavailable))?Theme::WARNING_CLR:
+            value->status==static_cast<uint8_t>(LXMFStatus::FAILED)?Theme::ERROR_CLR:
+            value->status==static_cast<uint8_t>(LXMFStatus::DELIVERED)?Theme::SUCCESS:Theme::TEXT_MUTED;
+        lv_obj_set_style_text_color(_rows[i].status,lv_color_hex(color),0);
+        char peer[33];peerText(value->peer,peer);
+        const auto* node=_am?_am->findNodeByHex(peer):nullptr;
+        const auto rail=(value->flags&Row::Unavailable)?Theme::WARNING_CLR:
+            value->status==static_cast<uint8_t>(LXMFStatus::FAILED)?Theme::ERROR_CLR:
+            value->pendingCount?Theme::WARNING_CLR:value->unreadCount?Theme::PRIMARY:
+            node&&node->saved?Theme::TEXT_SECONDARY:node?Theme::TEXT_MUTED:Theme::BORDER;
+        lv_obj_set_style_bg_color(lv_obj_get_child(_rows[i].row,0),lv_color_hex(rail),0);
+    }
+    _statusRevision=window.statusRevision();
+}
+void LvMessagesScreen::updateCaptions() {
+    if (!_screen || !_caption) return;
+    const auto* window=_service?&_service->conversationWindow():nullptr;
+    char text[100];
+    if (!window || !_active) snprintf(text,sizeof(text),"Conversations closed");
+    else snprintf(text,sizeof(text),"%u of %u chats%s%s%s",unsigned(window->count()),unsigned(window->total()),
+        window->state()==Window::State::Retrying?" · Read failed; retrying":
+            window->state()==Window::State::Exhausted?" · Reads unavailable":window->loading()?" · Loading":"",
+        window->updated()?" · Updated":"",window->freshnessAvailable()?"":" · Refresh to check");
+    lv_label_set_text(_caption,text);
+    if (!_rowCount) {
+        const char* empty=!window || !_active?"":
+            window->state()==Window::State::Retrying || window->state()==Window::State::Exhausted?"Unable to read conversations":
+            window->loading() || !window->statusReady()?"Loading conversations...":"No conversations";
+        lv_label_set_text(_empty,empty);lv_obj_clear_flag(_empty,LV_OBJ_FLAG_HIDDEN);
+    } else lv_obj_add_flag(_empty,LV_OBJ_FLAG_HIDDEN);
+    for (size_t i=0;i<4;++i) {
+        const bool enabled=window && _active && (i>=2 || (i==0?window->canPrevious():window->canNext()));
+        if (enabled) lv_obj_clear_state(_navigation[i],LV_STATE_DISABLED);
+        else lv_obj_add_state(_navigation[i],LV_STATE_DISABLED);
+        lv_obj_set_style_text_color(lv_obj_get_child(_navigation[i],0),
+            lv_color_hex(enabled?Theme::TEXT_PRIMARY:Theme::TEXT_MUTED),0);
+    }
+}
+void LvMessagesScreen::reportViewport() {
+    if (_binding || !bound()) return;
+    auto& window=_service->conversationWindow();
+    const auto offset=std::max<int>(0,lv_obj_get_scroll_y(_list));
+    window.setScrollOffset(offset);window.setViewportAtFirst(offset==0);
+}
+void LvMessagesScreen::navigate(Navigation navigation) {
+    if (!_active || !_service || _lpState!=LP_NONE) return;
+    auto& window=_service->conversationWindow();
+    if (bound()) reportViewport();
+    switch (navigation) {
+        case Navigation::Previous:window.previous();break;
+        case Navigation::Next:window.nextPage();break;
+        case Navigation::First:window.first();break;
+        case Navigation::Refresh:window.refresh();_namesResolved=0;break;
+    }
+    refreshUI();
+}
+void LvMessagesScreen::openRow(size_t index) {
+    if (!bound() || _lpState!=LP_NONE || index>=_rowCount || !_onOpen) return;
+    auto& window=_service->conversationWindow();window.select(index);reportViewport();
+    char peer[33];peerText(window.row(index)->peer,peer);
+    _onOpen(std::string(peer));
+}
+int LvMessagesScreen::focusedIndex() const {
+    auto* focus=lv_group_get_focused(LvInput::group());
+    for (size_t i=0;i<_rowCount;++i) if (_rows[i].row==focus) return static_cast<int>(i);
+    return -1;
+}
+void LvMessagesScreen::pollName() {
+    if (_nameRequest || !bound()) return;
+    auto& window=_service->conversationWindow();
+    for (size_t i=0;i<_rowCount;++i) {
+        const uint64_t bit=uint64_t{1}<<i;if (_namesResolved&bit) continue;
+        const auto* row=window.row(i);char peer[33];peerText(row->peer,peer);
+        const uint32_t revision=_boundRevision,identity=_boundIdentity,nodes=_nodeRevision;
+        const uint32_t advertisedNodes=_service->status().nodeRevision;
+        // The callback's fixed peer value belongs to the single admitted query.
+        std::array<uint8_t,16> expected;std::memcpy(expected.data(),row->peer,16);
+        _nameRequest=_service->requestPeerName(peer,[this,i,revision,identity,nodes,advertisedNodes,expected](const handheld::Result& result,const char* name) {
+            _nameRequest=0;
+            if (!bound() || _boundRevision!=revision || _boundIdentity!=identity ||
+                _service->status().nodeRevision!=advertisedNodes || (_am?_am->revision():0)!=nodes || i>=_rowCount ||
+                std::memcmp(_service->conversationWindow().row(i)->peer,expected.data(),16)) return;
+            _namesResolved|=uint64_t{1}<<i;
+            if (result.outcome==handheld::Outcome::Ok && name && *name) lv_label_set_text(_rows[i].name,name);
+        });
+        // Admission pressure waits for explicit Refresh; never spin per frame.
+        if (!_nameRequest) _namesResolved|=bit;
         return;
     }
-
-    hideEmptyState();
-
-    // Build sorted conversation info
-    _sortedConvs.reserve(count);
-    _avatarBuffers.reserve(count);
-    for (int i = 0; i < count; i++) {
-        ConvInfo ci;
-        ci.peerHex = convs[i];
-        auto* s = _lxmf->getConversationSummary(ci.peerHex);
-        if (s) {
-            ci.lastTs = s->lastTimestamp;
-            ci.preview = chatPreviewText(s->lastPreview, 56);
-            ci.lastIncoming = s->lastIncoming;
-            ci.unreadCount = s->unreadCount;
-            ci.totalCount = s->totalCount;
-            ci.hasUnread = ci.unreadCount > 0;
-            ci.hasOutgoing = s->hasOutgoing;
-            ci.hasPending = s->hasPending;
-            ci.hasFailed = s->hasFailed;
-            ci.lastOutgoingStatus = s->lastOutgoingStatus;
-        }
-        ci.displayName = displayNameForPeer(_am, ci.peerHex);
-
-        if (_am) {
-            const DiscoveredNode* node = _am->findNodeByHex(ci.peerHex);
-            if (node) {
-                ci.knownNode = true;
-                ci.savedNode = node->saved;
-                ci.rssi = node->rssi;
-                ci.snr = node->snr;
-                ci.hops = node->hops;
-                ci.lastSeen = node->lastSeen;
-            }
-        }
-
-        _sortedConvs.push_back(ci);
-    }
-
-    std::sort(_sortedConvs.begin(), _sortedConvs.end(), [](const ConvInfo& a, const ConvInfo& b) {
-        return a.lastTs > b.lastTs;
-    });
-
-    for (auto& ci : _sortedConvs) _sortedPeers.push_back(ci.peerHex);
-
-    // Build list items with focus group support
-    const lv_font_t* nameFont = &lv_font_rsdeck_14;
-    const lv_font_t* smallFont = &lv_font_rsdeck_12;
-
-    for (int i = 0; i < count; i++) {
-        const auto& ci = _sortedConvs[i];
-        bool latestOutgoingFailed = ci.hasOutgoing && ci.lastOutgoingStatus == LXMFStatus::FAILED;
-
-        lv_obj_t* row = lv_obj_create(_list);
-        lv_obj_set_size(row, Theme::CONTENT_W, kRowH);
-        lv_obj_add_style(row, LvTheme::styleListBtn(), 0);
-        lv_obj_add_style(row, LvTheme::styleListBtnFocused(), LV_STATE_FOCUSED);
-        lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_set_style_bg_color(row, lv_color_hex(ci.hasUnread ? Theme::PRIMARY_SUBTLE : Theme::BG), 0);
-        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
-        lv_obj_set_style_border_width(row, 1, 0);
-        lv_obj_set_style_border_color(row, lv_color_hex(Theme::BORDER), 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_user_data(row, (void*)(intptr_t)i);
-
-        lv_obj_add_event_cb(row, [](lv_event_t* e) {
-            auto* self = (LvMessagesScreen*)lv_event_get_user_data(e);
-            if (self->_lpState != LP_NONE) return;
-            int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-            if (idx < (int)self->_sortedPeers.size() && self->_onOpen) {
-                self->_onOpen(self->_sortedPeers[idx]);
-            }
-        }, LV_EVENT_CLICKED, this);
-        lv_obj_add_event_cb(row, [](lv_event_t* e) {
-            auto* self = (LvMessagesScreen*)lv_event_get_user_data(e);
-            int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-            self->showActionMenu(idx);
-        }, LV_EVENT_LONG_PRESSED, this);
-
-        lv_group_add_obj(LvInput::group(), row);
-        lv_obj_add_event_cb(row, [](lv_event_t* e) {
-            lv_obj_scroll_to_view(lv_event_get_target(e), LV_ANIM_ON);
-        }, LV_EVENT_FOCUSED, nullptr);
-
-        uint32_t railColor = Theme::BORDER;
-        if (latestOutgoingFailed) railColor = Theme::ERROR_CLR;
-        else if (ci.hasPending) railColor = Theme::WARNING_CLR;
-        else if (ci.hasUnread) railColor = Theme::PRIMARY;
-        else if (ci.savedNode) railColor = Theme::TEXT_SECONDARY;
-        else if (ci.knownNode) railColor = Theme::TEXT_MUTED;
-
-        lv_obj_t* rail = lv_obj_create(row);
-        lv_obj_set_size(rail, kRailW, kRowH);
-        lv_obj_set_pos(rail, 0, 0);
-        lv_obj_set_style_bg_color(rail, lv_color_hex(railColor), 0);
-        lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(rail, 0, 0);
-        lv_obj_set_style_radius(rail, 0, 0);
-        lv_obj_set_style_pad_all(rail, 0, 0);
-        lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
-
-        _avatarBuffers.emplace_back(LxmFaceAvatar::bufferSize(kChatAvatar));
-        auto avatar = LxmFaceAvatar::create(row, 13, 13, kChatAvatar,
-                                            _avatarBuffers.back().data(),
-                                            Theme::PRIMARY_SUBTLE,
-                                            ci.hasUnread ? Theme::PRIMARY : Theme::BORDER);
-        LxmFaceAvatar::render(avatar.canvas, String(ci.peerHex.c_str()));
-
-        int leftPad = kChatTextX;
-
-        // Name (top-left, first line)
-        lv_obj_t* nameLbl = lv_label_create(row);
-        lv_obj_set_style_text_font(nameLbl, nameFont, 0);
-        lv_obj_set_style_text_color(nameLbl, lv_color_hex(ci.hasUnread ? Theme::ACCENT : Theme::TEXT_PRIMARY), 0);
-        lv_label_set_long_mode(nameLbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(nameLbl, Theme::CONTENT_W - leftPad - 70);
-        lv_label_set_text(nameLbl, ci.displayName.c_str());
-        lv_obj_set_pos(nameLbl, leftPad, 6);
-
-        // Time (top-right)
-        char timeBuf[8];
-        if (formatClock(ci.lastTs, timeBuf, sizeof(timeBuf))) {
-            lv_obj_t* timeLbl = lv_label_create(row);
-            lv_obj_set_style_text_font(timeLbl, &lv_font_rsdeck_10, 0);
-            lv_obj_set_style_text_color(timeLbl, lv_color_hex(ci.hasUnread ? Theme::PRIMARY : Theme::TEXT_MUTED), 0);
-            lv_label_set_text(timeLbl, timeBuf);
-            lv_obj_align(timeLbl, LV_ALIGN_TOP_RIGHT, -8, 7);
-        }
-
-        // Preview (second line, below name)
-        lv_obj_t* prevLbl = lv_label_create(row);
-        lv_obj_set_style_text_font(prevLbl, smallFont, 0);
-        uint32_t previewColor = Theme::TEXT_SECONDARY;
-        if (latestOutgoingFailed) previewColor = Theme::ERROR_CLR;
-        else if (ci.hasPending) previewColor = Theme::WARNING_CLR;
-        else if (ci.hasUnread) previewColor = Theme::TEXT_PRIMARY;
-        lv_obj_set_style_text_color(prevLbl, lv_color_hex(previewColor), 0);
-        lv_label_set_long_mode(prevLbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(prevLbl, Theme::CONTENT_W - leftPad - 76);
-        lv_label_set_text(prevLbl, ci.preview.empty() ? "No preview" : ci.preview.c_str());
-        lv_obj_set_pos(prevLbl, leftPad, 28);
-
-        char chipBuf[16] = {0};
-        uint32_t chipColor = Theme::TEXT_MUTED;
-        if (latestOutgoingFailed) {
-            snprintf(chipBuf, sizeof(chipBuf), "FAILED");
-            chipColor = Theme::ERROR_CLR;
-        } else if (ci.hasPending) {
-            const char* pending = statusLabel(ci.lastOutgoingStatus);
-            snprintf(chipBuf, sizeof(chipBuf), "%s", pending[0] ? pending : "QUEUED");
-            chipColor = Theme::WARNING_CLR;
-        } else if (ci.hasUnread) {
-            if (ci.unreadCount > 9) snprintf(chipBuf, sizeof(chipBuf), "NEW 9+");
-            else snprintf(chipBuf, sizeof(chipBuf), "NEW %d", ci.unreadCount);
-            chipColor = Theme::PRIMARY;
-        } else if (!ci.lastIncoming && ci.hasOutgoing &&
-                   (ci.lastOutgoingStatus == LXMFStatus::SENT || ci.lastOutgoingStatus == LXMFStatus::DELIVERED)) {
-            snprintf(chipBuf, sizeof(chipBuf), "%s", statusLabel(ci.lastOutgoingStatus));
-            chipColor = statusColor(ci.lastOutgoingStatus);
-        }
-
-        if (chipBuf[0] != '\0') {
-            lv_obj_t* chip = lv_obj_create(row);
-            lv_obj_set_size(chip, 58, 15);
-            lv_obj_align(chip, LV_ALIGN_BOTTOM_RIGHT, -7, -8);
-            lv_obj_set_style_bg_color(chip, lv_color_hex(Theme::BG), 0);
-            lv_obj_set_style_bg_opa(chip, LV_OPA_80, 0);
-            lv_obj_set_style_border_color(chip, lv_color_hex(chipColor), 0);
-            lv_obj_set_style_border_width(chip, 1, 0);
-            lv_obj_set_style_radius(chip, 4, 0);
-            lv_obj_set_style_pad_all(chip, 0, 0);
-            lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
-
-            lv_obj_t* chipLbl = lv_label_create(chip);
-            lv_obj_set_style_text_font(chipLbl, &lv_font_rsdeck_10, 0);
-            lv_obj_set_style_text_color(chipLbl, lv_color_hex(chipColor), 0);
-            lv_label_set_text(chipLbl, chipBuf);
-            lv_obj_center(chipLbl);
+}
+void LvMessagesScreen::updateNames() {
+    _nodeRevision=_am?_am->revision():0;_namesResolved=0;
+    if (!_am) return;
+    const auto& window=_service->conversationWindow();
+    for (size_t i=0;i<_rowCount;++i) {
+        char peer[33];peerText(window.row(i)->peer,peer);
+        const auto* node=_am->findNodeByHex(peer);
+        if (node && !node->name.empty()) {
+            lv_label_set_text(_rows[i].name,node->name.c_str());_namesResolved|=uint64_t{1}<<i;
         }
     }
-
-#if !HAS_SCROLLWHEEL
-    // Trackball/touch boards defer visible focus until the user navigates.
-    if (!_focusActive) {
-        lv_obj_t* focused = lv_group_get_focused(LvInput::group());
-        if (focused) lv_obj_clear_state(focused, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
-    }
-#endif
-
-    unsigned long elapsed = millis() - startMs;
-    if (elapsed > 25) {
-        Serial.printf("[PERF] Chats rebuild: %d convs in %lums\n",
-                      count, (unsigned long)elapsed);
-    }
+    updateStatuses(); // Contact status also contributes to the existing rail.
 }
-
-// Layout-reset helpers: after a flex list teardown the parent keeps its layout
-// and scroll offset, which mis-places the centered empty panel. Reset both.
-void LvMessagesScreen::showEmptyState() {
-    if (_screen) {
-        lv_obj_set_layout(_screen, 0);
-        lv_obj_scroll_to_x(_screen, 0, LV_ANIM_OFF);
-        lv_obj_scroll_to_y(_screen, 0, LV_ANIM_OFF);
-    }
-    if (_lblEmpty) {
-        lv_obj_align(_lblEmpty, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_clear_flag(_lblEmpty, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(_lblEmpty);
-    }
-    if (_list) lv_obj_add_flag(_list, LV_OBJ_FLAG_HIDDEN);
+void LvMessagesScreen::showActionMenu(size_t index) {
+    if (!bound() || index>=_rowCount || _actionRequest) return;
+    auto& window=_service->conversationWindow();window.select(index);
+    std::memcpy(_actionPeer,window.row(index)->peer,16);_actionIdentity=_boundIdentity;
+    _focusActive=true;_lpState=LP_MENU;_menuIdx=0;rebuildActionOverlay();
 }
-
-void LvMessagesScreen::hideEmptyState() {
-    if (_lblEmpty) lv_obj_add_flag(_lblEmpty, LV_OBJ_FLAG_HIDDEN);
-    if (_list) {
-        lv_obj_clear_flag(_list, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(_list);
-    }
-}
-
-bool LvMessagesScreen::isPeerSavedContact(const std::string& peerHex) const {
-    if (!_am) return false;
-    const DiscoveredNode* node = _am->findNodeByHex(peerHex);
-    return node && node->saved;
-}
-
-int LvMessagesScreen::savedContactCount() const {
-    if (!_am) return 0;
-    int count = 0;
-    for (const auto& node : _am->nodes()) {
-        if (node.saved) count++;
-    }
-    return count;
-}
-
-int LvMessagesScreen::getFocusedPeerIdx() const {
-    lv_obj_t* focused = lv_group_get_focused(LvInput::group());
-    if (!focused) return -1;
-    return (int)(intptr_t)lv_obj_get_user_data(focused);
-}
-
 void LvMessagesScreen::hideActionMenu() {
-    if (_actionOverlay) {
-        lv_obj_del_async(_actionOverlay);
-        _actionOverlay = nullptr;
-    }
-    for (int i = 0; i < 3; i++) {
-        _actionRows[i] = nullptr;
-        _actionLabels[i] = nullptr;
-    }
-    _lpState = LP_NONE;
-    _lpPeerIdx = -1;
-    _menuIdx = 0;
-    _menuCount = 0;
+    if (_actionOverlay) lv_obj_del(_actionOverlay);
+    _actionOverlay=nullptr;for (auto& row:_actionRows) row=nullptr;
+    _lpState=LP_NONE;_menuIdx=0;_actionIdentity=0;std::memset(_actionPeer,0,16);
 }
-
-void LvMessagesScreen::rebuildActionOverlay(const char* title, const char* const* labels, int count) {
-    if (_actionOverlay) {
-        lv_obj_del_async(_actionOverlay);
-        _actionOverlay = nullptr;
-    }
-    for (int i = 0; i < 3; i++) {
-        _actionRows[i] = nullptr;
-        _actionLabels[i] = nullptr;
-    }
-
-    _menuCount = count;
-    _actionOverlay = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(_actionOverlay, 244, 118);
-    lv_obj_center(_actionOverlay);
-    lv_obj_add_style(_actionOverlay, LvTheme::styleModal(), 0);
-    lv_obj_set_style_pad_all(_actionOverlay, 8, 0);
-    lv_obj_clear_flag(_actionOverlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* titleLbl = lv_label_create(_actionOverlay);
-    lv_obj_set_style_text_font(titleLbl, &lv_font_rsdeck_12, 0);
-    lv_obj_set_style_text_color(titleLbl, lv_color_hex(Theme::ACCENT), 0);
-    lv_label_set_long_mode(titleLbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(titleLbl, 220);
-    lv_label_set_text(titleLbl, title);
-    lv_obj_align(titleLbl, LV_ALIGN_TOP_MID, 0, 0);
-
-    for (int i = 0; i < count && i < 3; i++) {
-        lv_obj_t* row = lv_obj_create(_actionOverlay);
-        lv_obj_set_size(row, 220, 24);
-        lv_obj_set_pos(row, 4, 24 + i * 28);
-        lv_obj_add_style(row, LvTheme::styleListBtn(), 0);
-        lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_set_style_bg_color(row, lv_color_hex(i == _menuIdx ? Theme::BG_HOVER : Theme::BG), 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_user_data(row, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(row, [](lv_event_t* e) {
-            auto* self = (LvMessagesScreen*)lv_event_get_user_data(e);
-            int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-            if (!self) return;
-            self->_menuIdx = idx;
-            KeyEvent enter = {};
-            enter.enter = true;
-            self->handleKey(enter);
-        }, LV_EVENT_CLICKED, this);
-
-        lv_obj_t* lbl = lv_label_create(row);
-        lv_obj_set_style_text_font(lbl, &lv_font_rsdeck_12, 0);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(Theme::TEXT_PRIMARY), 0);
-        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(lbl, 200);
-        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_text(lbl, labels[i]);
-        lv_obj_center(lbl);
-        _actionRows[i] = row;
-        _actionLabels[i] = lbl;
+void LvMessagesScreen::rebuildActionOverlay() {
+    if (_actionOverlay) lv_obj_del(_actionOverlay);
+    _actionOverlay=lv_obj_create(lv_layer_top());lv_obj_set_size(_actionOverlay,244,124);lv_obj_center(_actionOverlay);
+    lv_obj_add_style(_actionOverlay,LvTheme::styleModal(),0);lv_obj_set_style_pad_all(_actionOverlay,6,0);
+    lv_obj_clear_flag(_actionOverlay,LV_OBJ_FLAG_SCROLLABLE);
+    const bool confirm=_lpState==LP_CONFIRM_DELETE;
+    auto* title=label(_actionOverlay,&lv_font_rsdeck_12,Theme::ACCENT,3,0,220);
+    lv_label_set_text_static(title,confirm?"DELETE CHAT?":"CHAT ACTION");
+    const char* labels[]={confirm?"Delete Chat":"Add Friend",confirm?"Cancel":"Delete Chat","Cancel"};
+    for (size_t i=0;i<(confirm?2u:3u);++i) {
+        auto* row=lv_btn_create(_actionOverlay);_actionRows[i]=row;
+        lv_obj_set_pos(row,3,23+28*i);lv_obj_set_size(row,220,24);
+        lv_obj_add_style(row,LvTheme::styleListBtn(),0);
+        lv_obj_set_style_bg_color(row,lv_color_hex(i==_menuIdx?Theme::BG_HOVER:Theme::BG),0);
+        lv_obj_set_style_pad_all(row,0,0);lv_obj_set_user_data(row,reinterpret_cast<void*>(i));
+        auto* text=label(row,&lv_font_rsdeck_12,Theme::TEXT_PRIMARY,0,0,210);
+        lv_label_set_text_static(text,labels[i]);lv_obj_center(text);
+        lv_obj_add_event_cb(row,[](lv_event_t* event) {
+            auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
+            self->_menuIdx=reinterpret_cast<uintptr_t>(lv_obj_get_user_data(lv_event_get_target(event)));
+            KeyEvent enter{};enter.enter=true;self->handleKey(enter);
+        },LV_EVENT_CLICKED,this);
     }
 }
-
-void LvMessagesScreen::showActionMenu(int peerIdx) {
-    _actionPeerHex = peerIdx >= 0 && size_t(peerIdx) < _sortedPeers.size() ? _sortedPeers[peerIdx] : std::string();
-    if (!_lxmf || peerIdx < 0 || peerIdx >= (int)_sortedPeers.size()) return;
-#if !HAS_SCROLLWHEEL
-    _focusActive = true;
-#endif
-    _lpPeerIdx = peerIdx;
-    _lpState = LP_MENU;
-    _menuIdx = 0;
-    static const char* labels[] = {"Add Friend", "Delete Chat", "Cancel"};
-    rebuildActionOverlay("CHAT ACTION", labels, 3);
+void LvMessagesScreen::performAction(handheld::Operation operation) {
+    if (!_service || _actionRequest || _actionIdentity!=_service->status().generation || !_actionIdentity) {
+        hideActionMenu();return;
+    }
+    char peer[33];peerText(_actionPeer,peer);const uint32_t identity=_actionIdentity;
+    hideActionMenu();
+    _actionRequest=_service->action(operation,peer,"",0,[this,identity](const handheld::Result& result) {
+        _actionRequest=0;
+        if (!_service || identity!=_service->status().generation) return;
+        if (result.outcome==handheld::Outcome::Ok) {
+            _service->conversationWindow().refresh();
+            if (_active && _screen) notice("Saved");
+        } else if (_active && _screen) notice("Action failed; retry");
+    });
+    if (!_actionRequest) notice("Busy; try again");
 }
-
-void LvMessagesScreen::showDeleteConfirm() {
-    _lpState = LP_CONFIRM_DELETE;
-    _menuIdx = 0;
-    static const char* labels[] = {"Delete Chat", "Cancel"};
-    rebuildActionOverlay("DELETE CHAT?", labels, 2);
-}
-
-void LvMessagesScreen::addFocusedPeerToContacts() {
-    if (_am && !_actionPeerHex.empty()) _am->saveNode(_actionPeerHex);
-}
-
-void LvMessagesScreen::deleteFocusedConversation() {
-    if (_lxmf && !_actionPeerHex.empty()) _lxmf->deleteConversation(_actionPeerHex);
-}
-
 bool LvMessagesScreen::handleLongPress() {
-    if (!_lxmf) return false;
+    if (!bound()) return false;
 #if !HAS_SCROLLWHEEL
-    // On trackball/touch boards, an unfocused hold belongs to the power shell.
     if (!_focusActive) return false;
 #endif
-    int idx = getFocusedPeerIdx();
-    if (idx < 0 || idx >= (int)_sortedPeers.size()) return false;
-    showActionMenu(idx);
-    return true;
+    const int index=focusedIndex();if (index<0) return false;
+    showActionMenu(index);return true;
 }
-
 bool LvMessagesScreen::handleKey(const KeyEvent& event) {
-    if (!_lxmf) return false;
-
+    if (!_service || !_active) return false;
+    if (_lpState!=LP_NONE) {
+        if (_actionIdentity!=_service->status().generation) {hideActionMenu();return true;}
+        const bool confirm=_lpState==LP_CONFIRM_DELETE;const unsigned count=confirm?2:3;
+        if (event.up || event.down) {_menuIdx=(_menuIdx+count+(event.down?1:-1))%count;rebuildActionOverlay();return true;}
+        if (event.enter || event.character=='\n' || event.character=='\r') {
+            if (confirm) {if (_menuIdx==0) performAction(handheld::Operation::DeleteConversation);else hideActionMenu();}
+            else if (_menuIdx==0) performAction(handheld::Operation::SaveContact);
+            else if (_menuIdx==1) {_lpState=LP_CONFIRM_DELETE;_menuIdx=0;rebuildActionOverlay();}
+            else hideActionMenu();
+            return true;
+        }
+        if (!event.repeat && (event.del || event.character==8 || event.character==0x1b)) hideActionMenu();
+        return true;
+    }
 #if !HAS_SCROLLWHEEL
     if (!_focusActive && (event.up || event.down || event.enter)) {
-        _focusActive = true;
-        lv_obj_t* focused = lv_group_get_focused(LvInput::group());
-        if (focused) lv_obj_add_state(focused, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+        _focusActive=true;auto* focused=lv_group_get_focused(LvInput::group());
+        if (focused) lv_obj_add_state(focused,LV_STATE_FOCUSED|LV_STATE_FOCUS_KEY);
         return true;
     }
 #endif
-
-    // Long-press menu mode
-    if (_lpState == LP_MENU) {
-        if (event.up || event.down) {
-            _menuIdx = (_menuIdx + (event.down ? 1 : -1) + _menuCount) % _menuCount;
-            static const char* labels[] = {"Add Friend", "Delete Chat", "Cancel"};
-            rebuildActionOverlay("CHAT ACTION", labels, 3);
-            return true;
-        }
-        if (event.enter || event.character == '\n' || event.character == '\r') {
-            if (_menuIdx == 0) {
-                addFocusedPeerToContacts();
-            } else if (_menuIdx == 1) {
-                showDeleteConfirm();
-                return true;
-            } else {
-                if (_ui) _ui->lvStatusBar().showToast("Cancelled", 800);
-            }
-            hideActionMenu();
-            return true;
-        }
-        if ((event.del || event.character == 8 || event.character == 0x1B) && !event.repeat) {
-            hideActionMenu();
-            if (_ui) _ui->lvStatusBar().showToast("Cancelled", 800);
-            return true;
-        }
-        return true;
-    }
-
-    // Confirm delete mode
-    if (_lpState == LP_CONFIRM_DELETE) {
-        if (event.up || event.down) {
-            _menuIdx = (_menuIdx + 1) % _menuCount;
-            static const char* labels[] = {"Delete Chat", "Cancel"};
-            rebuildActionOverlay("DELETE CHAT?", labels, 2);
-            return true;
-        }
-        if (event.enter || event.character == '\n' || event.character == '\r') {
-            if (_menuIdx == 0) {
-                deleteFocusedConversation();
-            } else if (_ui) {
-                _ui->lvStatusBar().showToast("Cancelled", 800);
-            }
-            hideActionMenu();
-            return true;
-        }
-        if (event.repeat) return true;  // held-key repeats never cancel a confirm
-        hideActionMenu();
-        if (_ui) _ui->lvStatusBar().showToast("Cancelled", 800);
-        return true;
-    }
-
-    // Let LVGL focus group handle up/down/enter navigation
     return false;
 }

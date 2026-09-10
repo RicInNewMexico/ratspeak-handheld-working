@@ -9,6 +9,9 @@ public:
 
     void setProgress(float progress, const char* status);
     void showError(const char* message);
+    // Borrows a static-lifetime literal and reuses the existing title widget.
+    // Does not create widgets or copy/allocate a new label text buffer.
+    void showAllocationError(const char* staticMessage);
 
 private:
     lv_obj_t* _lblTitle = nullptr;

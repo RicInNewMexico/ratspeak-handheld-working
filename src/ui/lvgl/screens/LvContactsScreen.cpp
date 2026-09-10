@@ -298,7 +298,7 @@ bool LvContactsScreen::handleLongPress() {
     if (idx < 0 || idx >= (int)_contactHexes.size()) return false;
     _deleteHex = _contactHexes[idx];
     _confirmDelete = true;
-    if (_ui) _ui->lvStatusBar().showToast("Remove? Enter=Remove Esc=Keep", 5000);
+    if (_ui) _ui->lvStatusBar().showToast("Remove? Enter=Remove Backspace=Keep", 5000);
     return true;
 }
 

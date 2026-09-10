@@ -51,6 +51,10 @@ public:
     // sent packet's 32-byte hash (the LXMF engine tracks it for the delivery-proof receipt).
     bool sendLinkData(const uint8_t dest[16], const uint8_t* plaintext, size_t len,
                       uint8_t* outHash = nullptr);
+    // The outgoing owner installs the hash and checked authorization before a
+    // possible inline Started/proof callback. Refusal releases its workspace.
+    bool buildLinkDataPacket(const uint8_t dest[16], const uint8_t* plaintext, size_t len,
+                             uint8_t* raw, size_t capacity, size_t& rawLength);
 
     // Link session key for `dest` (64 bytes), or nullptr if no active link — used by the
     // resource engine (advertise_build / assemble take the link key).
@@ -59,6 +63,9 @@ public:
     const uint8_t* activeLinkId(const uint8_t dest[16]) const;
     uint8_t activeLinkIface(const uint8_t dest[16]) const;
     bool linkActive(const uint8_t dest[16]) const;
+    bool receiptBinding(uint8_t iface, const uint8_t linkId[16], uint8_t& slot, uint32_t& generation) const;
+    bool receiptLive(uint8_t slot, uint32_t generation, uint8_t iface) const;
+    const uint8_t* receiptPeer(uint8_t slot, uint32_t generation) const;
 
     // Pump local-frame dispatch (ProtocolRuntime routes Link-typed / LINKREQUEST frames here).
     void onLocalFrame(const rs_handheld_local_frame_t& f, uint8_t ifaceId);
@@ -69,7 +76,7 @@ public:
 private:
     struct Link {
         State state = State::Free;
-        uint8_t peerDest[16] = {};   // recipient dest (initiator) / peer source dest (responder)
+        uint8_t peerDest[16] = {};   // recipient dest (initiator); responder has no authenticated peer binding
         uint8_t linkId[16] = {};
         uint8_t pubkey[64] = {};     // peer identity public key (for proof validate)
         uint8_t ephPriv[32] = {};    // our ephemeral x25519 private
@@ -86,6 +93,12 @@ private:
         // (Link.py:788-790 — TX must never mask peer death).
         unsigned long lastInboundMs = 0;
         unsigned long lastKeepaliveSentMs = 0;
+        // One coalesced FF/FE control owned by this watchdog until driver
+        // admission. Refusal preserves its birth and interface incarnation.
+        uint64_t keepaliveBornMs = 0;
+        uint32_t keepaliveInterfaceGeneration = 0;
+        bool keepalivePending = false;
+        bool keepaliveAttempted = false;
         unsigned long staleSinceMs = 0;
         uint32_t keepaliveMs = 360000;  // KEEPALIVE default until RTT is measured
         uint32_t staleTimeMs = 720000;  // STALE_FACTOR(2) * keepalive
@@ -106,8 +119,11 @@ private:
     void onLinkRequest(const rs_handheld_local_frame_t& f, uint8_t ifaceId);
     void onLinkData(Link& l, const rs_handheld_local_frame_t& f);
     void updateKeepalive(Link& l, double rttSecs);
+    void queueKeepalive(Link& l);
+    void retryKeepalive(Link& l);
     void sendTeardown(Link& l);
 
     Deps _d;
     Link _links[MAX_LINKS];
+    uint32_t _generations[MAX_LINKS] = {}; // retained across close/reset; exhausted slots retire
 };

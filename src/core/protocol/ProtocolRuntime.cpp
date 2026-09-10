@@ -8,6 +8,7 @@
 #include "storage/FlashStore.h"
 #include "storage/SDStore.h"
 #include "storage/MessageStore.h"
+#include "transport/LoRaInterface.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <string.h>
@@ -60,7 +61,13 @@ ProtocolRuntime::~ProtocolRuntime() {
 bool ProtocolRuntime::begin(FlashStore* flash, SDStore* sd, IdentityManager* idMgr, MessageStore* store,
                         AnnounceManager* announceMgr, int32_t profile, uint32_t nodeHeapCaps) {
     handheld::assertDeviceOwner();
-    if (_ctx) end();
+    if (_maintenanceRadio && !maintenanceDrained()) return false;
+    if (_maintenanceRadio && !_ctx) end();
+    if (_ctx) {
+        stopReceive(); pollReceive();
+        if (!receiveDrained()) return false;
+        end();
+    }
 
     rs_handheld_status_t st = rs_handheld_rns_init(&_ctx);
     if (st != RS_HANDHELD_OK || !_ctx) {
@@ -88,9 +95,8 @@ bool ProtocolRuntime::begin(FlashStore* flash, SDStore* sd, IdentityManager* idM
     _pump.begin(_ctx, &_clock);
     _pump.setSink(this);
     if (!startEngines(flash, sd, store, announceMgr)) return false;
-    // Boot restore (micro LXMFManager::begin parity): re-queue persisted
-    // QUEUED/SENDING outgoing so a reboot doesn't strand them at QUEUED forever.
-    if (_enginesUp && store) _lxmf.restorePending(store->startupPendingOutgoing());
+    // The outgoing owner recovers persisted records through bounded metadata
+    // queries; it never materializes a second startup collection of bodies.
     Serial.printf("[RUST] backend up: identity=%s dest=%s node=%u bytes (%s) engines=%s\n",
                   _identityHashStr.c_str(), _destHashStr.c_str(),
                   (unsigned)_nodeBufLen,
@@ -129,8 +135,8 @@ bool ProtocolRuntime::startEngines(FlashStore* flash, SDStore* sd, MessageStore*
     rd.lxmf = &_lxmf;
     _resources.begin(rd);
     // Resource proof = delivery ack: flip the tracked resource-sent message DELIVERED/FAILED.
-    _resources.setOutcomeCallback([this](const uint8_t* peerDest, bool delivered) {
-        _lxmf.onResourceOutcome(peerDest, delivered);
+    _resources.setOutcomeCallback([this](handheld::outgoing::Ticket ticket, bool delivered) {
+        _lxmf.onResourceOutcome(ticket, delivered);
     });
 
     RustLxmfEngine::Deps ed;
@@ -144,7 +150,7 @@ bool ProtocolRuntime::startEngines(FlashStore* flash, SDStore* sd, MessageStore*
     ed.onMessage = &_onMessage;
     ed.statusCb = &_statusCb;
     ed.ourDestHash = _destHash;
-    _lxmf.begin(ed);
+    if (!_lxmf.begin(ed)) return false;
     _enginesUp = true;
     return true;
 }
@@ -270,8 +276,52 @@ bool ProtocolRuntime::openTransport(int32_t profile, uint32_t nodeHeapCaps) {
     return true;
 }
 
+void ProtocolRuntime::stopReceive() {
+    handheld::assertDeviceOwner();
+    _lxmf.incoming().stopAdmissions();
+    _lxmf.stopAdmissions();
+}
+void ProtocolRuntime::pollReceive() {
+    handheld::assertDeviceOwner();
+    _lxmf.loop();
+}
+
+void ProtocolRuntime::beginMaintenance(LoRaInterface& radio) {
+    handheld::assertDeviceOwner();
+    if (_maintenanceRadio) {
+        configASSERT(_maintenanceRadio == &radio);
+        return;
+    }
+    _maintenanceRadio = &radio;
+    stopReceive();
+    radio.beginMaintenance();
+    _pump.stop();
+    _pathRespPendingUntil = _normalAnnouncePendingUntil = 0;
+    _announceTiming = 0;
+    _normalAnnouncePendingLen = _pendingPathResponseTagLen = 0;
+}
+
+void ProtocolRuntime::pollMaintenance() {
+    handheld::assertDeviceOwner();
+    if (!_maintenanceRadio) return;
+    pollReceive();
+    _maintenanceRadio->pollMaintenance();
+}
+
+bool ProtocolRuntime::maintenanceDrained() const {
+    handheld::assertDeviceOwner();
+    return _maintenanceRadio && _maintenanceRadio->maintenanceDrained() && receiveDrained();
+}
+
+bool ProtocolRuntime::maintenanceFailed() const {
+    handheld::assertDeviceOwner();
+    return _maintenanceRadio && _maintenanceRadio->maintenanceFailed();
+}
+
 void ProtocolRuntime::end() {
     handheld::assertDeviceOwner();
+    configASSERT(!_maintenanceRadio || maintenanceDrained());
+    stopReceive();
     // Teardown: the ctx is still live and the pump is stopped, so nothing can dirty the table
     // between here and shutdown. Without this, up to PEER_SAVE_INTERVAL_MS of learning is lost.
     if (_ctx) {
@@ -280,8 +330,12 @@ void ProtocolRuntime::end() {
     }
     // Teardown order (header contract): pump quiesce (no late sink RX/TX into a
     // freed node) -> resource closes + link zeroize -> shutdown(ctx) -> free(buf).
-    _enginesUp = false;
     _pump.stop();
+    pollReceive();
+    configASSERT(receiveDrained());
+    _pump.setReceiptHook(nullptr, nullptr);
+    _lxmf.incoming().detach();
+    _enginesUp = false;
     _resources.endAll();
     _links.endAll();
     if (_ctx) {
@@ -299,26 +353,32 @@ void ProtocolRuntime::end() {
     _pathRespPendingUntil = 0;
     _normalAnnouncePendingUntil = 0;
     _normalAnnouncePendingLen = 0;
+    _announceTiming = 0;
     _pendingPathResponseTagLen = 0;
     _pathResponseCache.clear();
+    _maintenanceRadio = nullptr;
 }
 
 void ProtocolRuntime::loop() {
     handheld::assertDeviceOwner();
+    if (_maintenanceRadio) { pollMaintenance(); return; }
     if (!_ctx || !_nodeOpen) return;
     _pump.loop();
     // Fire a scheduled path-response re-announce off the ingest callstack once the grace window
     // elapses (fix map §4) — a burst of requests inside the window collapses into this one answer.
-    if (_pathRespPendingUntil != 0 && millis() >= _pathRespPendingUntil) {
+    if ((_announceTiming & PathPending) && int32_t(uint32_t(millis()) - _pathRespPendingUntil) >= 0) {
+        _announceTiming &= ~PathPending;
         _pathRespPendingUntil = 0;
         sendPathResponseAnnounce();
     }
-    if (_normalAnnouncePendingUntil != 0 && millis() >= _normalAnnouncePendingUntil) {
+    if ((_announceTiming & NormalPending) && int32_t(uint32_t(millis()) - _normalAnnouncePendingUntil) >= 0) {
+        _announceTiming &= ~NormalPending;
         _normalAnnouncePendingUntil = 0;
         const uint8_t* app = _normalAnnouncePendingLen ? _lastAppData : nullptr;
         if (emitAnnounce(app, _normalAnnouncePendingLen, RustWire::CTX_NONE, false) ==
             AnnounceResult::Deferred) {
             _normalAnnouncePendingUntil = millis() + 1000;
+            _announceTiming |= NormalPending;
         }
     }
     if (_enginesUp) {
@@ -363,6 +423,7 @@ uint32_t ProtocolRuntime::announceFilterCount() const {
 
 void ProtocolRuntime::onAnnounceEvent(const rs_handheld_announce_event_t& ev, uint8_t ifaceId) {
     handheld::assertDeviceOwner();
+    if (_maintenanceRadio) return;
     // Transport freshness was accepted before this event. KeyMap continuity must then accept
     // before the peer-ratchet table is allowed to change.
     if (!RustAnnouncePolicy::accept(_ctx, _keymap, _ratchets, ev, RustClock::epochSecs(),
@@ -395,7 +456,7 @@ void ProtocolRuntime::onAnnounceEvent(const rs_handheld_announce_event_t& ev, ui
 void ProtocolRuntime::onLocalFrame(const rs_handheld_local_frame_t& f, uint8_t ifaceId) {
     handheld::assertDeviceOwner();
     (void)ifaceId;
-    if (!_enginesUp) return;
+    if (!_enginesUp || _maintenanceRadio) return;
     switch (f.packet_type) {
         case RustWire::PT_LINKREQUEST:
             _links.onLocalFrame(f, ifaceId);
@@ -433,11 +494,17 @@ void ProtocolRuntime::seedAnnounceAppData(const uint8_t* appData, size_t len) {
     if (!appData || len == 0 || len > APP_DATA_MAX) return;
     memcpy(_lastAppData, appData, len);
     _lastAppDataLen = len;
+    // Nonempty deferred announces borrow this same buffer. A committed name
+    // change replaces both bytes and length; an explicitly empty retry stays empty.
+    if ((_announceTiming & NormalPending) && _normalAnnouncePendingLen)
+        _normalAnnouncePendingLen = len;
 }
 
 ProtocolBackend::AnnounceResult ProtocolRuntime::announce(const uint8_t* appData, size_t len) {
     handheld::assertDeviceOwner();
+    if (_maintenanceRadio) return AnnounceResult::Failed;
     // A newer caller request supersedes any same-second retry retained for the previous call.
+    _announceTiming &= ~NormalPending;
     _normalAnnouncePendingUntil = 0;
     _normalAnnouncePendingLen = 0;
     // Cache the display-name app_data so a later path response can reuse it (fix map §4).
@@ -450,6 +517,7 @@ ProtocolBackend::AnnounceResult ProtocolRuntime::announce(const uint8_t* appData
         if (len <= APP_DATA_MAX && (len == 0 || appData)) {
             _normalAnnouncePendingLen = len;
             _normalAnnouncePendingUntil = millis() + 1000;
+            _announceTiming |= NormalPending;
         } else {
             Serial.println("[RUST] announce deferred but app_data is too large to retain");
             return AnnounceResult::Failed;
@@ -502,8 +570,11 @@ ProtocolRuntime::AnnounceResult ProtocolRuntime::emitAnnounce(const uint8_t* app
         Serial.printf("[RUST] announce frame build failed (%d)\n", (int)st);
         return AnnounceResult::Failed;
     }
+    handheld::TxLease responseLease;
     const bool accepted = pathResponse
-                              ? _pump.sendTo(_pendingPathResponseIface, raw, rawLen)
+                              ? (_pump.captureLease(_pendingPathResponseIface, raw, rawLen,
+                                                    responseLease) &&
+                                 _pump.sendLeased(raw, rawLen, responseLease))
                               : _pump.sendAll(raw, rawLen);
     if (!accepted) {
         Serial.println("[RUST] announce not accepted by any eligible interface");
@@ -511,7 +582,7 @@ ProtocolRuntime::AnnounceResult ProtocolRuntime::emitAnnounce(const uint8_t* app
     }
     if (pathResponse && _pendingPathResponseTagLen > 0) {
         _pathResponseCache.store(_pendingPathResponseTag, _pendingPathResponseTagLen, raw, rawLen,
-                                 _clock.nowMs());
+                                 _clock.nowMs(), responseLease);
     }
     _lastAnnounceMs = millis();
     Serial.printf("[RUST] announce TX %u bytes app=%u%s%s\n", (unsigned)rawLen, (unsigned)len,
@@ -530,6 +601,7 @@ ProtocolRuntime::AnnounceResult ProtocolRuntime::emitAnnounce(const uint8_t* app
 
 void ProtocolRuntime::onOwnPathRequest(uint8_t ifaceId, const uint8_t tag[16], size_t tagLen) {
     handheld::assertDeviceOwner();
+    if (_maintenanceRadio) return;
     if (!tag || tagLen == 0 || tagLen > sizeof(_pendingPathResponseTag)) return;
     memset(_pendingPathResponseTag, 0, sizeof(_pendingPathResponseTag));
     memcpy(_pendingPathResponseTag, tag, tagLen);
@@ -537,19 +609,22 @@ void ProtocolRuntime::onOwnPathRequest(uint8_t ifaceId, const uint8_t tag[16], s
     _pendingPathResponseIface = ifaceId;
     // A peer's cached path to us expired and it requested ours (endpoint parity with Python
     // Transport.path_request local-dest branch). Schedule a throttled PATH_RESPONSE re-announce.
-    RustWire::schedulePathResponse(millis(), PATH_REQUEST_GRACE_MS, PATH_RESP_DEDUP_MS,
-                                   _pathRespPendingUntil, _lastPathRespMs);
+    if (RustWire::schedulePathResponse(millis(), PATH_REQUEST_GRACE_MS, PATH_RESP_DEDUP_MS,
+            _pathRespPendingUntil, _lastPathRespMs, _announceTiming & PathPending,
+            _announceTiming & HasPathResponseTime)) _announceTiming |= PathPending;
 }
 
 void ProtocolRuntime::sendPathResponseAnnounce() {
     handheld::assertDeviceOwner();
     const uint8_t* cachedRaw = nullptr;
+    const handheld::TxLease* cachedLease = nullptr;
     size_t cachedRawLen = 0;
     if (_pathResponseCache.recall(_pendingPathResponseTag, _pendingPathResponseTagLen,
-                                  _clock.nowMs(), cachedRaw, cachedRawLen)) {
-        if (_pump.sendTo(_pendingPathResponseIface, cachedRaw, cachedRawLen)) {
+                                  _clock.nowMs(), cachedRaw, cachedRawLen, cachedLease)) {
+        if (_pump.sendRetainedTo(_pendingPathResponseIface, cachedRaw, cachedRawLen, *cachedLease)) {
             _lastAnnounceMs = millis();
             _lastPathRespMs = millis();
+            _announceTiming |= HasPathResponseTime;
             Serial.printf("[RUST] path-response replay TX %u exact cached bytes\n",
                           (unsigned)cachedRawLen);
         } else {
@@ -563,27 +638,72 @@ void ProtocolRuntime::sendPathResponseAnnounce() {
         emitAnnounce(app, _lastAppDataLen, RustWire::CTX_PATH_RESPONSE, true);
     if (result == AnnounceResult::Sent) {
         _lastPathRespMs = millis();
+        _announceTiming |= HasPathResponseTime;
     } else if (result == AnnounceResult::Deferred) {
         // Never mark a deferred response as transmitted. Retry once the 1-second wall-order
         // granularity can advance; this avoids fabricating a timestamp a few seconds in future.
         _pathRespPendingUntil = millis() + 1000;
+        _announceTiming |= PathPending;
     }
 }
 
-bool ProtocolRuntime::lxmfSendMessage(const uint8_t dest[16], const char* content, const char* title,
-                                  bool preferLink) {
+handheld::outgoing::Submission ProtocolRuntime::lxmfSubmit(const uint8_t dest[16],
+        const uint8_t* title, size_t titleLength, const uint8_t* content,
+        size_t contentLength, bool preferLink) {
     handheld::assertDeviceOwner();
-    if (!_enginesUp) {
-        Serial.println("[RUST] LXMF send: backend not ready");
-        return false;
-    }
-    return _lxmf.send(dest, content, title, preferLink);
+    if (!_enginesUp) return {};
+    return _lxmf.submit(dest, title, titleLength, content, contentLength, preferLink);
 }
 
-void ProtocolRuntime::lxmfDropPeer(const std::string& peerHex) {
+handheld::outgoing::Poll ProtocolRuntime::lxmfPoll(handheld::outgoing::Ticket ticket,
+        handheld::outgoing::InitialResult& result) const {
     handheld::assertDeviceOwner();
-    if (!_enginesUp) return;
-    uint8_t dest[16];
-    if (!hexToBytes(peerHex, dest, sizeof(dest))) return;
-    _lxmf.dropPeer(dest);
+    return _enginesUp ? _lxmf.poll(ticket, result) : handheld::outgoing::Poll::Invalid;
+}
+
+bool ProtocolRuntime::lxmfAcknowledge(handheld::outgoing::Ticket ticket) {
+    handheld::assertDeviceOwner();
+    return _enginesUp && _lxmf.acknowledge(ticket);
+}
+
+bool ProtocolRuntime::lxmfCancel(handheld::outgoing::Ticket ticket) {
+    handheld::assertDeviceOwner();
+    return _enginesUp && _lxmf.cancel(ticket);
+}
+
+bool ProtocolRuntime::lxmfStatus(const handheld::storage::RecordKey& key,
+        handheld::outgoing::StatusView& result) const {
+    handheld::assertDeviceOwner();
+    return _enginesUp && _lxmf.status(key, result);
+}
+
+uint32_t ProtocolRuntime::lxmfStatusRevision() const {
+    handheld::assertDeviceOwner();
+    return _enginesUp ? _lxmf.statusRevision() : 0;
+}
+
+void ProtocolRuntime::lxmfStopAdmissions() {
+    handheld::assertDeviceOwner();
+    if (_enginesUp) _lxmf.stopAdmissions();
+}
+
+bool ProtocolRuntime::lxmfDrained() const {
+    handheld::assertDeviceOwner();
+    return !_enginesUp || _lxmf.drained();
+}
+
+handheld::storage::Error ProtocolRuntime::lxmfDrainError() const {
+    handheld::assertDeviceOwner();
+    return _enginesUp ? _lxmf.drainError() : handheld::storage::Error::None;
+}
+
+bool ProtocolRuntime::lxmfBeginPeerDelete(const uint8_t peer[16]) {
+    handheld::assertDeviceOwner();
+    return _enginesUp && _lxmf.beginPeerDelete(peer);
+}
+
+void ProtocolRuntime::lxmfFinishPeerDelete(const uint8_t peer[16],
+        const handheld::storage::Result& result) {
+    handheld::assertDeviceOwner();
+    if (_enginesUp) _lxmf.finishPeerDelete(peer, result);
 }

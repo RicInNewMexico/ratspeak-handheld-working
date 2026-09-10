@@ -14,12 +14,17 @@ extern const lv_font_t lv_font_rsdeck_14;
 // Without this, colors appear pixelated/glitchy
 #define LV_COLOR_16_SWAP 1
 
-// Memory: route all LVGL allocations to PSRAM via heap_caps
+// Shared UI owner enforces the LVGL ceiling and PSRAM admission reserve.
 #define LV_MEM_CUSTOM 1
-#define LV_MEM_CUSTOM_INCLUDE <esp_heap_caps.h>
-#define LV_MEM_CUSTOM_ALLOC(size)       heap_caps_malloc(size, MALLOC_CAP_SPIRAM)
-#define LV_MEM_CUSTOM_FREE              heap_caps_free
-#define LV_MEM_CUSTOM_REALLOC(p, size)  heap_caps_realloc(p, size, MALLOC_CAP_SPIRAM)
+#define LV_MEM_CUSTOM_INCLUDE "LvMemory.h"
+#define LV_MEM_CUSTOM_ALLOC(size)       handheld_lvgl_alloc(size)
+#define LV_MEM_CUSTOM_FREE              handheld_lvgl_free
+#define LV_MEM_CUSTOM_REALLOC(p, size)  handheld_lvgl_realloc(p, size)
+
+// Fail visibly without reentering a partially updated widget tree.
+#define LV_USE_ASSERT_MALLOC 1
+#define LV_ASSERT_HANDLER_INCLUDE "LvFailure.h"
+#define LV_ASSERT_HANDLER handheld_lvgl_fail();
 
 // Tick: custom (provided by main loop)
 #define LV_TICK_CUSTOM 1

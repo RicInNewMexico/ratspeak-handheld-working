@@ -83,7 +83,7 @@ void LvTimezoneScreen::createUI(lv_obj_t* parent) {
                                   LV_LABEL_LONG_DOT);
     lv_obj_align(eyebrow, LV_ALIGN_TOP_MID, 0, 8);
 
-    lv_obj_t* title = makeLabel(parent, "TIMEZONE", &lv_font_montserrat_16,
+    lv_obj_t* title = _saveTitle = makeLabel(parent, "TIMEZONE", &lv_font_montserrat_16,
                                 Theme::ACCENT, 260, LV_TEXT_ALIGN_CENTER,
                                 LV_LABEL_LONG_DOT);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
@@ -149,9 +149,11 @@ void LvTimezoneScreen::createUI(lv_obj_t* parent) {
         self->stepSelection(1);
     }, LV_EVENT_CLICKED, this);
 #endif
+    setSaving(_saving);
 }
 
 void LvTimezoneScreen::stepSelection(int delta) {
+    if (_saving) return;
     if (!_roller) return;
 
     int sel = lv_roller_get_selected(_roller);
@@ -161,7 +163,34 @@ void LvTimezoneScreen::stepSelection(int delta) {
     lv_roller_set_selected(_roller, sel, LV_ANIM_ON);
 }
 
+void LvTimezoneScreen::setSaving(bool saving) {
+    _saving = saving;
+    if (!_screen) return; // Terminal completion may arrive after UIManager destroyed the widgets.
+    if (_saveTitle) lv_label_set_text(_saveTitle, saving ? "SAVING TIMEZONE" : "TIMEZONE");
+    if (_roller) {
+        if (saving) lv_obj_add_state(_roller, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_roller, LV_STATE_DISABLED);
+    }
+    if (_upButton) {
+        if (saving) lv_obj_add_state(_upButton, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_upButton, LV_STATE_DISABLED);
+    }
+    if (_downButton) {
+        if (saving) lv_obj_add_state(_downButton, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_downButton, LV_STATE_DISABLED);
+    }
+    if (_doneButton) {
+        if (saving) lv_obj_add_state(_doneButton, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_doneButton, LV_STATE_DISABLED);
+    }
+    if (_doneButton) {
+        lv_obj_t* label = lv_obj_get_child(_doneButton, 0);
+        if (label) lv_label_set_text(label, saving ? "SAVING" : "DONE");
+    }
+}
+
 void LvTimezoneScreen::submit(bool enforceEnterGuard) {
+    if (_saving) return;
     if (!_roller) return;
     if (enforceEnterGuard && millis() - _enterTime < ENTER_GUARD_MS) return;
 
@@ -170,6 +199,7 @@ void LvTimezoneScreen::submit(bool enforceEnterGuard) {
 }
 
 bool LvTimezoneScreen::handleKey(const KeyEvent& event) {
+    if (_saving) return true;
     if (!_roller) return true;
     if (event.enter || event.character == '\n' || event.character == '\r') {
         submit(true);

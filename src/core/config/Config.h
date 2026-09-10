@@ -58,9 +58,6 @@
 #ifndef USERCONFIG_NVS_BACKUP
 #define USERCONFIG_NVS_BACKUP        0     // 1 = mirror full user config JSON to NVS (ns NVS_NS_CFG)
 #endif
-#ifndef TCP_SHARED_BUFFERS
-#define TCP_SHARED_BUFFERS           0     // 1 = one static rx/tx/wrap buffer set for all connections
-#endif
 #ifndef BOARD_DEFAULT_SD_STORAGE
 #define BOARD_DEFAULT_SD_STORAGE     0     // UserSettings.sdStorageEnabled default
 #endif
@@ -80,7 +77,7 @@
 #define LEGACY_READ_CTR_MIGRATION    0     // 1 = one-time .read_ctr -> read:true rewrite at boot
 #endif
 #ifndef LEGACY_MSG_FILENAME_MIGRATION
-#define LEGACY_MSG_FILENAME_MIGRATION 0    // 1 = pre-2.0 filename rename pass, gated on !fs_migrated
+#define LEGACY_MSG_FILENAME_MIGRATION 0    // 1 = pre-2.0 filenames; scan available media at each boot
 #endif
 
 // --- Power Management ---
@@ -108,7 +105,5 @@ static const char* const REGION_LABELS[REGION_COUNT] = {
 // --- Serial Debug ---
 #define SERIAL_BAUD  115200
 
-// --- Shared Utilities (defined in main.cpp) ---
-#include <Arduino.h>
-#include "util/Bytes.h"
-rs::Bytes encodeAnnounceName(const String& name);
+// --- Shared Utilities ---
+#include "util/AnnounceData.h"

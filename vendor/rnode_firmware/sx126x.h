@@ -40,6 +40,7 @@ public:
   uint8_t packetSnrRaw();
   float packetSnr();
   long packetFrequencyError();
+  uint32_t getAirtime(uint16_t physicalBytes) const;
 
   // from Print
   virtual size_t write(uint8_t byte);
@@ -53,7 +54,7 @@ public:
 
   void onReceive(void(*callback)(int));
 
-  #if BOARD_MODEL == BOARD_TDECK
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
     void serviceInterrupt();
   #endif
 
@@ -81,7 +82,8 @@ public:
 
   void rxAntEnable();
   bool loraMode();
-  void waitOnBusy();
+  bool waitOnBusy(uint32_t capMs = 100);
+  bool ioFailed() const { return _io_failed; }
   void executeOpcode(uint8_t opcode, uint8_t *buffer, uint8_t size);
   void executeOpcodeRead(uint8_t opcode, uint8_t *buffer, uint8_t size);
   void writeBuffer(const uint8_t* buffer, size_t size);
@@ -142,7 +144,9 @@ private:
   int _fifo_rx_addr_ptr;
   uint8_t _packet[255];
   bool _preinit_done;
-  #if BOARD_MODEL == BOARD_TDECK
+  bool _io_failed = false;
+  bool _sleeping = false;
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
     volatile bool _irq_pending;
   #endif
   void (*_onReceive)(int);

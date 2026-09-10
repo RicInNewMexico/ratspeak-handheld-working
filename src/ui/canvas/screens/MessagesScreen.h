@@ -1,9 +1,9 @@
 #pragma once
 
-#include <map>
 #include "Screen.h"
 #include "widgets/ScrollList.h"
 #include "reticulum/LXMFManager.h"
+#include "history/ConversationWindow.h"
 
 class AnnounceManager;
 class ProtocolBackend;
@@ -14,6 +14,7 @@ public:
     bool handleKey(const KeyEvent& event) override;
     const char* title() const override { return "Messages"; }
     void onEnter() override;
+    void onExit() override { _visible = false; _conversations.close(); }
 
     void setLXMFManager(LXMFManager* lxmf) { _lxmf = lxmf; }
     void setAnnounceManager(AnnounceManager* am) { _am = am; }
@@ -28,9 +29,15 @@ public:
     void setAddContactCallback(AddContactCb cb) { _addContactCb = cb; }
 
     void notifyNewMessage() { _needsRefresh = true; }
+    bool pollConversations(bool allowAdmission = true);
+    // The app consumes accepted deletion results even while this screen is hidden.
+    bool pollDeletion();
 
 private:
-    void refreshList();
+    using Conversations = handheld::history::ConversationWindow<16>;
+    std::string peerHex(size_t index) const;
+    std::string peerLabel(const std::string& peer) const;
+    void renderList(M5Canvas&, int y, int height);
     void showContextMenu(int idx);
     void executeContextAction();
     void exitContextMenu();
@@ -38,12 +45,14 @@ private:
     LXMFManager* _lxmf = nullptr;
     AnnounceManager* _am = nullptr;
     ProtocolBackend* _backend = nullptr;
-    ScrollList _list;
-    std::vector<std::string> _peerHexes;
-    unsigned long _lastRefresh = 0;
+    Conversations _conversations;
     OpenConversationCb _openCb;
     AddContactCb _addContactCb;
-    bool _needsRefresh = false;
+    bool _needsRefresh = false, _visible = false, _deleteSettled = false;
+    handheld::storage::Ticket _deleteTicket;
+    uint8_t _deletePeer[16] = {};
+    const char* _deleteNotice = nullptr;
+    uint32_t _deleteNoticeSince = 0;
 
     // Context menu (triggered by Delete key)
     bool _showingContext = false;

@@ -30,12 +30,13 @@ void TimezoneScreen::render(M5Canvas& canvas) {
     _list.render(canvas, 0, y, Theme::CONTENT_W,
                  Theme::CONTENT_H - (y - Theme::CONTENT_Y) - hintH);
     canvas.setTextColor(Theme::MUTED);
-    canvas.drawString("Fn+arrows move | Enter select", 8,
+    canvas.drawString(_saveStatus ? _saveStatus : "Fn+arrows move | Enter select", 8,
                       Theme::CONTENT_Y + Theme::CONTENT_H - Theme::CHAR_H);
     Theme::useSmallFont(canvas);
 }
 
 bool TimezoneScreen::handleKey(const KeyEvent& event) {
+    if (_savePending) return true;
     if (event.navPrevious()) {
         _list.scrollUp();
         return true;

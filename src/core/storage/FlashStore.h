@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+namespace handheld::storage { enum class Error : uint8_t; class AtomicSource; }
 
 class FlashStore {
 public:
@@ -12,6 +13,7 @@ public:
 
     // Atomic write: .tmp → validate → rename .bak → rename .tmp → primary
     bool writeAtomic(const char* path, const uint8_t* data, size_t len);
+    handheld::storage::Error writeAtomic(const char* path, const handheld::storage::AtomicSource& source);
     // Simple direct write (no rename dance — WriteQueue / small config files)
     bool writeDirect(const char* path, const uint8_t* data, size_t len);
     bool readFile(const char* path, uint8_t* buffer, size_t maxLen, size_t& bytesRead);
@@ -21,6 +23,11 @@ public:
 
     bool writeString(const char* path, const String& data);
     String readString(const char* path);
+    // Recovery-sensitive records never hide an existing primary open failure
+    // behind a backup. Backup is considered only when primary is absent.
+    enum class RecordSource : uint8_t { Absent, Primary, Backup, Unavailable, Invalid };
+    RecordSource readRecord(const char* path, String& out, size_t maxBytes = 32768,
+                            bool (*reserve)(String&, size_t) = nullptr);
 
     bool ensureDir(const char* path);
     bool exists(const char* path);
@@ -38,9 +45,18 @@ public:
 
     bool format();
 
+    // A mounted reset intent blocks normal begin() before config/identity
+    // recovery. Only an explicitly confirmed, quiescent reset may use these.
+    enum class ResetState : uint8_t { Clear, Pending, Unavailable };
+    ResetState resetState() const { return _resetState; }
+    bool resetScope(bool& includesSD);
+    bool prepareReset(bool includesSD, bool replaceInvalidScope = false);
+    bool wipeForReset();
+    bool completeReset();
+
     bool isReady() const { return _ready; }
-    size_t totalBytes() const { return _ready ? LittleFS.totalBytes() : 0; }
-    size_t usedBytes() const { return _ready ? LittleFS.usedBytes() : 0; }
+    size_t totalBytes() const;
+    size_t usedBytes() const;
 
     // Global LittleFS mutex — serializes WriteQueue and direct callers
     // and the WriteQueue task. Created on first begin().
@@ -49,6 +65,7 @@ public:
 private:
     void recoverAtomicArtifacts();
     bool _ready = false;
+    ResetState _resetState = ResetState::Unavailable;
     static SemaphoreHandle_t _mutex;
 };
 

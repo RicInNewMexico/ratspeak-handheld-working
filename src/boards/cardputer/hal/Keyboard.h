@@ -29,6 +29,7 @@ struct KeyEvent {
     bool down = false;
     bool left = false;
     bool right = false;
+    bool repeat = false; // Deletion may repeat inside text; back/dismiss must not.
 
     // The punctuation keys carry the printed arrows on the Cardputer. Bare
     // punctuation remains a convenient navigation alias outside text fields;
@@ -41,10 +42,14 @@ struct KeyEvent {
     bool navNext() const { return navDown() || navRight(); }
 };
 
+static_assert(sizeof(KeyEvent) == 17, "Canvas event accounting must retain its actual size");
+
 class Keyboard {
 public:
     void begin();
     void update();
+    // Consume the wake burst and cancel synthesis until a fresh press.
+    void discardPending();
 
     // Mode control
     InputMode getMode() const { return _mode; }
@@ -64,7 +69,6 @@ public:
 
 private:
     KeyEvent eventForKey(uint8_t row, uint8_t col) const;
-    KeyEvent currentEvent() const;
 
     InputMode _mode = InputMode::Navigation;
     KeyEvent _event = {};
@@ -73,7 +77,7 @@ private:
     bool _pressed[4][14] = {};
     bool _capsLocked = false;
     bool _keyHeld = false;
-    KeyEvent _heldEvent = {};
+    uint8_t _heldRow = 0, _heldCol = 0;
     unsigned long _heldSince = 0;
     unsigned long _lastRepeat = 0;
     KeyCallback _keyCallback;

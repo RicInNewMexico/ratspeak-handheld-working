@@ -1,5 +1,8 @@
 #include "FlashStore.h"
-#include "runtime/TaskOwner.h"
+#include "storage/StorageLease.h"
+#include "storage/AtomicStream.h"
+#include "storage/ResetDirectory.h"
+#include "storage/TreeWipe.h"
 #include "util/PerfTrace.h"
 #include <esp_partition.h>
 #include <algorithm>
@@ -8,7 +11,7 @@
 SemaphoreHandle_t FlashStore::_mutex = nullptr;
 
 SemaphoreHandle_t FlashStore::mutex() {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
     return _mutex;
 }
 
@@ -17,6 +20,26 @@ namespace {
 // labels the equivalent partition "spiffs". Try ours first, fall back.
 const char* FLASH_PARTITION_LABELS[] = {"littlefs", "spiffs"};
 constexpr const char* FLASH_BASE_PATH = "/littlefs";
+constexpr const char* RESET_SCOPE = "/.factory-reset";
+constexpr const char* RESET_NAME = ".factory-reset";
+constexpr const char* RESET_PATHS[] = {RESET_SCOPE, "/.factory-reset.tmp", "/.factory-reset.bak"};
+constexpr uint8_t RESET_MAGIC[] = {'R', 'S', 'R', 'E', 'S', 'E', 'T', 1};
+
+bool resetArtifact(const char* name) {
+    return !strcmp(name, RESET_NAME) || !strcmp(name, ".factory-reset.tmp") ||
+           !strcmp(name, ".factory-reset.bak");
+}
+
+FlashStore::ResetState resetStateLocked() {
+    using namespace handheld::storage::reset;
+    bool pending = false;
+    for (const char* path : RESET_PATHS) {
+        const auto state = probe(FLASH_BASE_PATH, path);
+        if (state == Presence::Unavailable) return FlashStore::ResetState::Unavailable;
+        pending |= state != Presence::Absent;
+    }
+    return pending ? FlashStore::ResetState::Pending : FlashStore::ResetState::Clear;
+}
 
 const esp_partition_t* dataPartition() {
     for (const char* label : FLASH_PARTITION_LABELS) {
@@ -112,7 +135,10 @@ void recoverArtifactsInDir(const char* dirPath,
 }  // namespace
 
 bool FlashStore::begin() {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    if (!handheld::storage::StorageLease::initialize()) return false;
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     // Create mutex before any LittleFS access
     if (!_mutex) {
         _mutex = xSemaphoreCreateMutex();
@@ -121,6 +147,7 @@ bool FlashStore::begin() {
 
     FSLock lock;
     _ready = false;
+    _resetState = ResetState::Unavailable;
 
     const auto* partition = dataPartition();
     if (!partition) return false;
@@ -134,6 +161,11 @@ bool FlashStore::begin() {
         if (!LittleFS.begin(true, FLASH_BASE_PATH, 10, partition->label)) return false;
     }
     _ready = true;
+
+    // Never restore backups or initialize application directories while a
+    // destructive operation is incomplete (including an unreadable probe).
+    _resetState = resetStateLocked();
+    if (_resetState != ResetState::Clear) return false;
 
     ensureDirLocked("/identity");
     ensureDirLocked("/transport");
@@ -155,7 +187,9 @@ bool FlashStore::begin() {
 // /messages to avoid an extra full history walk at boot. MessageStore discovers
 // backup-only files and validates both media while reading history.
 void FlashStore::recoverAtomicArtifacts() {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return ;
     static const char* dirs[] = {"/config", "/contacts", "/identity", "/transport"};
     int recovered = 0;
     int removedTmp = 0;
@@ -172,139 +206,97 @@ void FlashStore::recoverAtomicArtifacts() {
 }
 
 void FlashStore::end() {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return ;
     FSLock lock;
     LittleFS.end();
     _ready = false;
 }
 
 bool FlashStore::ensureDir(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     if (!_ready) return false;
     FSLock lock;
     return ensureDirLocked(path);
 }
 
 bool FlashStore::exists(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     if (!_ready) return false;
     FSLock lock;
     return LittleFS.exists(path);
 }
 
 bool FlashStore::remove(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     if (!_ready) return false;
     FSLock lock;
     return LittleFS.remove(path);
 }
 
 bool FlashStore::removeDir(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     if (!_ready) return false;
     FSLock lock;
     return LittleFS.rmdir(path);
 }
 
 bool FlashStore::rename(const char* from, const char* to) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     if (!_ready) return false;
     FSLock lock;
     return LittleFS.rename(from, to);
 }
 
 File FlashStore::openDir(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return File();
     if (!_ready) return File();
     FSLock lock;
     return LittleFS.open(path);
 }
 
 File FlashStore::openFile(const char* path, const char* mode) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return File();
     if (!_ready) return File();
     FSLock lock;
     return LittleFS.open(path, mode);
 }
 
 bool FlashStore::writeAtomic(const char* path, const uint8_t* data, size_t len) {
-    handheld::assertDeviceOwner();
-    unsigned long startMs = PerfTrace::nowMs();
-    if (!_ready) {
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-    // Refuse writes when heap is critically low — prevents OOM-induced LittleFS unmount
-    if (ESP.getFreeHeap() < 4096) {
-        Serial.printf("[FLASH] Write refused (heap=%lu) — OOM protection: %s\n",
-                      (unsigned long)ESP.getFreeHeap(), path);
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-    FSLock lock;
+    handheld::storage::MemorySource source(data, len);
+    return writeAtomic(path, source) == handheld::storage::Error::None;
+}
 
-    String tmpPath = String(path) + ".tmp";
-    String bakPath = String(path) + ".bak";
-
-    File f = LittleFS.open(tmpPath.c_str(), "w");
-    if (!f) {
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-    size_t written = f.write(data, len);
-    f.close();
-    if (written != len) {
-        LittleFS.remove(tmpPath.c_str());
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-
-    File verify = LittleFS.open(tmpPath.c_str(), "r");
-    if (!verify || verify.size() != len) {
-        if (verify) verify.close();
-        LittleFS.remove(tmpPath.c_str());
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-    uint8_t check[512];
-    for (size_t offset = 0; offset < len; offset += sizeof(check)) {
-        const size_t count = std::min(sizeof(check), len - offset);
-        if (verify.readBytes(reinterpret_cast<char*>(check), count) != count ||
-            memcmp(check, data + offset, count) != 0) {
-            verify.close(); LittleFS.remove(tmpPath.c_str());
-            return false;
-        }
-    }
-    verify.close();
-
-    if (LittleFS.exists(path)) {
-        if (LittleFS.exists(bakPath.c_str()) && !LittleFS.remove(bakPath.c_str())) return false;
-        if (!LittleFS.rename(path, bakPath.c_str())) {
-            LittleFS.remove(tmpPath.c_str());
-            Serial.printf("[FLASH] writeAtomic: backup rename failed for %s\n", path);
-            PerfTrace::write("flash", "atomic", path, len, startMs, false);
-            return false;
-        }
-    }
-
-    if (!LittleFS.rename(tmpPath.c_str(), path)) {
-        if (LittleFS.exists(bakPath.c_str())) {
-            LittleFS.rename(bakPath.c_str(), path);
-        }
-        LittleFS.remove(tmpPath.c_str());
-        PerfTrace::write("flash", "atomic", path, len, startMs, false);
-        return false;
-    }
-
-    // Clean up backup file after successful write
-    LittleFS.remove(bakPath.c_str());
-
-    PerfTrace::write("flash", "atomic", path, len, startMs, true);
-    return true;
+handheld::storage::Error FlashStore::writeAtomic(const char* path, const handheld::storage::AtomicSource& source) {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return handheld::storage::Error::Unavailable;
+    const unsigned long start = PerfTrace::nowMs();
+    const auto error = handheld::storage::atomicStream(*this, path, source);
+    PerfTrace::write("flash", "atomic", path, source.length(), start,
+                     error == handheld::storage::Error::None);
+    return error;
 }
 
 bool FlashStore::writeDirect(const char* path, const uint8_t* data, size_t len) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     unsigned long startMs = PerfTrace::nowMs();
     if (!_ready) {
         PerfTrace::write("flash", "direct", path, len, startMs, false);
@@ -330,12 +322,17 @@ bool FlashStore::writeDirect(const char* path, const uint8_t* data, size_t len) 
 }
 
 bool FlashStore::readFile(const char* path, uint8_t* buffer, size_t maxLen, size_t& bytesRead) {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     return readFileFully(path, buffer, maxLen, bytesRead);
 }
 
 bool FlashStore::readFileFully(const char* path, uint8_t* buffer, size_t maxLen,
                                size_t& bytesRead) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     bytesRead = 0;
     if (!_ready || !path || !buffer) return false;
     FSLock lock;
@@ -363,12 +360,16 @@ bool FlashStore::readFileFully(const char* path, uint8_t* buffer, size_t maxLen,
 }
 
 bool FlashStore::writeString(const char* path, const String& data) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     return writeAtomic(path, (const uint8_t*)data.c_str(), data.length());
 }
 
 String FlashStore::readString(const char* path) {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return String();
     if (!_ready) return "";
     FSLock lock;
     File f = LittleFS.open(path, "r");
@@ -396,12 +397,45 @@ String FlashStore::readString(const char* path) {
     return result;
 }
 
+FlashStore::RecordSource FlashStore::readRecord(const char* path, String& out, size_t maxBytes,
+                                               bool (*reserve)(String&, size_t)) {
+    handheld::storage::assertOwner();
+    out = "";
+    handheld::storage::StorageLease lease;
+    if (!lease.held() || !_ready || !path) return RecordSource::Unavailable;
+    FSLock lock;
+    const bool primary = LittleFS.exists(path);
+    const String selected = primary ? String(path) : String(path) + ".bak";
+    if (!primary && !LittleFS.exists(selected.c_str())) return RecordSource::Absent;
+    File file = LittleFS.open(selected.c_str(), "r");
+    if (!file) return RecordSource::Unavailable;
+    const size_t size = file.size();
+    if (!size || size > maxBytes || file.isDirectory()) { file.close(); return RecordSource::Invalid; }
+    if (!(reserve ? reserve(out, size) : out.reserve(size))) {
+        file.close(); return RecordSource::Unavailable;
+    }
+    char bytes[512];
+    for (size_t offset = 0; offset < size; offset += sizeof bytes) {
+        const size_t count = std::min(sizeof bytes, size - offset);
+        if (file.readBytes(bytes, count) != count || !out.concat(bytes, count)) {
+            file.close(); out = ""; return RecordSource::Unavailable;
+        }
+    }
+    file.close();
+    return primary ? RecordSource::Primary : RecordSource::Backup;
+}
+
 bool FlashStore::format() {
-    handheld::assertDeviceOwner();
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     Serial.println("[FLASH] Formatting LittleFS...");
     bool ok;
     {
         FSLock lock;
+        // The factory-reset intent must outlive NVS erase and internal data
+        // removal. A legacy/direct format must never erase that recovery gate.
+        if (!_ready || resetStateLocked() != ResetState::Clear) return false;
         LittleFS.end();
         _ready = false;
         ok = LittleFS.format();
@@ -409,4 +443,85 @@ bool FlashStore::format() {
     // Re-mount with fresh filesystem (begin() takes its own lock)
     if (ok) ok = begin();
     return ok;
+}
+
+bool FlashStore::resetScope(bool& includesSD) {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held() || !_ready) return false;
+    uint8_t bytes[12]; size_t length = 0;
+    if (!readFileFully(RESET_SCOPE, bytes, sizeof(bytes), length) || length != sizeof(bytes) ||
+        memcmp(bytes, RESET_MAGIC, sizeof(RESET_MAGIC)) || bytes[8] > 1 ||
+        bytes[9] != uint8_t(~bytes[8]) || bytes[10] || bytes[11]) return false;
+    includesSD = bytes[8] != 0;
+    return true;
+}
+
+bool FlashStore::prepareReset(bool includesSD, bool replaceInvalidScope) {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    if (!lease.held() || !_ready) return false;
+    {
+        FSLock lock;
+        using namespace handheld::storage::reset;
+        _resetState = resetStateLocked();
+        if (_resetState == ResetState::Unavailable) return false;
+        // A directory in a reserved record path cannot be overwritten safely.
+        for (const char* path : RESET_PATHS)
+            if (probe(FLASH_BASE_PATH, path) == Presence::Directory) return false;
+    }
+    bool originalScope = false;
+    if (resetScope(originalScope)) return originalScope == includesSD;
+    if (_resetState == ResetState::Pending && !replaceInvalidScope) return false;
+    uint8_t bytes[12]{};
+    memcpy(bytes, RESET_MAGIC, sizeof(RESET_MAGIC));
+    bytes[8] = includesSD ? 1 : 0; bytes[9] = uint8_t(~bytes[8]);
+    const bool written = writeAtomic(RESET_SCOPE, bytes, sizeof(bytes));
+    {
+        FSLock lock; _resetState = resetStateLocked();
+    }
+    return written && resetScope(originalScope) && originalScope == includesSD;
+}
+
+bool FlashStore::wipeForReset() {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    bool scope = false;
+    if (!lease.held() || !_ready || !resetScope(scope)) return false;
+    if (!handheld::storage::wipeTreeContents(*this, "/", resetArtifact)) return false;
+    FSLock lock;
+    return handheld::storage::reset::containsOnly(FLASH_BASE_PATH, resetArtifact);
+}
+
+bool FlashStore::completeReset() {
+    handheld::storage::assertOwner();
+    handheld::storage::StorageLease lease;
+    bool scope = false;
+    if (!lease.held() || !_ready || !resetScope(scope)) return false;
+    {
+        FSLock lock;
+        if (!handheld::storage::reset::containsOnly(FLASH_BASE_PATH, resetArtifact)) return false;
+    }
+    // Keep the full original scope in the primary until the final removal.
+    // In particular, a failed artifact cleanup never discards that metadata.
+    for (unsigned i = 1; i < 3; ++i) {
+        handheld::storage::reset::Presence state;
+        { FSLock lock; state = handheld::storage::reset::probe(FLASH_BASE_PATH, RESET_PATHS[i]); }
+        if (state == handheld::storage::reset::Presence::Absent) continue;
+        if (state != handheld::storage::reset::Presence::Other || !remove(RESET_PATHS[i])) return false;
+    }
+    if (!remove(RESET_SCOPE)) return false;
+    FSLock lock;
+    _resetState = resetStateLocked();
+    return _resetState == ResetState::Clear;
+}
+
+size_t FlashStore::totalBytes() const {
+    handheld::storage::assertOwner(); handheld::storage::StorageLease lease;
+    return lease.held() && _ready ? LittleFS.totalBytes() : 0;
+}
+
+size_t FlashStore::usedBytes() const {
+    handheld::storage::assertOwner(); handheld::storage::StorageLease lease;
+    return lease.held() && _ready ? LittleFS.usedBytes() : 0;
 }

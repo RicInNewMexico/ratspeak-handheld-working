@@ -14,7 +14,11 @@ public:
 
     static constexpr int MAX_NAME_LEN = 16;
 
+    void setSaving(bool saving);
+
 private:
+    bool _saving = false;
+    lv_obj_t* _saveTitle = nullptr;
     lv_obj_t* _textarea = nullptr;
     lv_obj_t* _doneButton = nullptr;
     std::function<void(const String&)> _doneCb;

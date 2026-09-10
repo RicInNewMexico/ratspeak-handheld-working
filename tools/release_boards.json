@@ -1,0 +1,72 @@
+{
+  "tdeck": {
+    "artifact_prefix": "rsdeck",
+    "app_suffix": "m5launcher",
+    "flash_size": "16MB",
+    "partition_csv": "partitions/dual-16mb.csv",
+    "standalone_partition_csv": "partitions/standalone-16mb.csv",
+    "rnode_target": "tdeck",
+    "rnode_prep_target": "prep-esp32",
+    "renderer": "lvgl",
+    "protocol_profile": "small",
+    "runtime": "dedicated",
+    "app_environments": [
+      "tdeck",
+      "tdeck_cooperative"
+    ],
+    "device_aliases": [
+      "rsdeck",
+      "ratdeck"
+    ],
+    "post_build_image": "rsdeck-merged.bin",
+    "standalone_flash_freq": null,
+    "rnode_partition_scheme": "no_ota",
+    "rnode_partition_csv": "partitions/rnode-no_ota.csv"
+  },
+  "tpager": {
+    "artifact_prefix": "rspager",
+    "app_suffix": "app",
+    "flash_size": "16MB",
+    "partition_csv": "partitions/dual-16mb.csv",
+    "standalone_partition_csv": "partitions/standalone-16mb.csv",
+    "rnode_target": "tpager",
+    "rnode_prep_target": "prep-esp32",
+    "renderer": "lvgl",
+    "protocol_profile": "small",
+    "runtime": "dedicated",
+    "app_environments": [
+      "tpager",
+      "tpager_cooperative"
+    ],
+    "device_aliases": [
+      "rspager"
+    ],
+    "post_build_image": "rspager-standalone-factory.bin",
+    "standalone_flash_freq": "80m",
+    "rnode_partition_scheme": "no_ota",
+    "rnode_partition_csv": "partitions/rnode-no_ota.csv"
+  },
+  "cardputer": {
+    "artifact_prefix": "rscardputer",
+    "app_suffix": "m5launcher",
+    "flash_size": "8MB",
+    "partition_csv": "partitions/dual-8mb.csv",
+    "standalone_partition_csv": "partitions/standalone-8mb.csv",
+    "rnode_target": "cardputer_adv",
+    "rnode_prep_target": "prep-cardputer_adv",
+    "renderer": "canvas",
+    "protocol_profile": "micro",
+    "runtime": "cooperative",
+    "app_environments": [
+      "cardputer"
+    ],
+    "device_aliases": [
+      "rscardputer",
+      "ratcom"
+    ],
+    "post_build_image": "rscardputer-standalone-factory.bin",
+    "standalone_flash_freq": null,
+    "rnode_partition_scheme": "default_8MB",
+    "rnode_partition_csv": "partitions/rnode-default_8MB.csv"
+  }
+}

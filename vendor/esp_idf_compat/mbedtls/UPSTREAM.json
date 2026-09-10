@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/espressif/mbedtls",
+  "revision": "2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9",
+  "original_sha256": {
+    "ssl_tls.c": "5b3a413bc4c14a4c3d6df543b391034f661c5e4e734886da0e62efab5acb4c2a",
+    "ssl_internal.h": "6fdd0b02ce7d87eebe47833238a57a5a5dbe521c8c47f6f0f04e4a862c347de3",
+    "common.h": "feaf8afb7f7dbb92d3fabd3a2bd8e1ed5fac71d7c0bfda87a121d4d59946673a"
+  }
+}

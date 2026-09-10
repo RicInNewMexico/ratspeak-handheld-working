@@ -27,7 +27,7 @@ public:
     }
 
     Admission submit(Request request, const void* data, size_t length,
-                     size_t resultCapacity, uint32_t& id) {
+                     size_t resultCapacity, uint32_t& id, uint32_t now = 0) {
         id = 0;
         if (!_arena) return Admission::NotReady;
         if (request.operation > Operation::ClearOldDataAndRestart) return Admission::Invalid;
@@ -59,8 +59,13 @@ public:
         slot.blockMask = selected;
         slot.blockCount = blocks;
         slot.length = static_cast<uint16_t>(length);
+        // A request ID is also the cancellation identity. Never recycle it.
+        if (_nextId == UINT32_MAX) {
+            _usedBlocks &= ~selected;
+            return Admission::NotReady;
+        }
         request.id = ++_nextId;
-        if (request.id == 0) request.id = ++_nextId;
+        request.admittedAt = now;
         slot.request = request;
         slot.result = {};
         copyIn(slot, 0, data, length);
@@ -95,11 +100,64 @@ public:
             if (head != _readyTail.load(std::memory_order_acquire)) return NoSlot;
             bool running = false;
             for (uint8_t i = 0; i < NormalSlots; ++i)
-                running |= _slots[i].state.load(std::memory_order_acquire) == State::Running;
+                running |= runningState(_slots[i].state.load(std::memory_order_acquire));
             if (!running) chosen = NormalSlots;
         }
-        if (chosen != NoSlot) _slots[chosen].state.store(State::Running, std::memory_order_release);
+        if (chosen != NoSlot) {
+            auto state = _slots[chosen].state.load(std::memory_order_acquire);
+            while (!_slots[chosen].state.compare_exchange_weak(state,
+                    state == State::CancelReady ? State::CancelRunning : State::Running,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {}
+        }
         return chosen;
+    }
+
+    // UI owner: cancellation is checked against the immutable request ID and
+    // is supported only before completion claims the Send slot. Ready sends
+    // never reach the engine; Running sends still retain their result credit.
+    bool cancelSend(uint32_t id) {
+        if (!id) return false;
+        for (uint8_t index = 0; index < NormalSlots; ++index) {
+            auto& slot = _slots[index];
+            auto state = slot.state.load(std::memory_order_acquire);
+            if (state == State::Free || slot.request.id != id ||
+                slot.request.operation != Operation::Send) continue;
+            for (;;) {
+                if (state == State::CancelReady || state == State::CancelRunning) return true;
+                if (state != State::Ready && state != State::Running) return false;
+                const auto next = state == State::Ready ? State::CancelReady : State::CancelRunning;
+                if (slot.state.compare_exchange_weak(state, next,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) return true;
+            }
+        }
+        return false;
+    }
+
+    bool cancellationRequested(uint8_t slot) const {
+        if (slot >= NormalSlots) return false;
+        const auto state = _slots[slot].state.load(std::memory_order_acquire);
+        return state == State::CancelReady || state == State::CancelRunning;
+    }
+    bool lifecyclePending() const {
+        const auto state = _slots[NormalSlots].state.load(std::memory_order_acquire);
+        return state == State::Ready || runningState(state);
+    }
+
+    // Service owner: claim the reserved control request before ordinary FIFO
+    // work settles. Its controller, not this claim, grants teardown permission.
+    // Normal slot states, FIFO entries and unread Done results remain owned.
+    uint8_t takeLifecycle() {
+        auto expected = State::Ready;
+        if (!_slots[NormalSlots].state.compare_exchange_strong(expected, State::Running,
+                std::memory_order_acq_rel, std::memory_order_acquire)) return NoSlot;
+        return NormalSlots;
+    }
+    bool normalWorkPending() const {
+        for (uint8_t i = 0; i < NormalSlots; ++i) {
+            const auto state = _slots[i].state.load(std::memory_order_acquire);
+            if (state == State::Ready || state == State::CancelReady || runningState(state)) return true;
+        }
+        return false;
     }
 
     const Request& request(uint8_t slot) const { return _slots[slot].request; }
@@ -126,12 +184,32 @@ public:
         return true;
     }
 
-    void complete(uint8_t slot, Result result) {
-        if (slot >= SlotCount || _slots[slot].state.load(std::memory_order_acquire) != State::Running)
+    // Service owner: claim prevents a late UI cancellation from racing the
+    // terminal result. The Send owner applies any claimed cancellation before
+    // acknowledging its engine ticket and publishing the mailbox result.
+    bool claimCompletion(uint8_t slot, bool& cancelled) {
+        cancelled = false;
+        if (slot >= SlotCount) return false;
+        auto state = _slots[slot].state.load(std::memory_order_acquire);
+        while (state == State::Running || state == State::CancelRunning) {
+            if (_slots[slot].state.compare_exchange_weak(state, State::Completing,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                cancelled = state == State::CancelRunning;
+                return true;
+            }
+        }
+        return false;
+    }
+    void publishCompletion(uint8_t slot, Result result) {
+        if (slot >= SlotCount || _slots[slot].state.load(std::memory_order_acquire) != State::Completing)
             return;
         if (result.length > capacity(slot)) { result = {}; result.outcome = Outcome::Invalid; }
         _slots[slot].result = result;
         _slots[slot].state.store(State::Done, std::memory_order_release);
+    }
+    void complete(uint8_t slot, Result result) {
+        bool cancelled;
+        if (claimCompletion(slot, cancelled)) publishCompletion(slot, result);
     }
 
     uint8_t nextResult() const {
@@ -172,7 +250,10 @@ public:
     }
 
 private:
-    enum class State : uint8_t { Free, Ready, Running, Done };
+    enum class State : uint8_t { Free, Ready, CancelReady, Running, CancelRunning, Completing, Done };
+    static bool runningState(State state) {
+        return state == State::Running || state == State::CancelRunning || state == State::Completing;
+    }
     struct Slot {
         std::atomic<State> state{State::Free};
         Request request;

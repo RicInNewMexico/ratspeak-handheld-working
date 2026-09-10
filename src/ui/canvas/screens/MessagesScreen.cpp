@@ -1,59 +1,95 @@
 #include "MessagesScreen.h"
+#include "StorageWindowAdapter.h"
 #include "Theme.h"
 #include "reticulum/AnnounceManager.h"
 #include "protocol/ProtocolBackend.h"
 
 void MessagesScreen::onEnter() {
-    _showingContext = false;
-    refreshList();
+    _showingContext = false; _visible = true;
+    // Cardputer identity switches commit through an orderly restart.
+    _conversations.resume(1);
 }
 
-void MessagesScreen::refreshList() {
-    if (!_lxmf) return;
-
-    _list.clear();
-    _peerHexes.clear();
-
-    const auto& convs = _lxmf->conversations();
-    for (const auto& peerHex : convs) {
-        std::string label;
-        if (_am) {
-            const DiscoveredNode* node = _am->findNodeByHex(peerHex);
-            if (node && !node->name.empty()) {
-                label = node->name;
-            }
-            if (label.empty()) {
-                label = _am->lookupName(peerHex);
-            }
-        }
-        if (label.empty()) {
-            if (peerHex.size() >= 8) {
-                label = peerHex.substr(0, 4) + ":" + peerHex.substr(4, 4);
-            } else {
-                label = peerHex;
-            }
-        }
-
-        int unread = _lxmf->unreadCount(peerHex);
-        if (unread > 0) {
-            label += " [" + std::to_string(unread) + "]";
-        }
-
-        _list.addItem(label);
-        _peerHexes.push_back(peerHex);
+std::string MessagesScreen::peerHex(size_t index) const {
+    const auto* row = _conversations.row(index);
+    if (!row) return {};
+    constexpr char hex[] = "0123456789abcdef";
+    std::string peer(32, '0');
+    for (size_t i = 0; i < 16; ++i) {
+        peer[i * 2] = hex[row->peer[i] >> 4]; peer[i * 2 + 1] = hex[row->peer[i] & 15];
     }
+    return peer;
+}
 
-    if (_list.itemCount() == 0) {
-        _list.addItem("No conversations yet");
+std::string MessagesScreen::peerLabel(const std::string& peer) const {
+    std::string label;
+    if (_am) {
+        const auto* node = _am->findNodeByHex(peer);
+        if (node) label = node->name;
+        if (label.empty()) label = _am->lookupName(peer);
     }
+    if (label.empty()) label = peer.size() >= 8 ? peer.substr(0, 4) + ":" + peer.substr(4, 4) : peer;
+    return label;
+}
 
-    _lastRefresh = millis();
-    _needsRefresh = false;
+bool MessagesScreen::pollConversations(bool allowAdmission) {
+    if (!_lxmf) return false;
+    const auto publication = _conversations.revision(), statuses = _conversations.statusRevision();
+    const auto state = _conversations.state(); const auto error = _conversations.error();
+    const bool updated = _conversations.updated();
+    if (allowAdmission) {
+        _conversations.observeRevision(_lxmf->storeRevision());
+        if (_backend) _conversations.observeStatusRevision(_backend->lxmfStatusRevision());
+        _needsRefresh = false;
+    }
+    handheld::canvas::pollStorageWindow(_conversations, *_lxmf, _backend, _visible, allowAdmission,
+        [](const Conversations::Query& query) {
+            handheld::storage::RecordKey key; memcpy(key.peer, query.selector.cursor.peer, 16);
+            key.counter = query.selector.counter; key.incoming = query.selector.incoming;
+            return key;
+        },
+        [&](const Conversations::Query& query, const handheld::storage::RecordKey&) {
+            return query.kind == Conversations::Kind::Page ?
+                _lxmf->requestConversationPage(query.selector.cursor, query.hasCursor, query.order, query.direction, Conversations::PageSize) :
+                _lxmf->requestConversation(query.selector);
+        });
+    if (!_conversations.visible() || _conversations.statusReady())
+        _conversations.acknowledgePublication(_conversations.revision());
+    return publication != _conversations.revision() || statuses != _conversations.statusRevision() ||
+        state != _conversations.state() || error != _conversations.error() || updated != _conversations.updated();
+}
+
+void MessagesScreen::renderList(M5Canvas& canvas, int y, int height) {
+    Theme::useUiFont(canvas);
+    const int listHeight = height - Theme::CHAR_H - 2;
+    const size_t visible = std::max(1, listHeight / Theme::LIST_ROW_H);
+    const auto count = _conversations.count(), selected = _conversations.selectedIndex();
+    uint32_t offset = std::min(_conversations.scrollOffset(), uint32_t(count > visible ? count - visible : 0));
+    if (selected < count) {
+        if (selected < offset) offset = selected;
+        else if (selected >= offset + visible) offset = selected - visible + 1;
+    }
+    _conversations.setScrollOffset(offset);
+    for (size_t i = offset; i < count && i < offset + visible; ++i) {
+        const auto& row = *_conversations.row(i);
+        auto label = peerLabel(peerHex(i));
+        if (row.flags & handheld::storage::ConversationView::Unavailable) label += " [unavailable]";
+        else if (row.unreadCount) label += " [" + std::to_string(row.unreadCount) + "]";
+        ScrollList::renderRow(canvas, label, 0, y + (i - offset) * Theme::LIST_ROW_H, Theme::CONTENT_W, i == selected);
+    }
+    if (!count) {
+        canvas.setTextColor(Theme::TEXT_SECONDARY);
+        canvas.drawString(_conversations.state() == Conversations::State::Retrying ? "Read failed; retrying..." :
+            _conversations.state() == Conversations::State::Exhausted ? "Restart needed to read list" :
+            _conversations.loading() ? "Loading conversations..." : "No conversations yet", 8, y + 1);
+    }
+    Theme::useSmallFont(canvas); canvas.setTextColor(Theme::TEXT_SECONDARY);
+    canvas.drawString("Left/Right: page  R: refresh  N: first", 2, y + height - Theme::CHAR_H);
 }
 
 void MessagesScreen::showContextMenu(int idx) {
-    if (idx < 0 || idx >= (int)_peerHexes.size()) return;
-    _contextPeerHex = _peerHexes[idx];
+    if (idx < 0 || size_t(idx) >= _conversations.count()) return;
+    _contextPeerHex = peerHex(idx);
 
     _contextIsContact = false;
     if (_am) {
@@ -76,21 +112,62 @@ void MessagesScreen::executeContextAction() {
     const std::string& action = _contextList.getSelectedItem();
 
     if (action == "Message") {
+        const std::string peer = _contextPeerHex;
         exitContextMenu();
-        if (_openCb) _openCb(_contextPeerHex);
+        if (_openCb) _openCb(peer);
     } else if (action == "Add Contact") {
-        if (_addContactCb) _addContactCb(_contextPeerHex);
+        const std::string peer = _contextPeerHex;
         exitContextMenu();
+        if (_addContactCb) _addContactCb(peer);
     } else if (action == "Delete History") {
-        if (_lxmf) {
-            if (_backend) _backend->lxmfDropPeer(_contextPeerHex);
-            _lxmf->deleteConversation(_contextPeerHex);
+        if (_lxmf && _backend && !_deleteTicket.valid()) {
+            rs::Bytes peer; peer.assignHex(_contextPeerHex.c_str());
+            if (peer.size() == sizeof(_deletePeer) && _backend->lxmfBeginPeerDelete(peer.data())) {
+                const auto submitted = _lxmf->requestDelete(_contextPeerHex);
+                if (submitted.accepted()) {
+                    _deleteTicket = submitted.ticket; _deleteSettled = false;
+                    memcpy(_deletePeer, peer.data(), sizeof(_deletePeer));
+                    _deleteNotice = "Deleting history...";
+                } else {
+                    handheld::storage::Result failed;
+                    failed.error = handheld::storage::Error::Unavailable;
+                    _backend->lxmfFinishPeerDelete(peer.data(), failed);
+                    _deleteNotice = "Not deleted; try again";
+                }
+            } else _deleteNotice = "Deletion busy; try again";
+            _deleteNoticeSince = millis();
         }
         exitContextMenu();
-        refreshList();
     } else {
         exitContextMenu();
     }
+}
+
+bool MessagesScreen::pollDeletion() {
+    if (!_deleteTicket.valid()) {
+        if (_deleteNotice && uint32_t(millis() - _deleteNoticeSince) >= 4000) {
+            _deleteNotice = nullptr;
+            return true;
+        }
+        return false;
+    }
+    if (!_lxmf || !_backend) return false;
+    if (!_deleteSettled) {
+        handheld::storage::Result result;
+        if (!_lxmf->pollStorageResult(_deleteTicket, result)) return false;
+        // Settle the protocol fence exactly once, then retain the terminal credit
+        // until storage confirms release, even while this screen is hidden.
+        _backend->lxmfFinishPeerDelete(_deletePeer, result);
+        _deleteSettled = true;
+        _deleteNotice = result.outcome == handheld::storage::Outcome::Committed ?
+            "History deleted" : "History not deleted";
+        _deleteNoticeSince = millis();
+        if (result.outcome == handheld::storage::Outcome::Committed) _conversations.refresh();
+    }
+    if (_lxmf->releaseStorageResult(_deleteTicket)) {
+        _deleteTicket = {}; _deleteSettled = false;
+    }
+    return true;
 }
 
 void MessagesScreen::exitContextMenu() {
@@ -99,10 +176,6 @@ void MessagesScreen::exitContextMenu() {
 }
 
 void MessagesScreen::render(M5Canvas& canvas) {
-    if (_needsRefresh) {
-        refreshList();
-    }
-
     int y = Theme::CONTENT_Y;
 
     const int headerH = Theme::SECTION_HEADER_H;
@@ -110,7 +183,11 @@ void MessagesScreen::render(M5Canvas& canvas) {
     canvas.fillRect(0, y + 2, 3, headerH - 4, Theme::ACCENT);
     canvas.setTextColor(Theme::ACCENT);
     Theme::useUiFont(canvas);
-    canvas.drawString("Messages", 8, y + 2);
+    const char* notice = _deleteNotice ? _deleteNotice : !_conversations.freshnessAvailable() ? "List needs manual refresh" :
+        _conversations.state() == Conversations::State::Retrying ? "Read failed; retrying..." :
+        _conversations.updated() ? "List updated; R to refresh" : nullptr;
+    const auto heading = notice ? std::string(notice) : "Messages (" + std::to_string(_conversations.total()) + ")";
+    canvas.drawString(heading.c_str(), 8, y + 2);
     canvas.drawFastHLine(0, y + headerH, Theme::CONTENT_W, Theme::DIVIDER);
     y += headerH + 2;
 
@@ -131,12 +208,13 @@ void MessagesScreen::render(M5Canvas& canvas) {
 
         _contextList.render(canvas, 0, y, Theme::CONTENT_W, Theme::CONTENT_H - (y - Theme::CONTENT_Y));
     } else {
-        _list.render(canvas, 0, y, Theme::CONTENT_W, Theme::CONTENT_H - (y - Theme::CONTENT_Y));
+        renderList(canvas, y, Theme::CONTENT_H - (y - Theme::CONTENT_Y));
     }
     Theme::useSmallFont(canvas);
 }
 
 bool MessagesScreen::handleKey(const KeyEvent& event) {
+    if (event.repeat && (event.backspace || event.forwardDelete)) return true;
     if (_showingContext) {
         if (event.escape || event.backspace) {
             exitContextMenu();
@@ -151,24 +229,46 @@ bool MessagesScreen::handleKey(const KeyEvent& event) {
         return true;
     }
 
-    if (event.navUp()) { _list.scrollUp(); return true; }
-    if (event.navDown()) { _list.scrollDown(); return true; }
-
-    // Enter → open conversation immediately
-    if (event.enter) {
-        int idx = _list.getSelectedIndex();
-        if (idx >= 0 && idx < (int)_peerHexes.size() && _openCb) {
-            _openCb(_peerHexes[idx]);
+    const size_t selected = _conversations.selectedIndex();
+    const size_t count = _conversations.count();
+    if (event.left || event.right) {
+        if (!event.repeat) {
+            if (event.left) _conversations.previous(); else _conversations.nextPage();
         }
         return true;
     }
-
-    // The printed Fn+Backspace Delete key opens the context menu.
-    if (event.forwardDelete) {
-        int idx = _list.getSelectedIndex();
-        if (idx >= 0 && idx < (int)_peerHexes.size()) {
-            showContextMenu(idx);
+    if (event.navUp() || event.navDown()) {
+        if (count) {
+            // A removed/off-page peer stays selected until explicit navigation.
+            // The first tap restores a visible selection without skipping a page.
+            if (selected >= count) {
+                _conversations.select(event.navUp() ? count - 1 : 0);
+            } else if (event.navUp()) {
+                if (selected > 0 && selected < count) _conversations.select(selected - 1);
+                else if (_conversations.canPrevious()) _conversations.previous();
+                else _conversations.select(0);
+            } else if (selected + 1 < count) _conversations.select(selected + 1);
+            else if (_conversations.canNext()) _conversations.nextPage();
+            else _conversations.select(count - 1);
+            _conversations.setViewportAtFirst(_conversations.selectedIndex() == 0 && !_conversations.canPrevious());
         }
+        return true;
+    }
+    if (!event.ctrl && !event.repeat && (event.character == 'r' || event.character == 'R')) {
+        _conversations.refresh(); return true;
+    }
+    if (!event.ctrl && !event.repeat && (event.character == 'n' || event.character == 'N')) {
+        _conversations.first(); return true;
+    }
+    if (event.enter) {
+        if (!event.repeat && selected < count && _openCb) {
+            const auto peer = peerHex(selected); // Stable through reentrant navigation.
+            _openCb(peer);
+        }
+        return true;
+    }
+    if (event.forwardDelete) {
+        if (selected < count) showContextMenu(selected);
         return true;
     }
 

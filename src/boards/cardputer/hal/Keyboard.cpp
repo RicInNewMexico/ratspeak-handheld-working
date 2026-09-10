@@ -5,16 +5,6 @@ static constexpr unsigned long KEY_REPEAT_START_MS = 400;
 static constexpr unsigned long KEY_REPEAT_INTERVAL_MS = 125;
 
 namespace {
-bool sameEvent(const KeyEvent& a, const KeyEvent& b) {
-    return a.character == b.character &&
-           a.ctrl == b.ctrl && a.shift == b.shift && a.fn == b.fn &&
-           a.alt == b.alt && a.opt == b.opt && a.enter == b.enter &&
-           a.backspace == b.backspace && a.forwardDelete == b.forwardDelete &&
-           a.tab == b.tab && a.space == b.space && a.escape == b.escape &&
-           a.up == b.up && a.down == b.down &&
-           a.left == b.left && a.right == b.right;
-}
-
 bool hasAction(const KeyEvent& event) {
     return event.character != 0 || event.enter || event.backspace ||
            event.forwardDelete || event.tab || event.space || event.escape ||
@@ -81,66 +71,43 @@ KeyEvent Keyboard::eventForKey(uint8_t row, uint8_t col) const {
     return event;
 }
 
-KeyEvent Keyboard::currentEvent() const {
-    for (uint8_t row = 0; row < 4; ++row) {
-        for (uint8_t col = 0; col < 14; ++col) {
-            if (!_pressed[row][col] || isModifierPosition(row, col)) continue;
-            KeyEvent event = eventForKey(row, col);
-            if (hasAction(event)) return event;
-        }
-    }
-    return {};
-}
-
 void Keyboard::update() {
     _hasEvent = false;
+    const unsigned long now = millis();
 
-    CardputerAdvKeyboard::Event rawEvents[16];
-    const size_t rawCount = _hardware.poll(rawEvents, 16);
-    KeyEvent tapped = {};
-    bool hasTapped = false;
-    for (size_t i = 0; i < rawCount; ++i) {
-        const auto& raw = rawEvents[i];
+    // Emit every physical press in FIFO order. A held earlier key must neither
+    // hide a new key nor be re-emitted when that newer key is released.
+    for (size_t i = 0; i < 16; ++i) {
+        CardputerAdvKeyboard::Event raw;
+        if (!_hardware.poll(&raw, 1)) break;
         _pressed[raw.row][raw.col] = raw.pressed;
-        if (raw.pressed && !isModifierPosition(raw.row, raw.col)) {
-            KeyEvent candidate = eventForKey(raw.row, raw.col);
-            if (!hasTapped && hasAction(candidate)) {
-                tapped = candidate;
-                hasTapped = true;
-            }
-        }
-    }
-
-    KeyEvent next = currentEvent();
-    if (!hasAction(next)) {
-        _keyHeld = false;
-        _heldEvent = {};
-        if (hasTapped) {
-            _event = tapped;
-            _hasEvent = true;
-            if (_keyCallback) _keyCallback(_event);
-        }
+        if (!raw.pressed || isModifierPosition(raw.row, raw.col)) continue;
+        KeyEvent candidate = eventForKey(raw.row, raw.col);
+        if (!hasAction(candidate)) continue;
+        _event = candidate;
+        _hasEvent = true;
+        _keyHeld = isRepeatable(candidate);
+        _heldRow = raw.row; _heldCol = raw.col;
+        _heldSince = _lastRepeat = now;
+        if (_keyCallback) _keyCallback(_event);
         return;
     }
 
-    const unsigned long now = millis();
-    const bool changed = !_keyHeld || !sameEvent(next, _heldEvent);
-    if (!changed) {
-        if (!isRepeatable(next) || now - _heldSince < KEY_REPEAT_START_MS ||
-            now - _lastRepeat < KEY_REPEAT_INTERVAL_MS) {
-            return;
-        }
-        _lastRepeat = now;
-    } else {
-        _keyHeld = true;
-        _heldEvent = next;
-        _heldSince = now;
-        _lastRepeat = now;
+    if (!_keyHeld || !_pressed[_heldRow][_heldCol]) { _keyHeld = false; return; }
+    const auto next = eventForKey(_heldRow, _heldCol);
+    // Releasing Fn stops arrow/delete repetition; modifiers never synthesize
+    // a printable press for a key that was already held.
+    if (!isRepeatable(next) || next.backspace != _event.backspace ||
+        next.forwardDelete != _event.forwardDelete || next.up != _event.up ||
+        next.down != _event.down || next.left != _event.left || next.right != _event.right) {
+        _keyHeld = false;
+        return;
     }
-
+    if (now - _heldSince < KEY_REPEAT_START_MS || now - _lastRepeat < KEY_REPEAT_INTERVAL_MS) return;
+    _lastRepeat = now;
     _event = next;
+    _event.repeat = true;
     _hasEvent = true;
-
     if (_keyCallback) _keyCallback(_event);
 }
 
@@ -150,4 +117,14 @@ bool Keyboard::capsLocked() const {
 
 void Keyboard::setCapsLocked(bool locked) {
     _capsLocked = locked;
+}
+
+void Keyboard::discardPending() {
+    for (unsigned i = 0; i < 16; ++i) {
+        CardputerAdvKeyboard::Event raw;
+        if (!_hardware.poll(&raw, 1)) break;
+        _pressed[raw.row][raw.col] = raw.pressed;
+    }
+    _keyHeld = false;
+    _hasEvent = false;
 }

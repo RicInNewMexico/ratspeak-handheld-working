@@ -14,10 +14,13 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-from package_merged_zip import BOARDS, NOTICES, PACKAGES, ROOT, firmware_version, make_manifest, source_identity
+from package_merged_zip import NOTICES, firmware_version, make_manifest, source_identity
+from release_catalog import APPLICATIONS, BOARDS, PACKAGES, ROOT, firmware_assets
+from release_identity import check_workspace, load_identity, source_pins, validate_version
+from release_images import verify_application, verify_component, verify_factory
 
 
-RELEASE_BOARDS = ("tdeck", "tpager")
+RELEASE_BOARDS = tuple(BOARDS)
 SOURCE_NAME = "ratspeak-handheld-source.tar.gz"
 NOTICE_NAME = "ratspeak-handheld-notices.zip"
 METADATA_NAME = "release-manifest.json"
@@ -26,39 +29,9 @@ SERVICE_MARKER = b"[SERVICE] Dedicated network/storage task started\x00"
 GENERATED = {SOURCE_NAME, NOTICE_NAME, METADATA_NAME, CHECKSUM_NAME}
 
 
-def firmware_assets() -> set[str]:
-    names = set()
-    for board in RELEASE_BOARDS:
-        brand = BOARDS[board][0]
-        names.update(f"{brand}-{mode}.zip" for mode in PACKAGES)
-        suffix = "app" if board == "tpager" else "m5launcher"
-        names.update(f"{brand}-{mode}-{suffix}.bin" for mode in ("standalone", "rnode"))
-    return names
-
-
-def verify_application(data: bytes) -> None:
-    import esptool
-    from esptool.bin_image import LoadFirmwareImage
-
-    if esptool.__version__ != "5.2.0":
-        raise ValueError("release image validation requires esptool 5.2.0")
-    try:
-        image = LoadFirmwareImage("esp32s3", data)
-        if not image.segments or image.chip_id != image.ROM_LOADER.IMAGE_CHIP_ID:
-            raise ValueError("not an ESP32-S3 application")
-        if image.checksum != image.calculate_checksum():
-            raise ValueError("application checksum mismatch")
-        if not image.append_digest or image.stored_digest != image.calc_digest:
-            raise ValueError("missing or invalid application SHA-256")
-        if image.data_length + 32 != len(data):
-            raise ValueError("truncated application or unexpected trailing data")
-    except Exception as error:
-        raise ValueError(f"invalid complete application image: {error}") from error
-
 
 def verify_tag(tag: str, version: str) -> None:
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
-        raise ValueError("release manifest has an invalid firmware version")
+    validate_version(version)
     pattern = re.escape("v" + version)
     if "-" not in version:
         pattern += r"(?:-[0-9A-Za-z.-]+)?"
@@ -67,7 +40,8 @@ def verify_tag(tag: str, version: str) -> None:
 
 
 def verify_package(path: Path, board: str, mode: str, revision: str, root: Path) -> tuple[dict, bytes]:
-    brand, flash = BOARDS[board]
+    capability = BOARDS[board]
+    brand, flash = capability.artifact_prefix, capability.flash_size
     name = f"{brand}-{mode}"
     allowed = {f"{name}.bin", "manifest.json", *NOTICES.values()}
     with zipfile.ZipFile(path) as archive:
@@ -86,6 +60,7 @@ def verify_package(path: Path, board: str, mode: str, revision: str, root: Path)
             raise ValueError(f"{path.name}: manifest, image hash or clean-source identity mismatch")
         if len(image) < 24 or image[0] != 0xE9:
             raise ValueError(f"{path.name}: missing ESP image header")
+        verify_factory(image, board, mode, manifest["version"], revision, False, root)
         for source, destination in NOTICES.items():
             if archive.read(destination) != (root / source).read_bytes():
                 raise ValueError(f"{path.name}: notice differs from the release source: {destination}")
@@ -99,20 +74,23 @@ def verify_firmware(dist: Path, revision: str, root: Path) -> list[dict]:
         raise ValueError(f"release asset mismatch; missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}")
     manifests = []
     for board in RELEASE_BOARDS:
-        brand = BOARDS[board][0]
+        capability = BOARDS[board]
+        brand = capability.artifact_prefix
+        partitions = capability.partitions(root)
         images = {}
         for mode in PACKAGES:
             manifest, images[mode] = verify_package(dist / f"{brand}-{mode}.zip", board, mode, revision, root)
             manifests.append(manifest)
-        suffix = "app" if board == "tpager" else "m5launcher"
-        for mode, slot, offset in (("standalone", 0x400000, 0x110000), ("rnode", 0x300000, 0x510000)):
-            app = (dist / f"{brand}-{mode}-{suffix}.bin").read_bytes()
+        for mode in APPLICATIONS:
+            slot, offset = partitions[mode].size, partitions[mode].offset
+            app = (dist / capability.app_name(mode)).read_bytes()
             if not 24 <= len(app) <= slot or app[0] != 0xE9:
                 raise ValueError(f"{board} {mode}: invalid application image or slot overflow")
-            verify_application(app)
-            if mode == "standalone" and SERVICE_MARKER not in app:
+            verify_component(app, board, mode, firmware_version(root, board), revision, False, slot)
+            if mode == "standalone" and capability.runtime == "dedicated" and SERVICE_MARKER not in app:
                 raise ValueError(f"{board}: release application does not use the dedicated service task")
-            if images[mode][0x10000:0x10000 + len(app)] != app:
+            factory_offset = capability.factory_app_offset(mode, root)
+            if images[mode][factory_offset:factory_offset + len(app)] != app:
                 raise ValueError(f"{board} {mode}: application differs from factory package")
             if images["full"][offset:offset + len(app)] != app:
                 raise ValueError(f"{board} {mode}: application differs from dual-boot package")
@@ -122,20 +100,10 @@ def verify_firmware(dist: Path, revision: str, root: Path) -> list[dict]:
 
 
 def source_refs(root: Path) -> dict[str, str]:
-    workflow = (root / ".github/workflows/build.yml").read_text()
-    refs = {"ratspeak-handheld": source_identity(root)[0]}
-    for repo, variable in (
-        ("rsReticulumLite", "RNS_LITE_COMMIT"), ("rsLXMFLite", "LXMF_LITE_COMMIT"),
-        ("rsReticulum", "RNS_FULL_COMMIT"), ("rsLXMF", "LXMF_FULL_COMMIT"),
-    ):
-        match = re.search(rf"^  {variable}: ([0-9a-f]{{40}})$", workflow, re.MULTILINE)
-        if not match:
-            raise ValueError(f"missing reviewed source pin: {variable}")
-        refs[repo] = match.group(1)
-    return refs
+    return {"ratspeak-handheld": source_identity(root)[0], **source_pins(root)}
 
 
-def write_sources(destination: Path, workspace: Path, refs: dict[str, str]) -> None:
+def write_sources(destination: Path, workspace: Path, refs: dict[str, str], roles: dict[str, str] | None = None) -> None:
     """Include committed source, never working files, .git history or credentials."""
     with destination.open("wb") as output, gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w|") as bundle:
@@ -150,7 +118,12 @@ def write_sources(destination: Path, workspace: Path, refs: dict[str, str]) -> N
                         member.uname = member.gname = ""
                         member.pax_headers = {}
                         bundle.addfile(member, archive.extractfile(member) if member.isfile() else None)
-            data = (json.dumps({"schemaVersion": 1, "sources": refs}, indent=2) + "\n").encode()
+            metadata = {"schemaVersion": 1, "sources": refs}
+            if roles is not None:
+                if set(roles) != set(refs):
+                    raise ValueError("source roles do not cover the source archive")
+                metadata["sourceRoles"] = roles
+            data = (json.dumps(metadata, indent=2) + "\n").encode()
             info = tarfile.TarInfo("SOURCE.json")
             info.size = len(data)
             info.mode = 0o644
@@ -176,13 +149,16 @@ def prepare(dist: Path, root: Path) -> None:
     for name in GENERATED:
         if (dist / name).exists():
             raise ValueError(f"refusing to overwrite release output: {name}; use a fresh artifact directory")
+    check_workspace(root)
     manifests = verify_firmware(dist, revision, root)
     refs = source_refs(root)
     for repo, expected in refs.items():
         actual, dirty = source_identity(root.parent / repo)
         if actual != expected or dirty:
             raise ValueError(f"{repo}: source checkout must be clean at {expected}")
-    write_sources(dist / SOURCE_NAME, root.parent, refs)
+    roles = {"ratspeak-handheld": "firmware",
+             **{name: source["role"] for name, source in load_identity(root)["sources"].items()}}
+    write_sources(dist / SOURCE_NAME, root.parent, refs, roles)
     write_notices(dist / NOTICE_NAME, root)
     assets = {}
     for name in sorted(firmware_assets() | {SOURCE_NAME, NOTICE_NAME}):
@@ -190,14 +166,17 @@ def prepare(dist: Path, root: Path) -> None:
         assets[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     metadata = {
         "schemaVersion": 1, "product": "ratspeak-handheld", "version": manifests[0]["version"],
-        "sources": refs, "boards": list(RELEASE_BOARDS), "installMode": "factory", "assets": assets,
+        "sources": refs, "sourceRoles": roles,
+        "boards": list(RELEASE_BOARDS), "installMode": "factory", "assets": assets,
     }
     (dist / METADATA_NAME).write_text(json.dumps(metadata, indent=2) + "\n")
     checksums = []
     for name in sorted(firmware_assets() | {SOURCE_NAME, NOTICE_NAME, METADATA_NAME}):
         checksums.append(f"{hashlib.sha256((dist / name).read_bytes()).hexdigest()}  {name}\n")
     (dist / CHECKSUM_NAME).write_text("".join(checksums))
-    print(f"release assets verified: 2 boards, 6 factory ZIPs, 4 app images; source {revision}")
+    print(f"release assets verified: {len(BOARDS)} boards, "
+          f"{len(BOARDS) * len(PACKAGES)} factory ZIPs, "
+          f"{len(BOARDS) * len(APPLICATIONS)} app images; source {revision}")
 
 
 def main() -> int:

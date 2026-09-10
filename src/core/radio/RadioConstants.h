@@ -94,9 +94,6 @@
 #define FREQ_DIV_6X     (double)pow(2.0, 25.0)
 #define FREQ_STEP_6X    (double)(XTAL_FREQ_6X / FREQ_DIV_6X)
 
-// --- TX Timeout Multiplier ---
-#define MODEM_TIMEOUT_MULT          1.5
-
 // --- LoRa PHY Constants ---
 #define PHY_HEADER_LORA_SYMBOLS     8
 #define PHY_CRC_LORA_BITS           16

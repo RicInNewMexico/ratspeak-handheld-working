@@ -1,6 +1,7 @@
+#include "../../../src/core/config/FirmwareVersion.h"
 #include <Arduino.h>
 #include <M5Cardputer.h>
-#include <Preferences.h>
+#include "../ChoicePreferences.h"
 
 #include "RsCardputerModeSwitch.h"
 #include "CardputerAdvKeyboard.h"
@@ -13,16 +14,13 @@ constexpr uint16_t kText = 0xF7BE;
 constexpr uint16_t kMuted = 0x8C71;
 constexpr uint16_t kAccent = 0x06D7;
 constexpr uint16_t kWarn = 0xFBA0;
-constexpr uint32_t kAutoBootMs = 7000;
 constexpr uint32_t kKeyRepeatStartMs = 400;
 constexpr uint32_t kKeyRepeatIntervalMs = 125;
-constexpr char kPrefsNamespace[] = "rslaunch";
-constexpr char kLastChoiceKey[] = "last";
 
-enum class Choice : uint8_t {
-  Standalone = 0,
-  RNode = 1,
-};
+using launcher::Choice;
+using launcher::loadLastChoice;
+using launcher::saveLastChoice;
+launcher::SelectionState selection;
 
 enum class KeyAction : uint8_t {
   None = 0,
@@ -33,42 +31,13 @@ enum class KeyAction : uint8_t {
   StartRNode,
 };
 
-Choice selected = Choice::Standalone;
-uint32_t bootStarted = 0;
 uint32_t lastRemain = UINT32_MAX;
-bool booting = false;
-bool autoBootEnabled = true;
 KeyAction heldAction = KeyAction::None;
 uint32_t heldSince = 0;
 uint32_t lastRepeat = 0;
+uint8_t heldRow = 0, heldCol = 0;
 CardputerAdvKeyboard keyboardHardware;
 bool pressedKeys[4][14] = {};
-
-uint8_t choiceValue(Choice choice) {
-  return choice == Choice::RNode ? 1 : 0;
-}
-
-Choice choiceFromValue(uint8_t value) {
-  return value == 1 ? Choice::RNode : Choice::Standalone;
-}
-
-Choice loadLastChoice() {
-  Preferences prefs;
-  Choice choice = Choice::Standalone;
-  if (prefs.begin(kPrefsNamespace, true)) {
-    choice = choiceFromValue(prefs.getUChar(kLastChoiceKey, choiceValue(choice)));
-    prefs.end();
-  }
-  return choice;
-}
-
-void saveLastChoice(Choice choice) {
-  Preferences prefs;
-  if (prefs.begin(kPrefsNamespace, false)) {
-    prefs.putUChar(kLastChoiceKey, choiceValue(choice));
-    prefs.end();
-  }
-}
 
 void drawOption(int y, const char *title, const char *subtitle, bool active) {
   auto &d = M5Cardputer.Display;
@@ -87,16 +56,12 @@ void drawOption(int y, const char *title, const char *subtitle, bool active) {
 }
 
 uint32_t remainingSeconds() {
-  uint32_t elapsed = millis() - bootStarted;
-  if (elapsed >= kAutoBootMs) {
-    return 0;
-  }
-  return (kAutoBootMs - elapsed + 999) / 1000;
+  return selection.remainingSeconds(millis());
 }
 
 void drawCountdown(bool force = false) {
   auto &d = M5Cardputer.Display;
-  if (!autoBootEnabled) {
+  if (!selection.autoBootEnabled()) {
     d.fillRect(200, 8, 28, 20, kBg);
     lastRemain = UINT32_MAX;
     return;
@@ -130,8 +95,8 @@ void drawScreen() {
   d.setCursor(14, 30);
   d.print("Cardputer Adv");
 
-  drawOption(48, "Standalone", "On-device messenger", selected == Choice::Standalone);
-  drawOption(87, "RNode", "BLE / USB radio", selected == Choice::RNode);
+  drawOption(48, "Standalone", "On-device messenger", selection.selected() == Choice::Standalone);
+  drawOption(87, "RNode", "BLE / USB radio", selection.selected() == Choice::RNode);
 
   d.setTextColor(kMuted, kBg);
   d.setCursor(75, 125);
@@ -141,23 +106,14 @@ void drawScreen() {
 }
 
 void selectChoice(Choice choice) {
-  if (selected == choice) {
-    return;
-  }
-  selected = choice;
-  drawScreen();
+  if (selection.choose(choice)) drawScreen();
 }
 
 void pauseAutoBoot() {
-  if (!autoBootEnabled) {
-    return;
-  }
-  autoBootEnabled = false;
-  drawCountdown(true);
+  if (selection.activity()) drawScreen();
 }
 
 void showBooting(const char *label) {
-  booting = true;
   auto &d = M5Cardputer.Display;
   d.fillScreen(kBg);
   d.setTextSize(2);
@@ -170,14 +126,13 @@ void showBooting(const char *label) {
   d.print("Starting...");
 }
 
-void showError(const char *message) {
-  booting = false;
+void showError(const char *message, bool warning = false) {
   auto &d = M5Cardputer.Display;
   d.fillScreen(kBg);
   d.setTextSize(2);
   d.setTextColor(kWarn, kBg);
   d.setCursor(16, 36);
-  d.print("Boot error");
+  d.print(warning ? "Save warning" : "Boot error");
   d.setTextSize(1);
   d.setTextColor(kText, kBg);
   d.setCursor(16, 68);
@@ -188,13 +143,18 @@ void startChoice(Choice choice) {
   using namespace rs_cardputer_adv;
 
   FirmwareMode mode = choice == Choice::Standalone ? FirmwareMode::Standalone : FirmwareMode::RNode;
+  if (!selection.requestBoot(choice)) return;
   showBooting(mode_name(mode));
   SwitchResult result = set_next_boot(mode);
-  if (!result.ok) {
+  const bool saved = result.ok && saveLastChoice(choice);
+  if (!selection.completeBoot(result.ok, saved)) {
     showError(result.message);
     return;
   }
-  saveLastChoice(choice);
+  if (!saved) {
+    showError("Last choice not saved", true);
+    delay(1500);
+  }
   delay(50);
   esp_restart();
 }
@@ -238,31 +198,6 @@ KeyAction actionForKey(uint8_t row, uint8_t col) {
   return KeyAction::None;
 }
 
-KeyAction pollKeyboard() {
-  CardputerAdvKeyboard::Event events[16];
-  const size_t count = keyboardHardware.poll(events, 16);
-  KeyAction tapped = KeyAction::None;
-  for (size_t i = 0; i < count; ++i) {
-    const auto& event = events[i];
-    pressedKeys[event.row][event.col] = event.pressed;
-    if (event.pressed && tapped == KeyAction::None) {
-      tapped = actionForKey(event.row, event.col);
-    }
-  }
-  return tapped;
-}
-
-KeyAction currentKeyAction() {
-  for (uint8_t row = 0; row < 4; ++row) {
-    for (uint8_t col = 0; col < 14; ++col) {
-      if (!pressedKeys[row][col] || isModifierPosition(row, col)) continue;
-      const KeyAction action = actionForKey(row, col);
-      if (action != KeyAction::None) return action;
-    }
-  }
-  return KeyAction::None;
-}
-
 bool repeatable(KeyAction action) {
   return action == KeyAction::Previous || action == KeyAction::Next;
 }
@@ -271,7 +206,7 @@ void performAction(KeyAction action) {
   switch (action) {
     case KeyAction::Previous: selectChoice(Choice::Standalone); break;
     case KeyAction::Next: selectChoice(Choice::RNode); break;
-    case KeyAction::Select: startChoice(selected); break;
+    case KeyAction::Select: startChoice(selection.selected()); break;
     case KeyAction::StartStandalone: startChoice(Choice::Standalone); break;
     case KeyAction::StartRNode: startChoice(Choice::RNode); break;
     case KeyAction::None: break;
@@ -279,37 +214,41 @@ void performAction(KeyAction action) {
 }
 
 void updateKeyboard() {
-  const KeyAction tapped = pollKeyboard();
-  const KeyAction action = currentKeyAction();
+  CardputerAdvKeyboard::Event events[16];
+  const size_t count = keyboardHardware.poll(events, 16);
   const uint32_t now = millis();
-  if (action == KeyAction::None) {
-    heldAction = KeyAction::None;
-    if (tapped != KeyAction::None) {
-      pauseAutoBoot();
-      performAction(tapped);
-    }
-    return;
-  }
-
-  if (action != heldAction) {
-    heldAction = action;
-    heldSince = now;
-    lastRepeat = now;
+  for (size_t i = 0; i < count; ++i) {
+    const auto& event = events[i];
+    const bool fresh = event.pressed && !pressedKeys[event.row][event.col];
+    pressedKeys[event.row][event.col] = event.pressed;
+    // Release/modifier edges also cancel countdown, but cannot dismiss an error.
+    if (selection.autoBootEnabled()) pauseAutoBoot();
+    if (!fresh) continue;
     pauseAutoBoot();
-    performAction(action);
-    return;
+    const KeyAction action = actionForKey(event.row, event.col);
+    if (action == KeyAction::None) continue;
+    heldAction = repeatable(action) ? action : KeyAction::None;
+    heldRow = event.row;
+    heldCol = event.col;
+    heldSince = lastRepeat = now;
+    performAction(action); // Preserve FIFO press order, including quick taps.
   }
-
-  if (repeatable(action) && now - heldSince >= kKeyRepeatStartMs &&
+  // Holding or changing a modifier cannot manufacture another confirmation.
+  if (heldAction != KeyAction::None &&
+      (!pressedKeys[heldRow][heldCol] || actionForKey(heldRow, heldCol) != heldAction)) {
+    heldAction = KeyAction::None;
+  }
+  if (repeatable(heldAction) && now - heldSince >= kKeyRepeatStartMs &&
       now - lastRepeat >= kKeyRepeatIntervalMs) {
     lastRepeat = now;
-    performAction(action);
+    performAction(heldAction);
   }
 }
 
 } // namespace
 
 void setup() {
+    ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("cardputer", "launcher"));
   auto cfg = M5.config();
   // The generic ESP32-S3 PlatformIO target cannot reliably identify the ADV
   // display. Force the fallback so M5Cardputer selects its TCA8418 keyboard
@@ -322,13 +261,12 @@ void setup() {
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setBrightness(180);
 
-  selected = loadLastChoice();
-  bootStarted = millis();
+  selection.begin(loadLastChoice(), millis());
   drawScreen();
 }
 
 void loop() {
-  if (booting) {
+  if (selection.booting()) {
     delay(20);
     return;
   }
@@ -338,8 +276,8 @@ void loop() {
 
   drawCountdown();
 
-  if (autoBootEnabled && millis() - bootStarted >= kAutoBootMs) {
-    startChoice(selected);
+  if (selection.autoBootDue(millis())) {
+    startChoice(selection.selected());
     return;
   }
 }

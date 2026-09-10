@@ -39,11 +39,9 @@ void Keyboard::update() {
 
     uint8_t mod = 0;
     uint8_t key = readKey(&mod);
-    if (key == 0 || key == _lastKey) {
-        if (key == 0) _lastKey = 0;
-        return;
-    }
-    _lastKey = key;
+    // The C3 clears its pending-byte flag on each I2C read. Equal adjacent
+    // nonzero bytes are distinct presses, even without an intervening zero.
+    if (key == 0) return;
 
     // Debug logging for first 50 keypresses to help diagnose key mapping
     if (_debugCount < 50) {
@@ -83,8 +81,6 @@ void Keyboard::update() {
         _event.character = 0x08;
     } else if (key == 0x09) {
         _event.tab = true;
-    } else if (key == 0x1B) {
-        _event.character = 27;  // ESC
     } else if (key == ' ') {
         _event.space = true;
         _event.character = ' ';
@@ -129,4 +125,12 @@ bool Keyboard::setBrightness(uint8_t pwm) {
     Wire.write(0x01); // LILYGO_KB_BRIGHTNESS_CMD
     Wire.write(pwm);
     return Wire.endTransmission() == 0;
+}
+
+void Keyboard::discardPending() {
+    uint8_t modifiers = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        if (readKey(&modifiers) == 0) break;
+    }
+    _hasEvent = false;
 }

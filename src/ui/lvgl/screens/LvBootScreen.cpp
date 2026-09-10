@@ -68,3 +68,13 @@ void LvBootScreen::showError(const char* message) {
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
     lv_timer_handler();
 }
+
+void LvBootScreen::showAllocationError(const char* staticMessage) {
+    if (_bar) lv_obj_add_flag(_bar, LV_OBJ_FLAG_HIDDEN);
+    if (_lblTitle) {
+        // LONG_DOT may alter text and save a suffix. Finalize that mode before
+        // borrowing read-only text; WRAP requires no copied label buffer.
+        lv_label_set_long_mode(_lblTitle, LV_LABEL_LONG_WRAP);
+        lv_label_set_text_static(_lblTitle, staticMessage);
+    }
+}

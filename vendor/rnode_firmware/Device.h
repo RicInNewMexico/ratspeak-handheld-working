@@ -185,7 +185,7 @@ void calculate_region_hash(unsigned long long start, unsigned long long end, uin
 void device_validate_partitions() {
   device_load_firmware_hash();
   #if MCU_VARIANT == MCU_ESP32
-  esp_partition_t partition;
+  esp_partition_t partition = {};
   partition.address   = ESP_PARTITION_TABLE_OFFSET;
   partition.size      = ESP_PARTITION_TABLE_MAX_LEN;
   partition.type      = ESP_PARTITION_TYPE_DATA;
@@ -194,7 +194,13 @@ void device_validate_partitions() {
   partition.size      = ESP_PARTITION_TABLE_OFFSET;
   partition.type      = ESP_PARTITION_TYPE_APP;
   esp_partition_get_sha256(&partition, dev_bootloader_hash);
-  esp_partition_get_sha256(esp_ota_get_running_partition(), dev_firmware_hash);
+  const esp_partition_t* running_partition = esp_ota_get_running_partition();
+  if (!running_partition || esp_partition_get_sha256(running_partition, dev_firmware_hash) != ESP_OK) {
+    // An unavailable measurement must not replace the last saved image hash.
+    memset(dev_firmware_hash, 0, DEV_HASH_LEN);
+    fw_signature_validated = false;
+    return;
+  }
   #elif MCU_VARIANT == MCU_NRF52
   // todo, add bootloader, partition table, or softdevice?
   calculate_region_hash(APPLICATION_START, APPLICATION_START+retrieve_application_size(), dev_firmware_hash);
@@ -209,6 +215,12 @@ void device_validate_partitions() {
     }
 
     #if BOARD_MODEL == BOARD_CARDPUTER_ADV || BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER
+      // Custom-firmware policy: automatically enroll a successfully measured
+      // running image, including after an upgrade or damaged hash metadata.
+      // This permits custom builds; it does not authenticate the firmware or
+      // turn the legacy fw_signature_validated flag into a signature check.
+      // Persistence is best effort under the vendor EEPROM policy. The host
+      // can compare the reported running digest with its expected artifact.
       if (!firmware_hash_valid) {
         memcpy(dev_firmware_hash_target, dev_firmware_hash, DEV_HASH_LEN);
         device_save_firmware_hash();

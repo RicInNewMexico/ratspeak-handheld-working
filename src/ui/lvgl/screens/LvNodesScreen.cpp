@@ -200,8 +200,26 @@ void LvNodesScreen::createUI(lv_obj_t* parent) {
     _nicknameHint = lv_label_create(_nicknameBox);
     lv_obj_set_style_text_font(_nicknameHint, &lv_font_rsdeck_10, 0);
     lv_obj_set_style_text_color(_nicknameHint, lv_color_hex(Theme::TEXT_MUTED), 0);
-    lv_label_set_text(_nicknameHint, "Enter saves / Esc keeps");
-    lv_obj_set_pos(_nicknameHint, 0, 52);
+#if HAS_TRACKBALL
+    lv_label_set_text(_nicknameHint, "Enter saves / Hold click cancels");
+#else
+    lv_label_set_text(_nicknameHint, "Enter saves / Alt+Back cancels");
+#endif
+    lv_obj_set_pos(_nicknameHint, 0, 46);
+
+    lv_obj_t* cancel = lv_btn_create(_nicknameBox);
+    lv_obj_set_pos(cancel, 154, 61);
+    lv_obj_set_size(cancel, 80, 22);
+    lv_obj_add_style(cancel, LvTheme::styleBtn(), 0);
+    lv_obj_add_style(cancel, LvTheme::styleBtnPressed(), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(cancel, [](lv_event_t* e) {
+        auto* self = static_cast<LvNodesScreen*>(lv_event_get_user_data(e));
+        self->hideOverlay();
+    }, LV_EVENT_CLICKED, this);
+    lv_obj_t* cancelLabel = lv_label_create(cancel);
+    lv_obj_set_style_text_font(cancelLabel, &lv_font_rsdeck_10, 0);
+    lv_label_set_text(cancelLabel, "Cancel");
+    lv_obj_center(cancelLabel);
 }
 
 void LvNodesScreen::destroyUI() {
@@ -485,6 +503,12 @@ void LvNodesScreen::updateNicknameDisplay() {
 }
 
 bool LvNodesScreen::handleLongPress() {
+#if HAS_TRACKBALL
+    if (_actionState == NodeAction::NICKNAME_INPUT) {
+        hideOverlay();
+        return true;
+    }
+#endif
     if (!_am) return false;
 #if !HAS_SCROLLWHEEL
     // On trackball/touch boards, an unfocused hold belongs to the power shell.
@@ -496,7 +520,7 @@ bool LvNodesScreen::handleLongPress() {
     if (node->saved) {
         _confirmDelete = true;
         _actionNodeHex = nodeHex;
-        if (_ui) _ui->lvStatusBar().showToast("Remove? Enter=Remove Esc=Keep", 5000);
+        if (_ui) _ui->lvStatusBar().showToast("Remove? Enter=Remove Backspace=Keep", 5000);
     } else {
         showActionMenu(nodeHex);
     }

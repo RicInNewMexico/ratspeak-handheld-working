@@ -1,6 +1,9 @@
 //! Transport tables, packet I/O, routing, and interface framing.
 
 use super::*;
+use rns_lite_core::transport::OutboundLifetime;
+
+pub const RS_HANDHELD_TX_LIFETIME_BYTES: usize = 104;
 //
 // rsDeck feeds raw Reticulum packet bytes in (RX from the LoRa driver) and polls raw bytes out
 // (TX to the driver); the LiteNode (rsReticulumLite) does the relay control plane (dedup, learn
@@ -297,15 +300,31 @@ pub(super) fn init_node_in<
         addr_of_mut!((*p).known_destinations).write(KnownDestinations::new());
         fill_none(addr_of_mut!((*p).packet_hashes.entries));
         fill_none(addr_of_mut!((*p).paths.entries));
+        // Zero valid integer storage directly; no table-sized stack temporary.
+        addr_of_mut!((*p).paths.generations).write_bytes(0, 1);
+        addr_of_mut!((*p).paths.last_generation).write(0);
         fill_none(addr_of_mut!((*p).announce_cache.entries));
         fill_none(addr_of_mut!((*p).announce_schedule.entries));
         fill_none(addr_of_mut!((*p).reverse.entries));
+        // Zero valid integer storage directly; no table-sized stack temporary.
+        addr_of_mut!((*p).reverse.generations).write_bytes(0, 1);
+        addr_of_mut!((*p).reverse.last_generation).write(0);
         fill_none(addr_of_mut!((*p).links.entries));
+        // Zero valid integer storage directly; no table-sized stack temporary.
+        addr_of_mut!((*p).links.generations).write_bytes(0, 1);
+        addr_of_mut!((*p).links.last_generation).write(0);
         fill_none(addr_of_mut!((*p).request_tags.entries));
         fill_none(addr_of_mut!((*p).outbound.entries));
         addr_of_mut!((*p).outbound.head).write(0);
         addr_of_mut!((*p).outbound.len).write(0);
+        addr_of_mut!((*p).last_delivery_identity).write(0);
+        addr_of_mut!((*p).retained_owner_mode).write(false);
+        addr_of_mut!((*p).discoveries.entries).write_bytes(0, 1);
+        addr_of_mut!((*p).discoveries.last_identity).write(0);
+        addr_of_mut!((*p).interface_facts)
+            .write([rns_lite_core::transport::InterfaceFacts::EMPTY; 8]);
         addr_of_mut!((*p).stats).write(TransportStats::default());
+        addr_of_mut!((*p).clock_ms).write(0);
         // Every field is initialized: forming the reference is now sound.
         Ok(&mut *p)
     }
@@ -346,7 +365,7 @@ pub unsafe extern "C" fn rs_handheld_rns_open_transport(
         }
         if buf.is_null()
             || buf_len < core::mem::size_of::<ActiveNode>()
-            || (buf as usize) % core::mem::align_of::<ActiveNode>() != 0
+            || !(buf as usize).is_multiple_of(core::mem::align_of::<ActiveNode>())
         {
             return RsHandheldStatus::ErrInvalidArg;
         }
@@ -404,13 +423,8 @@ pub unsafe extern "C" fn rs_handheld_rns_packet_ingest_with_mode(
         if ctx.is_null() || raw.is_null() || out_action.is_null() {
             return RsHandheldStatus::ErrInvalidArg;
         }
-        let mode = match interface_mode {
-            RS_HANDHELD_IFACE_MODE_FULL => InterfaceMode::Full,
-            RS_HANDHELD_IFACE_MODE_ACCESS_POINT => InterfaceMode::AccessPoint,
-            RS_HANDHELD_IFACE_MODE_ROAMING => InterfaceMode::Roaming,
-            RS_HANDHELD_IFACE_MODE_BOUNDARY => InterfaceMode::Boundary,
-            RS_HANDHELD_IFACE_MODE_GATEWAY => InterfaceMode::Gateway,
-            _ => return RsHandheldStatus::ErrInvalidArg,
+        let Some(mode) = decode_interface_mode(interface_mode) else {
+            return RsHandheldStatus::ErrInvalidArg;
         };
         // SAFETY: non-null per the contract; the node pointer targets the caller-owned
         // open_transport buffer, alive until shutdown per the ABI contract.
@@ -421,7 +435,22 @@ pub unsafe extern "C" fn rs_handheld_rns_packet_ingest_with_mode(
             None => return RsHandheldStatus::ErrNotReady,
         };
         let raw = unsafe { core::slice::from_raw_parts(raw, raw_len) };
-        let action = match node.ingest(raw, RxMeta::with_mode(interface_id, mode), now_ms) {
+        // Endpoint Links are owned by C++, not the Lite relay Link table. Use
+        // only this live registry to defer hash admission until C++ has checked
+        // the bound interface and authenticated the payload. An overheard copy
+        // must not suppress the same frame arriving on the correct interface.
+        let local_link = PacketView::parse(raw).ok().and_then(|view| {
+            ctx.link_ids
+                .iter()
+                .flatten()
+                .find(|id| **id == view.header.destination_hash)
+        });
+        let action = match node.ingest_with_local_link(
+            raw,
+            RxMeta::with_mode(interface_id, mode),
+            now_ms,
+            local_link,
+        ) {
             Ok(a) => a,
             Err(_) => return RsHandheldStatus::ErrInvalidArg,
         };
@@ -486,6 +515,60 @@ pub unsafe extern "C" fn rs_handheld_rns_packet_ingest_with_mode(
 
         unsafe { *out_action = action_code };
         RsHandheldStatus::Ok
+    })
+}
+
+fn decode_interface_mode(code: i32) -> Option<InterfaceMode> {
+    match code {
+        RS_HANDHELD_IFACE_MODE_FULL => Some(InterfaceMode::Full),
+        RS_HANDHELD_IFACE_MODE_ACCESS_POINT => Some(InterfaceMode::AccessPoint),
+        RS_HANDHELD_IFACE_MODE_ROAMING => Some(InterfaceMode::Roaming),
+        RS_HANDHELD_IFACE_MODE_BOUNDARY => Some(InterfaceMode::Boundary),
+        RS_HANDHELD_IFACE_MODE_GATEWAY => Some(InterfaceMode::Gateway),
+        _ => None,
+    }
+}
+
+/// Private handheld interface-owner metadata. No driver pointer or packet buffer
+/// crosses this boundary. A generation/availability change retires old requester
+/// bits before the owner can use its interface ID again. Call before ingest/tick.
+///
+/// # Safety
+/// `ctx` is live and exclusively owned with an open transport node.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_update_interface(
+    ctx: *mut RsHandheldRns,
+    interface_id: u8,
+    generation: u32,
+    interface_mode: i32,
+    bitrate_bps: u32,
+    outbound: u8,
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null() || interface_id >= 7 || outbound > 1 {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let Some(mode) = decode_interface_mode(interface_mode) else {
+            return RsHandheldStatus::ErrInvalidArg;
+        };
+        // SAFETY: exclusive live context and caller-owned open node per contract.
+        let ctx = unsafe { &mut *ctx };
+        let Some(mut pointer) = ctx.node else {
+            return RsHandheldStatus::ErrNotReady;
+        };
+        let node = unsafe { pointer.as_mut() };
+        if node.update_interface(
+            interface_id,
+            generation,
+            mode,
+            bitrate_bps,
+            outbound != 0,
+            false,
+        ) {
+            RsHandheldStatus::Ok
+        } else {
+            RsHandheldStatus::ErrCapacity
+        }
     })
 }
 
@@ -557,7 +640,7 @@ pub unsafe extern "C" fn rs_handheld_rns_take_own_path_request_tag(
 
 /// Register a live link id for inbound routing: a subsequent packet addressed to `link_id`
 /// (or any proof for it) is reported by `packet_ingest` as `INGEST_LOCAL_FRAME`. Idempotent;
-/// silently no-ops if the fixed slot set is full (endpoint scope). `ErrInvalidArg` on null.
+/// returns `ErrCapacity` if the fixed slot set is full. `ErrInvalidArg` on null.
 ///
 /// # Safety
 /// `ctx` live; `link_id` 16 readable bytes.
@@ -576,10 +659,17 @@ pub unsafe extern "C" fn rs_handheld_rns_link_register(
         if ctx.link_ids.iter().flatten().any(|l| *l == id) {
             return RsHandheldStatus::Ok;
         }
-        if let Some(slot) = ctx.link_ids.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(id);
+        if let Some(index) = ctx
+            .link_ids
+            .iter()
+            .enumerate()
+            .position(|(i, slot)| slot.is_none() && ctx.link_generations[i] < u32::MAX)
+        {
+            ctx.link_generations[index] += 1;
+            ctx.link_ids[index] = Some(id);
+            return RsHandheldStatus::Ok;
         }
-        RsHandheldStatus::Ok
+        RsHandheldStatus::ErrCapacity
     })
 }
 
@@ -868,6 +958,194 @@ pub unsafe extern "C" fn rs_handheld_rns_poll_outbound(
     out_interface_id: *mut u8,
     out_reason: *mut i32,
 ) -> RsHandheldStatus {
+    // SAFETY: same buffer and context contract as the common implementation.
+    unsafe {
+        poll_outbound(
+            ctx,
+            out,
+            out_cap,
+            out_len,
+            out_interface_id,
+            out_reason,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Poll while retaining the node's original lifetime and state dependencies.
+///
+/// # Safety
+/// Same as `rs_handheld_rns_poll_outbound`; `out_lifetime` is 104 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_poll_outbound_leased(
+    ctx: *mut RsHandheldRns,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+    out_interface_id: *mut u8,
+    out_reason: *mut i32,
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
+    if out_lifetime.is_null() {
+        return RsHandheldStatus::ErrInvalidArg;
+    }
+    // SAFETY: checked non-null token plus the caller's writable buffer contract.
+    unsafe {
+        poll_outbound(
+            ctx,
+            out,
+            out_cap,
+            out_len,
+            out_interface_id,
+            out_reason,
+            out_lifetime,
+        )
+    }
+}
+
+fn lifetime_token(lifetime: OutboundLifetime) -> [u8; RS_HANDHELD_TX_LIFETIME_BYTES] {
+    let mut token = [0; RS_HANDHELD_TX_LIFETIME_BYTES];
+    token[..OutboundLifetime::TOKEN_BYTES].copy_from_slice(&lifetime.to_token());
+    token[92] = u8::MAX; // no endpoint Link dependency
+    token
+}
+
+/// Private handheld retained-owner adapter. Never returns a borrowed packet.
+/// `transfer=1` moves the oldest eligible row into the owner's existing held slot;
+/// otherwise acknowledgment clears individual target bits in the Rust queue.
+/// Selection latches exclusive retained mode; legacy polling then returns NotReady.
+///
+/// # Safety
+/// `ctx` is a live, exclusively owned context. All pointers are valid for their
+/// indicated sizes; outputs are mutually disjoint and outside the context/node.
+/// Only `generations` and `out_generations` may alias (the input is copied first).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_outbound_select(
+    ctx: *mut RsHandheldRns,
+    after_identity: u64,
+    blocked_targets: u8,
+    generations: *const [u32; 7],
+    transfer: i32,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+    out_identity: *mut u64,
+    out_targets: *mut u8,
+    out_generations: *mut [u32; 7],
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null()
+            || generations.is_null()
+            || out.is_null()
+            || out_len.is_null()
+            || out_identity.is_null()
+            || out_targets.is_null()
+            || out_generations.is_null()
+            || out_lifetime.is_null()
+            || blocked_targets & 0x80 != 0
+            || !(transfer == 0 || (transfer == 1 && after_identity == 0 && blocked_targets == 0))
+        {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        // SAFETY: pointer sizes and exclusive context ownership are caller obligations.
+        let generations = unsafe { *generations };
+        let node = match unsafe { &mut *ctx }.node {
+            Some(mut p) => unsafe { p.as_mut() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        unsafe {
+            *out_len = 0;
+            *out_identity = 0;
+            *out_targets = 0;
+        }
+        let Some(queued) =
+            node.retained_outbound_select(after_identity, blocked_targets, generations)
+        else {
+            return RsHandheldStatus::Ok;
+        };
+        let length = queued.frame.packet.len();
+        if length > out_cap {
+            return RsHandheldStatus::ErrCapacity;
+        }
+        let identity = queued.delivery.identity;
+        // No driver callback or caller borrow exists while the Rust row is borrowed.
+        unsafe {
+            core::ptr::copy_nonoverlapping(queued.frame.packet.as_slice().as_ptr(), out, length);
+            *out_len = length;
+            *out_identity = identity;
+            *out_targets = queued.delivery.pending_targets;
+            *out_generations = queued.delivery.interface_generations;
+            *out_lifetime = lifetime_token(queued.frame.lifetime);
+        }
+        if transfer == 1 {
+            node.retained_outbound_take(identity);
+        }
+        RsHandheldStatus::Ok
+    })
+}
+
+/// Complete only the named row's admitted or terminal target bits. An evicted,
+/// expired or already-completed identity returns Retry and cannot affect reuse.
+///
+/// # Safety
+/// `ctx` must be a live exclusively owned context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_outbound_ack(
+    ctx: *mut RsHandheldRns,
+    identity: u64,
+    completed_targets: u8,
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null() || identity == 0 || completed_targets & 0x80 != 0 {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let node = match unsafe { &mut *ctx }.node {
+            Some(mut p) => unsafe { p.as_mut() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        if node.retained_outbound_ack(identity, completed_targets) {
+            RsHandheldStatus::Ok
+        } else {
+            RsHandheldStatus::ErrRetry
+        }
+    })
+}
+
+/// Retire an old interface's permissions on every existing queued row, including
+/// rows whose fanout has never been bound. Does not latch retained-owner mode.
+///
+/// # Safety
+/// `ctx` must be a live exclusively owned context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_outbound_retire_interface(
+    ctx: *mut RsHandheldRns,
+    interface: u8,
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null() || interface >= 7 {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let node = match unsafe { &mut *ctx }.node {
+            Some(mut p) => unsafe { p.as_mut() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        node.retained_outbound_retire_interface(interface);
+        RsHandheldStatus::Ok
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn poll_outbound(
+    ctx: *mut RsHandheldRns,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+    out_interface_id: *mut u8,
+    out_reason: *mut i32,
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
     guard(|| {
         if ctx.is_null()
             || out.is_null()
@@ -883,6 +1161,9 @@ pub unsafe extern "C" fn rs_handheld_rns_poll_outbound(
             Some(mut p) => unsafe { p.as_mut() },
             None => return RsHandheldStatus::ErrNotReady,
         };
+        if node.retained_owner_mode {
+            return RsHandheldStatus::ErrNotReady;
+        }
         // Peek the next frame's length BEFORE consuming it: if `out` is too small, return
         // ErrCapacity with the frame still queued (a destructive pop-then-check would silently
         // drop relay traffic the caller never sees).
@@ -892,6 +1173,9 @@ pub unsafe extern "C" fn rs_handheld_rns_poll_outbound(
                     *out_len = 0;
                     *out_interface_id = 0;
                     *out_reason = -1;
+                    if !out_lifetime.is_null() {
+                        *out_lifetime = [0; RS_HANDHELD_TX_LIFETIME_BYTES];
+                    }
                 }
                 return RsHandheldStatus::Ok;
             }
@@ -903,7 +1187,14 @@ pub unsafe extern "C" fn rs_handheld_rns_poll_outbound(
         let frame = match node.poll_tx() {
             Some(f) => f,
             None => {
-                unsafe { *out_len = 0 };
+                unsafe {
+                    *out_len = 0;
+                    *out_interface_id = 0;
+                    *out_reason = -1;
+                    if !out_lifetime.is_null() {
+                        *out_lifetime = [0; RS_HANDHELD_TX_LIFETIME_BYTES];
+                    }
+                }
                 return RsHandheldStatus::Ok;
             }
         };
@@ -914,7 +1205,220 @@ pub unsafe extern "C" fn rs_handheld_rns_poll_outbound(
             *out_len = bytes.len();
             *out_interface_id = frame.interface_id;
             *out_reason = outbound_reason_code(frame.reason);
+            if !out_lifetime.is_null() {
+                *out_lifetime = lifetime_token(frame.lifetime);
+            }
         }
+        RsHandheldStatus::Ok
+    })
+}
+
+/// Capture lifetime and local Link generation before a host retains a constructed packet.
+///
+/// # Safety
+/// `ctx` live; `raw` has `raw_len` readable bytes; `out_lifetime` has 104 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_capture_outbound_lifetime(
+    ctx: *const RsHandheldRns,
+    raw: *const u8,
+    raw_len: usize,
+    now_ms: u64,
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
+    // SAFETY: forwarded caller contracts; no retained-age override.
+    unsafe { capture_outbound_lifetime(ctx, raw, raw_len, now_ms, None, out_lifetime) }
+}
+
+/// Capture current protocol dependencies for a receipt whose immutable wait
+/// began before its bytes could be constructed (for example, before storage
+/// committed). This never renews the original wait or extends a state deadline.
+///
+/// # Safety
+/// Same pointer/buffer requirements as `rs_handheld_rns_capture_outbound_lifetime`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_capture_outbound_lifetime_at(
+    ctx: *const RsHandheldRns,
+    raw: *const u8,
+    raw_len: usize,
+    now_ms: u64,
+    born_ms: u64,
+    max_wait_ms: u32,
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
+    // SAFETY: forwarded caller contracts; validation precedes publication.
+    unsafe {
+        capture_outbound_lifetime(
+            ctx,
+            raw,
+            raw_len,
+            now_ms,
+            Some((born_ms, max_wait_ms)),
+            out_lifetime,
+        )
+    }
+}
+
+unsafe fn capture_outbound_lifetime(
+    ctx: *const RsHandheldRns,
+    raw: *const u8,
+    raw_len: usize,
+    now_ms: u64,
+    retained_age: Option<(u64, u32)>,
+    out_lifetime: *mut [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null()
+            || raw.is_null()
+            || out_lifetime.is_null()
+            || raw_len > rns_lite_core::constants::MTU
+        {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        // SAFETY: the caller provides a live context and readable packet buffer.
+        let ctx = unsafe { &*ctx };
+        let raw = unsafe { core::slice::from_raw_parts(raw, raw_len) };
+        let node = match ctx.node {
+            Some(p) => unsafe { p.as_ref() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        let mut lifetime = match node.local_outbound_lifetime(raw, now_ms) {
+            Ok(value) => value,
+            Err(_) => return RsHandheldStatus::ErrInvalidArg,
+        };
+        if let Some((born_ms, max_wait_ms)) = retained_age {
+            if max_wait_ms == 0
+                || u64::from(max_wait_ms) > rns_lite_core::transport::OUTBOUND_MAX_AGE_MS
+                || now_ms < born_ms
+            {
+                return RsHandheldStatus::ErrInvalidArg;
+            }
+            let Some(deadline) = born_ms.checked_add(u64::from(max_wait_ms)) else {
+                return RsHandheldStatus::ErrInvalidArg;
+            };
+            lifetime.enqueued_ms = born_ms;
+            lifetime.expires_ms = lifetime.expires_ms.min(deadline);
+            if now_ms >= lifetime.expires_ms {
+                return RsHandheldStatus::ErrNotReady;
+            }
+        }
+        let view = match PacketView::parse(raw) {
+            Ok(value) => value,
+            Err(_) => return RsHandheldStatus::ErrInvalidArg,
+        };
+        let mut token = lifetime_token(lifetime);
+        let link_id = if view.header.flags.destination_type == DestinationType::Link {
+            Some(view.header.destination_hash)
+        } else if view.header.flags.packet_type == PacketType::LinkRequest {
+            Some(rns_link::compute_link_id(
+                &view.header.destination_hash,
+                view.payload,
+            ))
+        } else {
+            None
+        };
+        if let Some(id) = link_id {
+            let Some(index) = ctx.link_ids.iter().position(|slot| *slot == Some(id)) else {
+                return RsHandheldStatus::ErrNotReady;
+            };
+            token[88..92].copy_from_slice(&ctx.link_generations[index].to_le_bytes());
+            token[92] = index as u8;
+            // A teardown is deliberately sent as the local Link closes. It may
+            // finish after unregister, but never after that slot is reused.
+            token[93] = u8::from(view.header.context == PacketContext::LinkClose);
+            let resource_direction = match view.header.context {
+                PacketContext::Resource
+                | PacketContext::ResourceAdv
+                | PacketContext::ResourceHmu => Some(0),
+                PacketContext::ResourceReq => Some(1),
+                _ => None,
+            };
+            if let Some(direction) = resource_direction {
+                let active = if direction == 0 {
+                    ctx.resource_out.is_some()
+                } else {
+                    ctx.resource_in.is_some()
+                };
+                if !active {
+                    return RsHandheldStatus::ErrNotReady;
+                }
+                token[96..100].copy_from_slice(&ctx.resource_generations[direction].to_le_bytes());
+                token[100] = direction as u8 + 1;
+            }
+            // Resource proof/cancellation packets have transferred terminal
+            // ownership. Their hash-bound bytes may outlive that Resource and
+            // remain bounded by the local Link generation and original age.
+        }
+        // SAFETY: writable fixed-size caller buffer; publication follows validation.
+        unsafe { *out_lifetime = token };
+        RsHandheldStatus::Ok
+    })
+}
+
+/// Validate original queue metadata without refreshing any state or deadline.
+///
+/// # Safety
+/// `ctx` live; `lifetime` has 104 readable bytes; `out_live` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_outbound_lifetime_is_live(
+    ctx: *const RsHandheldRns,
+    lifetime: *const [u8; RS_HANDHELD_TX_LIFETIME_BYTES],
+    interface_id: u8,
+    now_ms: u64,
+    out_live: *mut i32,
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null() || lifetime.is_null() || out_live.is_null() {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        // SAFETY: readable fixed-size token and live context per caller contract.
+        let ctx = unsafe { &*ctx };
+        let token = unsafe { &*lifetime };
+        let Some(lifetime) = OutboundLifetime::from_token(token[..88].try_into().unwrap()) else {
+            return RsHandheldStatus::ErrInvalidArg;
+        };
+        if token[94..96] != [0; 2] || token[93] > 1 || token[101..104] != [0; 3] {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let generation = u32::from_le_bytes(token[88..92].try_into().unwrap());
+        let link_live = if token[92] == u8::MAX {
+            if generation != 0 || token[93] != 0 {
+                return RsHandheldStatus::ErrInvalidArg;
+            }
+            true
+        } else {
+            let index = usize::from(token[92]);
+            if index >= LOCAL_LINK_SLOTS || generation == 0 {
+                return RsHandheldStatus::ErrInvalidArg;
+            }
+            ctx.link_generations[index] == generation
+                && (ctx.link_ids[index].is_some() || token[93] == 1)
+        };
+        let resource_generation = u32::from_le_bytes(token[96..100].try_into().unwrap());
+        let resource_live = match token[100] {
+            0 if resource_generation == 0 => true,
+            1 | 2 if resource_generation != 0 && token[92] != u8::MAX && token[93] == 0 => {
+                let index = usize::from(token[100] - 1);
+                ctx.resource_generations[index] == resource_generation
+                    && if index == 0 {
+                        ctx.resource_out.is_some()
+                    } else {
+                        ctx.resource_in.is_some()
+                    }
+            }
+            _ => return RsHandheldStatus::ErrInvalidArg,
+        };
+        let node = match ctx.node {
+            Some(p) => unsafe { p.as_ref() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        // SAFETY: caller's writable scalar output.
+        unsafe {
+            *out_live = i32::from(
+                link_live
+                    && resource_live
+                    && node.outbound_lifetime_is_live(interface_id, lifetime, now_ms),
+            )
+        };
         RsHandheldStatus::Ok
     })
 }
@@ -1119,6 +1623,29 @@ pub unsafe extern "C" fn rs_handheld_rns_route(
             None => broadcast,
         };
         unsafe { *out_route = route };
+        RsHandheldStatus::Ok
+    })
+}
+
+/// Immediately discard a failed route before requesting a replacement. The
+/// known-identity table is retained. Missing paths are an idempotent success.
+///
+/// # Safety
+/// `ctx` is live with an open node; `destination_hash` is 16 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_drop_path(
+    ctx: *mut RsHandheldRns,
+    destination_hash: *const [u8; DESTINATION_LENGTH],
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null() || destination_hash.is_null() {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let node = match unsafe { &mut *ctx }.node {
+            Some(mut p) => unsafe { p.as_mut() },
+            None => return RsHandheldStatus::ErrNotReady,
+        };
+        node.drop_path(unsafe { &*destination_hash });
         RsHandheldStatus::Ok
     })
 }

@@ -3,11 +3,11 @@
 #include "config/Config.h"
 #include "util/Bytes.h"
 #include "storage/MirrorWriteState.h"
+#include <dirent.h>
 #include <vector>
 #include <string>
 #include <map>
 #include <unordered_map>
-#include <set>
 
 class SDStore;
 class FlashStore;
@@ -27,7 +27,7 @@ struct DiscoveredNode {
 class AnnounceManager {
 public:
     AnnounceManager(const char* aspectFilter = nullptr);
-    virtual ~AnnounceManager() = default;
+    virtual ~AnnounceManager();
 
     // Announce bridge (D13, sole ingest path since micro retirement 2026-08-13):
     // the FFI validates signature + binding; this applies the contact/name-cache/
@@ -73,6 +73,9 @@ private:
     bool removeContact(const std::string& hexHash);
     bool commitContact(const std::string& hexHash, const String& json);
     void flushContactMirrors();
+    void closeContactMirrorDirectory();
+    bool mirrorContact(const char* filename);
+    void cacheName(const std::string& hash, const std::string& name);
 
     std::vector<DiscoveredNode> _nodes;
     SDStore* _sd = nullptr;
@@ -80,7 +83,13 @@ private:
     LoRaInterface* _loraIf = nullptr;
     rs::Bytes _localDestHash;
     bool _contactsDirty = false;
-    std::set<std::string> _contactMirrorsPending;
+    // The canonical directory is the retry ledger, including contacts outside
+    // the in-memory node limit and deletion markers. No filename backlog.
+    DIR* _contactMirrorDirectory = nullptr;
+    bool _contactMirrorsPending = false;
+    bool _contactMirrorRetry = false;
+    bool _contactMirrorWaiting = false;
+    unsigned long _lastContactMirrorAttempt = 0;
     MirrorWriteState _nameCacheWrites;
     unsigned long _lastContactSave = 0;
     unsigned long _lastNameCacheSave = 0;

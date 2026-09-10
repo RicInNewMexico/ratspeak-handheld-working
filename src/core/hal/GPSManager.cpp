@@ -13,7 +13,7 @@ void GPSManager::begin() {
     if (_running) return;
 
     // Restore last-known time from NVS on boot
-    restoreTimeFromNVS();
+    if (_timeEnabled) restoreTimeFromNVS();
 
     // Start baud rate auto-detection: try first rate
     _baudDetected = false;
@@ -28,8 +28,6 @@ void GPSManager::begin() {
 void GPSManager::loop() {
     handheld::assertDeviceOwner();
     if (!_running) return;
-
-    uint32_t prevSentences = _parser.sentencesParsed();
 
     // Read available bytes (up to 64 per call to stay non-blocking)
     int count = 0;
@@ -73,9 +71,8 @@ void GPSManager::loop() {
         // even without satellite lock (e.g., indoors). Year/epoch validation
         // in syncSystemTime() guards against garbage data.
         bool hasSatFix = (d.satellites > 0);
-        if (hasSatFix) _lastFixMs = millis();
         bool allowSync = hasSatFix || (_timeSyncCount == 0);
-        if (d.timeValid && allowSync && (millis() - _lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS || _timeSyncCount == 0)) {
+        if (_timeEnabled && d.timeValid && allowSync && (millis() - _lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS || _timeSyncCount == 0)) {
             syncSystemTime();
             // Persist time to NVS so reboots without WiFi/GPS have approximate time
             persistToNVS();
@@ -87,11 +84,14 @@ void GPSManager::loop() {
     if (d.locationUpdated) {
         d.locationUpdated = false;
         _locationValid = d.locationValid;
-        _lastFixMs = millis();
+        if (_locationValid) {
+            _lastFixMs = millis();
+            _hadLocationFix = true;
+        }
     }
 
     // Stale fix detection
-    if (_timeValid && (millis() - _lastFixMs >= FIX_TIMEOUT_MS)) {
+    if (_locationValid && (millis() - _lastFixMs >= FIX_TIMEOUT_MS)) {
         // Don't clear _timeValid — system clock is still set and accurate.
         // Only clear location validity since position may have changed.
         _locationValid = false;
@@ -103,7 +103,7 @@ void GPSManager::stop() {
     if (!_running) return;
 
     // Persist current data before stopping
-    if (_timeValid || _locationValid) {
+    if (_timeEnabled && (_timeValid || _locationValid)) {
         persistToNVS();
     }
 
@@ -115,7 +115,7 @@ void GPSManager::stop() {
 }
 
 uint32_t GPSManager::fixAgeMs() const {
-    if (_lastFixMs == 0) return UINT32_MAX;
+    if (!_hadLocationFix) return UINT32_MAX;
     return millis() - _lastFixMs;
 }
 
@@ -207,7 +207,7 @@ void GPSManager::persistToNVS() {
     prefs.putLong64("epoch", (int64_t)now);
 
     const NMEAData& d = _parser.data();
-    if (d.locationValid) {
+    if (_parser.parseLocation() && d.locationValid) {
         // Store as integers (microdegrees) to avoid float NVS issues
         prefs.putLong("lat_ud", (int32_t)(d.latitude * 1000000.0));
         prefs.putLong("lon_ud", (int32_t)(d.longitude * 1000000.0));

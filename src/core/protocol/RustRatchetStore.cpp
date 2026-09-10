@@ -62,7 +62,7 @@ uint64_t RustRatchetStore::fingerprint(const uint8_t* data, size_t len) {
     return value;
 }
 
-bool RustRatchetStore::quarantine(const char* path, const char* label) {
+bool RustRatchetStore::quarantine(const char* path, const char* label, PreparedKind kind) {
     if (!_flash || !path) return true;
     const char* source = path;
     char backup[96];
@@ -84,6 +84,7 @@ bool RustRatchetStore::quarantine(const char* path, const char* label) {
         break;
     }
     Serial.printf("[RUST] could not quarantine rejected %s state; primary preserved\n", label);
+    _flags |= static_cast<uint8_t>(kind);
     return false;
 }
 
@@ -97,12 +98,12 @@ bool RustRatchetStore::restoreRing(rs_handheld_rns_t* ctx) {
     if (!read || seeded != RS_HANDHELD_OK) {
         Serial.printf("[RUST] ratchet ring rejected (%d); preserving for diagnosis\n",
                       static_cast<int>(seeded));
-        quarantine(_ringPath, "ratchet ring");
+        quarantine(_ringPath, "ratchet ring", PreparedKind::Ring);
         return false;
     }
 
     if (rs_handheld_rns_ratchet_current(ctx, _persistedPub) == RS_HANDHELD_OK) {
-        _havePub = true;
+        _flags |= HAVE_PUB;
         Serial.println("[RUST] ratchet ring restored");
     } else {
         // A valid signed empty ring is harmless; the next announce creates its first key.
@@ -123,7 +124,7 @@ bool RustRatchetStore::restoreAnnounceState(rs_handheld_rns_t* ctx) {
     if (!read || seeded != RS_HANDHELD_OK) {
         Serial.printf("[RUST] announce-order state rejected (%d); preserving for diagnosis\n",
                       static_cast<int>(seeded));
-        quarantine(_announceStatePath, "announce-order");
+        quarantine(_announceStatePath, "announce-order", PreparedKind::AnnounceState);
         return false;
     }
     Serial.println("[RUST] announce-order state restored");
@@ -145,11 +146,11 @@ bool RustRatchetStore::restorePeers(rs_handheld_rns_t* ctx, uint64_t wallSecs,
     if (!read || seeded != RS_HANDHELD_OK) {
         Serial.printf("[RUST] peer-ratchet table rejected (%d); preserving for diagnosis\n",
                       static_cast<int>(seeded));
-        quarantine(PATH_PEERS, "peer-ratchet");
+        quarantine(PATH_PEERS, "peer-ratchet", PreparedKind::Peers);
         return false;
     }
-    _peersDirty = changed != 0;
-    if (_peersDirty) {
+    if (changed) _flags |= PEERS_DIRTY;
+    if (_flags & PEERS_DIRTY) {
         Serial.println("[RUST] peer-ratchet ages anchored; v2 persistence pending");
     } else {
         Serial.println("[RUST] peer-ratchet table restored");
@@ -165,8 +166,7 @@ void RustRatchetStore::begin(FlashStore* flash, rs_handheld_rns_t* ctx,
     memset(_ringPath, 0, sizeof(_ringPath));
     memset(_announceStatePath, 0, sizeof(_announceStatePath));
     _flash = flash;
-    _havePub = false;
-    _peersDirty = false;
+    _flags = 0;
     _lastPeerSaveMs = static_cast<uint32_t>(uptimeMs);
     if (!_flash || !ctx || !identityHash) return;
 
@@ -187,7 +187,8 @@ void RustRatchetStore::begin(FlashStore* flash, rs_handheld_rns_t* ctx,
 bool RustRatchetStore::writePreparedAndCommit(rs_handheld_rns_t* ctx, const char* path,
                                               size_t len, PreparedKind kind,
                                               uint64_t& outWireValue, uint8_t outPub[32]) {
-    if (!_flash || !ctx || !path || len == 0 || len > sizeof(_blob)) {
+    if (!_flash || !ctx || !path || len == 0 || len > sizeof(_blob) ||
+        (_flags & static_cast<uint8_t>(kind))) {
         secureZero(_blob, sizeof(_blob));
         return false;
     }
@@ -203,7 +204,7 @@ bool RustRatchetStore::writePreparedAndCommit(rs_handheld_rns_t* ctx, const char
     size_t readLen = 0;
     if (!_flash->readFileFully(path, _blob, sizeof(_blob), readLen) || readLen != len) {
         secureZero(_blob, sizeof(_blob));
-        quarantine(path, kind == PreparedKind::Ring ? "ratchet ring" : "announce-order");
+        quarantine(path, kind == PreparedKind::Ring ? "ratchet ring" : "announce-order", kind);
         return false;
     }
 
@@ -218,7 +219,7 @@ bool RustRatchetStore::writePreparedAndCommit(rs_handheld_rns_t* ctx, const char
         Serial.printf("[RUST] persisted %s candidate rejected on commit (%d)\n",
                       kind == PreparedKind::Ring ? "ratchet" : "announce-order",
                       static_cast<int>(st));
-        quarantine(path, kind == PreparedKind::Ring ? "ratchet ring" : "announce-order");
+        quarantine(path, kind == PreparedKind::Ring ? "ratchet ring" : "announce-order", kind);
         return false;
     }
     return true;
@@ -230,6 +231,11 @@ RustRatchetStore::AnnounceMode RustRatchetStore::prepareAnnounce(
     outWireValue = wallSecs ? wallSecs : uptimeMs / 1000;
     memset(outPub, 0, 32);
     if (!ctx) return AnnounceMode::BaseKey;
+    if (_flags & (static_cast<uint8_t>(PreparedKind::Ring) |
+                          static_cast<uint8_t>(PreparedKind::AnnounceState))) {
+        Serial.println("[RUST] rejected announce state awaits preservation; announcing base-key");
+        return AnnounceMode::BaseKey;
+    }
 
     size_t stateLen = 0;
     int32_t ready = 0;
@@ -279,7 +285,7 @@ RustRatchetStore::AnnounceMode RustRatchetStore::prepareAnnounce(
             Serial.println("[RUST] ratchet ring full with unknown-age key; retaining current key");
         }
         memcpy(_persistedPub, outPub, 32);
-        _havePub = true;
+        _flags |= HAVE_PUB;
         return AnnounceMode::Ratcheted;
     }
 
@@ -293,7 +299,7 @@ RustRatchetStore::AnnounceMode RustRatchetStore::prepareAnnounce(
     }
 
     memcpy(_persistedPub, outPub, 32);
-    _havePub = true;
+    _flags |= HAVE_PUB;
     Serial.println(action == RS_HANDHELD_RATCHET_PREP_ROTATED
                        ? "[RUST] ratchet rotated + durably committed"
                        : "[RUST] ratchet metadata durably committed");
@@ -312,13 +318,14 @@ bool RustRatchetStore::rememberPeer(rs_handheld_rns_t* ctx,
         Serial.printf("[RUST] peer-ratchet remember failed (%d)\n", static_cast<int>(st));
         return false;
     }
-    if (changed) _peersDirty = true;
+    if (changed) _flags |= PEERS_DIRTY;
     return changed != 0;
 }
 
 bool RustRatchetStore::flushPeers(rs_handheld_rns_t* ctx, uint32_t nowMs, bool force) {
-    if (!_peersDirty) return true;
-    if (!_flash || !ctx) return false;
+    if (!(_flags & PEERS_DIRTY)) return true;
+    if (!_flash || !ctx || (_flags & static_cast<uint8_t>(PreparedKind::Peers)))
+        return false;
     if (!force && static_cast<uint32_t>(nowMs - _lastPeerSaveMs) < PEER_SAVE_INTERVAL_MS) return false;
     // Stamp the attempt: a failed flash device must not be hammered on every loop pass.
     _lastPeerSaveMs = nowMs;
@@ -345,9 +352,9 @@ bool RustRatchetStore::flushPeers(rs_handheld_rns_t* ctx, uint32_t nowMs, bool f
     secureZero(_blob, sizeof(_blob));
     if (!verified) {
         Serial.println("[RUST] peer-ratchet readback verification failed");
-        quarantine(PATH_PEERS, "peer-ratchet");
+        quarantine(PATH_PEERS, "peer-ratchet", PreparedKind::Peers);
         return false;
     }
-    _peersDirty = false;
+    _flags &= static_cast<uint8_t>(~PEERS_DIRTY);
     return true;
 }

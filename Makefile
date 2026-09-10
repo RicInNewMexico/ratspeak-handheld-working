@@ -1,5 +1,5 @@
 DEVICE ?= tdeck
-SUPPORTED_DEVICES := tdeck tpager cardputer
+SUPPORTED_DEVICES := $(shell python3 tools/release_catalog.py devices)
 STANDALONE_ENV ?= $(DEVICE)
 RNODE_DIR ?= vendor/rnode_firmware
 LAUNCHER_DIR ?= launcher
@@ -10,47 +10,17 @@ ifeq ($(filter $(DEVICE),$(SUPPORTED_DEVICES)),)
 $(error Unsupported DEVICE '$(DEVICE)'; choose one of: $(SUPPORTED_DEVICES))
 endif
 
-# Established per-device release names.
-ifeq ($(DEVICE),tpager)
-BRAND := rspager
-else ifeq ($(DEVICE),cardputer)
-BRAND := rscardputer
-else
-BRAND := rsdeck
+# Catalog values are whitespace-free Make assignments. Partition geometry comes
+# from the selected CSV, so packaging and validation cannot drift independently.
+RELEASE_CONFIG := $(shell python3 tools/release_catalog.py make --device $(DEVICE))
+ifeq ($(strip $(RELEASE_CONFIG)),)
+$(error Failed to load release catalog for $(DEVICE))
 endif
-
-# Per-device dual-boot layout: partition CSV, flash size, RNode sketch target,
-# OTA slot sizes and RNode slot offset (defaults = deck/tpager 16MB layout).
-ifeq ($(DEVICE),cardputer)
-PARTITION_CSV := partitions/dual-8mb.csv
-PARTITIONS_BIN := $(BUILD_DIR)/partitions-8mb.bin
-FLASH_SIZE := 8MB
-RNODE_TARGET := cardputer_adv
-STANDALONE_SLOT_SIZE := 0x260000
-RNODE_SLOT_SIZE := 0x260000
-RNODE_OFFSET := 0x370000
-RNODE_PREP_TARGET := prep-cardputer_adv
-else
-PARTITION_CSV := partitions/dual-16mb.csv
-PARTITIONS_BIN := $(BUILD_DIR)/partitions-16mb.bin
-FLASH_SIZE := 16MB
-RNODE_TARGET := $(DEVICE)
-STANDALONE_SLOT_SIZE := 0x400000
-RNODE_SLOT_SIZE := 0x300000
-RNODE_OFFSET := 0x510000
-RNODE_PREP_TARGET := prep-esp32
-endif
-
+$(foreach setting,$(RELEASE_CONFIG),$(eval $(subst =, := ,$(setting))))
+PARTITIONS_BIN := $(BUILD_DIR)/$(PARTITIONS_BASENAME)
 FULL_NAME := $(BRAND)-full
 STANDALONE_NAME := $(BRAND)-standalone
 RNODE_ONLY_NAME := $(BRAND)-rnode
-ifeq ($(DEVICE),tpager)
-LAUNCHER_STANDALONE_NAME := $(BRAND)-standalone-app
-LAUNCHER_RNODE_NAME := $(BRAND)-rnode-app
-else
-LAUNCHER_STANDALONE_NAME := $(BRAND)-standalone-m5launcher
-LAUNCHER_RNODE_NAME := $(BRAND)-rnode-m5launcher
-endif
 
 FULL_BIN := $(BUILD_DIR)/$(FULL_NAME).bin
 STANDALONE_BIN := $(BUILD_DIR)/$(STANDALONE_NAME).bin
@@ -92,6 +62,7 @@ doctor-source:
 	python3 tools/check_prebuilt.py --allow-dirty
 
 source-check:
+	python3 tools/release_catalog.py check
 	python3 tools/check_source_release.py
 	python3 tools/check_runtime_boundary.py
 	python3 tools/collect_licenses.py --check
@@ -110,9 +81,8 @@ $(PARTITIONS_BIN): $(PARTITION_CSV)
 	python3 $(GEN_ESPPART) $(PARTITION_CSV) $(PARTITIONS_BIN)
 
 check: build-launcher build-standalone build-rnode
-	python3 tools/check_image_fit.py --launcher $(LAUNCHER_BIN) \
-		--standalone $(STANDALONE_APP_BIN) --standalone-slot-size $(STANDALONE_SLOT_SIZE) \
-		--rnode $(RNODE_BIN) --rnode-slot-size $(RNODE_SLOT_SIZE)
+	python3 tools/check_image_fit.py --device $(DEVICE) --launcher $(LAUNCHER_BIN) \
+		--standalone $(STANDALONE_APP_BIN) --rnode $(RNODE_BIN)
 
 check-all:
 	@for device in $(SUPPORTED_DEVICES); do \
@@ -120,22 +90,21 @@ check-all:
 	done
 
 full-image: check $(PARTITIONS_BIN)
-	python3 tools/make_dual_image.py \
+	python3 tools/make_dual_image.py --device $(DEVICE) \
 		--bootloader $(BOOTLOADER_BIN) \
 		--partitions $(PARTITIONS_BIN) \
 		--boot-app0 $(BOOT_APP0_BIN) \
 		--launcher $(LAUNCHER_BIN) \
-		--standalone $(STANDALONE_APP_BIN) --standalone-slot-size $(STANDALONE_SLOT_SIZE) \
-		--rnode $(RNODE_BIN) --rnode-slot-size $(RNODE_SLOT_SIZE) \
-		--rnode-offset $(RNODE_OFFSET) --flash-size $(FLASH_SIZE) \
+		--standalone $(STANDALONE_APP_BIN) \
+		--rnode $(RNODE_BIN) \
 		--output $(FULL_BIN)
 
 standalone-image: build-standalone
 	mkdir -p $(BUILD_DIR)
 	python3 -m esptool --chip esp32s3 merge-bin --flash-mode dio --flash-size $(FLASH_SIZE) \
-		$(if $(filter tpager,$(DEVICE)),--flash-freq 80m,) --output $(STANDALONE_BIN) \
+		$(if $(STANDALONE_FLASH_FREQ),--flash-freq $(STANDALONE_FLASH_FREQ),) --output $(STANDALONE_BIN) \
 		0x0000 $(BOOTLOADER_BIN) 0x8000 .pio/build/$(STANDALONE_ENV)/partitions.bin \
-		0xe000 $(BOOT_APP0_BIN) 0x10000 $(STANDALONE_APP_BIN)
+		0xe000 $(BOOT_APP0_BIN) $(STANDALONE_FACTORY_OFFSET) $(STANDALONE_APP_BIN)
 
 rnode-only-image: build-rnode
 	mkdir -p $(BUILD_DIR)
@@ -145,7 +114,7 @@ rnode-only-image: build-rnode
 		0x0000 $(RNODE_BOOTLOADER_BIN) \
 		0x8000 $(RNODE_PARTITIONS_BIN) \
 		0xe000 $(BOOT_APP0_BIN) \
-		0x10000 $(RNODE_BIN)
+		$(RNODE_FACTORY_OFFSET) $(RNODE_BIN)
 
 bundle: full-image
 

@@ -31,6 +31,7 @@
 
 #if MODEM == SX1262
 #include "sx126x.h"
+#include "RadioTimingPolicy.h"
 sx126x *LoRa = &sx126x_modem;
 #elif MODEM == SX1276 || MODEM == SX1278
 #include "sx127x.h"
@@ -1242,7 +1243,31 @@ inline uint8_t packetSequence(uint8_t header) {
 	return header >> 4;
 }
 
+// RNode owns one receive buffer. Keep its existing single/split behavior,
+// but never carry a partial packet into a new radio configuration or epoch.
+inline void resetPartialPacket() {
+  #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+    seq = SEQ_UNSET;
+    read_len = 0;
+  #endif
+}
+
+inline void rememberPartialPacket() {
+  #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+    split_rx_started_at = millis();
+    split_rx_timeout_ms = handheld::radio_timing::splitReceiveTimeoutMs(LoRa->getAirtime(SINGLE_MTU));
+  #endif
+}
+
+inline void expirePartialPacket() {
+  #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+    if (seq != SEQ_UNSET && uint32_t(millis() - split_rx_started_at) > split_rx_timeout_ms)
+      resetPartialPacket();
+  #endif
+}
+
 void setPreamble() {
+	resetPartialPacket();
 	if (radio_online) LoRa->setPreambleLength(lora_preamble_symbols);
 	kiss_indicate_phy_stats();
 }
@@ -1282,16 +1307,19 @@ void updateBitrate() {
 }
 
 void setSpreadingFactor() {
+	resetPartialPacket();
 	if (radio_online) LoRa->setSpreadingFactor(lora_sf);
 	updateBitrate();
 }
 
 void setCodingRate() {
+	resetPartialPacket();
 	if (radio_online) LoRa->setCodingRate4(lora_cr);
 	updateBitrate();
 }
 
 void set_implicit_length(uint8_t len) {
+	resetPartialPacket();
 	implicit_l = len;
 	if (implicit_l != 0) {
 		implicit = true;
@@ -1437,6 +1465,7 @@ void getBandwidth() {
 }
 
 void setBandwidth() {
+	resetPartialPacket();
 	if (radio_online) {
 		LoRa->setSignalBandwidth(lora_bw);
 		getBandwidth();
@@ -1450,6 +1479,7 @@ void getFrequency() {
 }
 
 void setFrequency() {
+	resetPartialPacket();
 	if (radio_online) {
 		LoRa->setFrequency(lora_freq);
 		getFrequency();
@@ -1459,10 +1489,12 @@ void setFrequency() {
 uint8_t getRandom() { return random(0xFF); }
 
 void promisc_enable() {
+	resetPartialPacket();
 	promisc = true;
 }
 
 void promisc_disable() {
+	resetPartialPacket();
 	promisc = false;
 }
 

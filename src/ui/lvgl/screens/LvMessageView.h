@@ -5,7 +5,8 @@
 #include "reticulum/LXMFMessage.h"
 #include <functional>
 #include <string>
-#include <vector>
+#include <array>
+#include "history/HistoryWindow.h"
 
 
 class LvMessageView : public LvScreen {
@@ -21,8 +22,7 @@ public:
     bool handleKey(const KeyEvent& event) override;
     bool handleLongPress() override;
 
-    void setPeerHex(const std::string& hex) { _peerHex = hex; }
-    void setLXMFManager(handheld::MessageViewModel* lxmf) { _lxmf = lxmf; }
+    void setPeerHex(const std::string& hex);
     void setBackend(handheld::ProtocolView* backend) { _backend = backend; }
     void setAnnounceManager(handheld::NodeView* am) { _am = am; }
     void setUIManager(class UIManager* ui) { _ui = ui; }
@@ -34,43 +34,63 @@ private:
     handheld::ServiceClient* _service = nullptr;
     void sendCurrentMessage(bool viaLink = false);
     void rebuildMessages();
-    void appendMessage(const LXMFMessage& msg, bool deferLayout = false);
-    std::string getPeerName();
+    using HistoryWindow = handheld::history::HistoryWindow;
+    using Span = HistoryWindow::Span;
+    void appendMessage(size_t index, const Span& span, const char* text);
+    void clearMessages();
+    bool windowMatches() const;
+    bool boundWindow() const;
+    void historyAction(unsigned action);
+    void readFull(size_t index);
+    void goBack();
+    void scrollHistory(int pixels);
+    void focusNextRead();
+    void updateHistoryControls();
+    void updateHistoryFocus();
+    void saveScroll(bool userChange = false);
     void updateHeader();
     void markVisibleConversationRead();
     void updateComposerState();
     void refreshComposerPlaceholder();
     void updateComposerText();
+    void composerEdited();
     void showSendModeMenu();
     void hideSendModeMenu();
     void updateSendModeMenu();
     void chooseSendMode(int idx);
 
-    handheld::MessageViewModel* _lxmf = nullptr;
     handheld::ProtocolView* _backend = nullptr;
     handheld::NodeView* _am = nullptr;
     class UIManager* _ui = nullptr;
     BackCallback _onBack;
     std::string _peerHex;
     std::string _inputText;
-    int _lastMsgCount = -1;
-    int _knownTotalCount = -1;
-    unsigned long _lastRefreshMs = 0;
-    std::vector<LXMFMessage> _cachedMsgs;
     bool _markReadPending = false;
+    bool _readInFlight = false, _readRetry = false;
+    uint32_t _readRequest = 0, _readRetryStarted = 0, _readThrough = 0;
+    bool _nameInFlight = false, _nameResolved = false;
+    uint32_t _nameNodeRevision = 0, _nameIdentity = 0;
     bool _sendPending = false;
     std::string _retainedDraftPeer, _retainedDraft;
+    uint64_t _nextDraftRevision = 1, _draftRevision = 1, _retainedDraftRevision = 0;
+    uint32_t _retainedDraftIdentity = 0;
     uint32_t _lastHistoryRevision = 0;
-    handheld::HistoryState _shownHistoryState = handheld::HistoryState::Closed;
+    uint32_t _lastStatusRevision = 0, _boundIdentity = 0;
+    HistoryWindow::Mode _boundMode = HistoryWindow::Mode::Closed;
+    bool _entered = false, _binding = false, _atBottom = true, _scrollToEnd = true;
+    uint8_t _rowCount = 0;
 
-    void updateMessageStatus(int msgIdx, LXMFStatus status);
-    static void applyStatusGlyph(lv_obj_t* lbl, LXMFStatus status);
+    void updateMessageStatus(size_t index, const Span& span);
+    static void applyStatusGlyph(lv_obj_t* label, const Span& span);
 
     // LVGL widgets
     lv_obj_t* _header = nullptr;
     lv_obj_t* _lblHeader = nullptr;
     lv_obj_t* _lblHeaderMeta = nullptr;
     lv_obj_t* _msgScroll = nullptr;
+    lv_obj_t* _historyBar = nullptr;
+    lv_obj_t* _historyStateLabel = nullptr;
+    std::array<lv_obj_t*, 4> _historyButtons{}, _historyLabels{};
     lv_obj_t* _inputRow = nullptr;
     lv_obj_t* _textarea = nullptr;
     lv_obj_t* _btnSend = nullptr;
@@ -80,12 +100,8 @@ private:
     int _sendMenuIdx = 0;
     bool _suppressNextSendClick = false;
 
-    // Per-message status labels for partial updates (avoids full rebuild)
-    std::vector<lv_obj_t*> _statusLabels;
-    std::vector<lv_obj_t*> _textLabels;
-    std::vector<lv_obj_t*> _bubbleBoxes;
+    // Every label points into the client's leased publication, never a body copy.
+    std::array<lv_obj_t*, HistoryWindow::VisibleSpans> _statusLabels{}, _textLabels{}, _bubbleBoxes{}, _readButtons{};
 
-    static constexpr unsigned long REFRESH_INTERVAL_MS = 2000;  // Check for new messages every 2s
-    static constexpr size_t CHAT_VIEW_MAX_MESSAGES = 40;
     static constexpr size_t MAX_COMPOSER_CHARS = 120;
 };

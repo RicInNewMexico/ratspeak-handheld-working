@@ -24,6 +24,7 @@ public:
     String getAPSSID() const { return _apSSID; }
     int getClientCount() const { return _clients.size(); }
     bool isAPActive() const { return _apActive; }
+    uint32_t generation() const { return _generation; }
 
     // STA config (optional)
     void setSTACredentials(const char* ssid, const char* password);
@@ -38,6 +39,7 @@ public:
     static std::vector<ScanResult> scanNetworks(int maxResults = 15);
     static void startAsyncScan();
     static bool isScanComplete();
+    // Reads at most15 strongest unique rows; caller retires SDK results with scanDelete.
     static std::vector<ScanResult> getScanResults(int maxResults = 15);
 
     // Raw-frame seam for the backend pump (TCPClientInterface precedent):
@@ -48,7 +50,7 @@ public:
     bool sendRaw(const uint8_t* data, size_t len) { return sendToClients(data, len); }
 
 private:
-    void startAP();
+    bool startAP();
     void acceptClients();
     void readClients();
     bool sendToClients(const uint8_t* data, size_t len);
@@ -65,6 +67,7 @@ private:
     RawSink _rawSink;
     std::string _name;
     bool _online = false;
+    uint32_t _generation = 0;
 
     String _apSSID;
     String _apPassword;

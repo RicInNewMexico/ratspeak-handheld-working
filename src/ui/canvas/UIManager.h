@@ -9,7 +9,7 @@
 
 class UIManager {
 public:
-    void begin();
+    bool begin();
     void render();
 
     // Screen management

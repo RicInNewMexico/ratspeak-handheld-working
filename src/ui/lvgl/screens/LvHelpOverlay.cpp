@@ -67,22 +67,31 @@ void LvHelpOverlay::create() {
 
 #if HAS_SCROLLWHEEL
     addHelpRow(_overlay, "Encoder", "Move selection");
+    addHelpRow(_overlay, "Click/Enter", "Open or confirm");
+    addHelpRow(_overlay, "Backspace", "Back; then select a tab");
+    addHelpRow(_overlay, "Alt+Back", "Cancel editing (Esc)");
+    addHelpRow(_overlay, "Alt+Q..P", "Type numbers 1..0");
+    addHelpRow(_overlay, "A / D", "Select frequency digit");
+    addHelpRow(_overlay, "Encoder", "Tune selected digit");
+    addHelpRow(_overlay, "BOOT", "Tap sleep; hold power off");
 #else
     addHelpRow(_overlay, "Trackball", "Move selection");
-#endif
-    addHelpRow(_overlay, "Enter", "Open or confirm");
+    addHelpRow(_overlay, "Click/Enter", "Open or confirm");
     addHelpRow(_overlay, ",  /", "Previous or next tab");
-    addHelpRow(_overlay, "Esc", "Back");
-    addHelpRow(_overlay, "Ctrl+M", "Messages");
-    addHelpRow(_overlay, "Ctrl+N", "New message");
-    addHelpRow(_overlay, "Ctrl+S", "Settings");
-    addHelpRow(_overlay, "Ctrl+A", "Announce");
-    addHelpRow(_overlay, "Ctrl+D/I/T/R", "Diagnostics tools");
-#if HAS_SCROLLWHEEL
-    addHelpRow(_overlay, "BOOT", "Tap sleep; hold power off");
+    addHelpRow(_overlay, "Backspace", "Delete text; back if empty");
+    addHelpRow(_overlay, "Hold click", "Cancel settings / name edit");
+    addHelpRow(_overlay, "Cancel / <", "Tap to cancel or go back");
+    addHelpRow(_overlay, "Peers", "Pick a contact to message");
+    addHelpRow(_overlay, "Home", "Announce button");
+    addHelpRow(_overlay, "USB serial ?", "Diagnostics command help");
 #endif
 
-    lv_obj_t* footer = makeLabel(_overlay, "Any key or tap closes",
+    lv_obj_t* footer = makeLabel(_overlay,
+#if HAS_SCROLLWHEEL
+                                 "Any key closes",
+#else
+                                 "Any key or tap closes",
+#endif
                                  &lv_font_rsdeck_10, Theme::TEXT_MUTED,
                                  260, LV_TEXT_ALIGN_CENTER);
     lv_obj_set_style_pad_top(footer, 2, 0);

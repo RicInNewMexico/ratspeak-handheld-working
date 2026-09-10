@@ -77,7 +77,7 @@ void LvDataCleanScreen::createUI(lv_obj_t* parent) {
     lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 58);
 
     lv_obj_t* prompt = makeLabel(parent,
-        "Keeping data is safest. Erase only for a clean setup.",
+        "Erase affects SD copies only. Imported device data is kept.",
         &lv_font_rsdeck_12, Theme::TEXT_SECONDARY, 276, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(prompt, LV_ALIGN_TOP_MID, 0, 82);
 
@@ -133,7 +133,8 @@ void LvDataCleanScreen::createUI(lv_obj_t* parent) {
     char verBuf[32];
     snprintf(verBuf, sizeof(verBuf), "v%s", RSDECK_VERSION_STRING);
     lv_label_set_text(ver, verBuf);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -10);
+    // Pager's shorter boot surface needs this footer below the action hint.
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, Theme::SCREEN_H < 240 ? -4 : -10);
 }
 
 void LvDataCleanScreen::updateSelection() {

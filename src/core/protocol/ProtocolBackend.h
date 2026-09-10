@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "reticulum/LXMFManager.h"
+#include "protocol/OutgoingContract.h"
 
 class ProtocolBackend {
 public:
@@ -34,15 +35,30 @@ public:
     virtual size_t linkCount() const = 0;
 
     // Announce: neutral byte buffer; the adapter owns wire-type conversion.
-    // Empty buffer (nullptr/0) means "use the backend's default app data".
+    // Empty buffer (nullptr/0) explicitly announces empty wire app data; it does
+    // not clear the separately seeded name/capability cache for path responses.
     virtual AnnounceResult announce(const uint8_t* appData, size_t len) = 0;
     virtual unsigned long lastAnnounceTime() const = 0;
     virtual uint32_t announceFilterCount() const = 0;
 
-    // LXMF send/queue surface. dest is the 16-byte lxmf.delivery hash.
-    virtual bool lxmfSendMessage(const uint8_t dest[16], const char* content,
-                                 const char* title, bool preferLink) = 0;
-    virtual void lxmfDropPeer(const std::string& peerHex) = 0;
+    // Admission copies spans and reserves a terminal persistence result. Only a
+    // Ready/Committed result means saved; each accepted ticket must be acknowledged.
+    virtual handheld::outgoing::Submission lxmfSubmit(const uint8_t dest[16],
+        const uint8_t* title, size_t titleLength, const uint8_t* content,
+        size_t contentLength, bool preferLink = false) = 0;
+    virtual handheld::outgoing::Poll lxmfPoll(handheld::outgoing::Ticket,
+        handheld::outgoing::InitialResult&) const = 0;
+    virtual bool lxmfAcknowledge(handheld::outgoing::Ticket) = 0;
+    virtual bool lxmfCancel(handheld::outgoing::Ticket) = 0;
+    virtual bool lxmfStatus(const handheld::storage::RecordKey&,
+        handheld::outgoing::StatusView&) const = 0;
+    virtual uint32_t lxmfStatusRevision() const = 0;
+    virtual void lxmfStopAdmissions() = 0;
+    virtual bool lxmfDrained() const = 0;
+    virtual handheld::storage::Error lxmfDrainError() const = 0;
+    virtual bool lxmfBeginPeerDelete(const uint8_t peer[16]) = 0;
+    virtual void lxmfFinishPeerDelete(const uint8_t peer[16],
+        const handheld::storage::Result&) = 0;
     virtual int lxmfQueuedCount() const = 0;
     virtual void setMessageCallback(LXMFManager::MessageCallback cb) = 0;
     virtual void setStatusCallback(LXMFManager::StatusCallback cb) = 0;

@@ -190,11 +190,18 @@ private:
         // Location requires active fix (status='A')
         if (fields[2][0] != 'A') {
             _data.locationValid = false;
+            _data.locationUpdated = true;
             return true;
         }
 
         // Position — only parse if location tracking is enabled
         if (_parseLocation) {
+            // Publish a complete position or invalidate the previous one. A
+            // time-only RMC must never refresh stale or partial coordinates.
+            _data.locationValid = false;
+            _data.locationUpdated = true;
+            if (!fields[3][0] || !fields[4][0] || !fields[5][0] || !fields[6][0])
+                return true;
             // Latitude: DDMM.MMMM,N/S
             if (strlen(fields[3]) > 0 && strlen(fields[4]) > 0) {
                 _data.latitude = parseCoord(fields[3]);

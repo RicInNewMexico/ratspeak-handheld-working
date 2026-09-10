@@ -1,11 +1,25 @@
 #include "TextInput.h"
+#include <new>
 
-void TextInput::setText(const std::string& text) {
+bool TextInput::reserveTextCapacity(size_t capacity) {
+    if (_text.size() > capacity) return false;
+    try { if (_text.capacity() < capacity) _text.reserve(capacity); }
+    catch (const std::bad_alloc&) { return false; }
+    _capacityLimit = capacity;
+    return true;
+}
+
+bool TextInput::setText(const std::string& text) {
+    if (_capacityLimit && text.size() > _capacityLimit) return false;
+    const bool changed = _text != text;
     _text = text;
+    if (changed && _revision != UINT64_MAX) ++_revision;
     _cursorPos = _text.length();
+    return true;
 }
 
 void TextInput::clear() {
+    if (!_text.empty() && _revision != UINT64_MAX) ++_revision;
     _text.clear();
     _cursorPos = 0;
     _numericOnly = false;
@@ -36,6 +50,7 @@ bool TextInput::handleKey(const KeyEvent& event) {
     if (event.backspace) {
         if (_cursorPos > 0 && !_text.empty()) {
             _text.erase(_cursorPos - 1, 1);
+            if (_revision != UINT64_MAX) ++_revision;
             _cursorPos--;
         }
         return true;
@@ -45,6 +60,7 @@ bool TextInput::handleKey(const KeyEvent& event) {
     if (event.forwardDelete) {
         if (_cursorPos < (int)_text.length()) {
             _text.erase(_cursorPos, 1);
+            if (_revision != UINT64_MAX) ++_revision;
         }
         return true;
     }
@@ -54,8 +70,9 @@ bool TextInput::handleKey(const KeyEvent& event) {
         if (_numericOnly && (event.character < '0' || event.character > '9')) {
             return true;  // Reject non-digit input
         }
-        if ((int)_text.length() < _maxLength) {
+        if ((int)_text.length() < _maxLength && (!_capacityLimit || _text.size() < _capacityLimit)) {
             _text.insert(_text.begin() + _cursorPos, event.character);
+            if (_revision != UINT64_MAX) ++_revision;
             _cursorPos++;
         }
         return true;
@@ -63,8 +80,9 @@ bool TextInput::handleKey(const KeyEvent& event) {
 
     // Space (fallback if character wasn't set but space flag is)
     if (event.space && event.character < 32) {
-        if ((int)_text.length() < _maxLength) {
+        if ((int)_text.length() < _maxLength && (!_capacityLimit || _text.size() < _capacityLimit)) {
             _text.insert(_text.begin() + _cursorPos, ' ');
+            if (_revision != UINT64_MAX) ++_revision;
             _cursorPos++;
         }
         return true;

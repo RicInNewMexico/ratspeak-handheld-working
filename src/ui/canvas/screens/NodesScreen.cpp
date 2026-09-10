@@ -280,6 +280,7 @@ void NodesScreen::render(M5Canvas& canvas) {
 }
 
 bool NodesScreen::handleKey(const KeyEvent& event) {
+    if (event.repeat && (event.backspace || event.forwardDelete)) return true;
     if (_showingActions) {
         // ESC or Delete exits action menu
         if (event.escape || event.backspace) {

@@ -10,10 +10,7 @@
 #define BOARD_CONFIRM_INPUT_NAME "trackball"
 #define BOARD_DEFAULT_BRIGHTNESS 100
 
-#define RSDECK_VERSION_MAJOR  2
-#define RSDECK_VERSION_MINOR  1
-#define RSDECK_VERSION_PATCH  0
-#define RSDECK_VERSION_STRING "2.1.0"
+#include "config/FirmwareVersion.h"
 #define BOARD_RELEASE_REPO    "ratspeak/ratspeak-handheld"
 #define HAS_CONTACT_RENAME    true
 

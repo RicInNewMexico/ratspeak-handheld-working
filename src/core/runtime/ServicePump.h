@@ -26,8 +26,8 @@ public:
                 Result stale;
                 stale.outcome = Outcome::Stale;
                 _mailbox.complete(slot, stale);
-                // A rejected stale lifecycle must not leave the owner closed.
-                if (slot == ServiceMailbox::NormalSlots) _mailbox.setAccepting(true);
+                // Only the lifecycle owner can decide whether admission may
+                // reopen. A stale result must not undo a failed barrier.
             } else {
                 _handler.execute(slot);
             }

@@ -1,4 +1,5 @@
 #include "ScrollList.h"
+#include "util/DisplayText.h"
 
 static const std::string EMPTY_ITEM;
 
@@ -11,6 +12,7 @@ void drawFitted(M5Canvas& canvas, const std::string& text, int x, int y, int max
 
     char buf[96];
     int copyLen = std::min((int)text.length(), (int)sizeof(buf) - 3);
+    while (copyLen > 0 && copyLen < int(text.size()) && handheld::display::continuation(uint8_t(text[copyLen]))) --copyLen;
     while (copyLen > 0) {
         memcpy(buf, text.c_str(), copyLen);
         buf[copyLen] = '.';
@@ -20,7 +22,8 @@ void drawFitted(M5Canvas& canvas, const std::string& text, int x, int y, int max
             canvas.drawString(buf, x, y);
             return;
         }
-        copyLen--;
+        --copyLen;
+        while (copyLen > 0 && handheld::display::continuation(uint8_t(text[copyLen]))) --copyLen;
     }
 }
 }
@@ -95,6 +98,17 @@ const std::string& ScrollList::getSelectedItem() const {
     return EMPTY_ITEM;
 }
 
+void ScrollList::renderRow(M5Canvas& canvas, const std::string& label, int x, int y, int width,
+                           bool selected, uint16_t color) {
+    const int rowH = Theme::LIST_ROW_H;
+    if (selected) {
+        canvas.fillRoundRect(x + 1, y, width - 2, rowH - 1, 3, Theme::BG_HOVER);
+        canvas.fillRoundRect(x + 2, y + 2, 3, rowH - 5, 1, Theme::PRIMARY);
+        canvas.setTextColor(Theme::PRIMARY); canvas.drawString(">", x + 7, y + 1);
+    } else canvas.setTextColor(color ? color : Theme::TEXT_SECONDARY);
+    drawFitted(canvas, label, x + (selected ? 16 : 9), y + 1, width - (selected ? 23 : 16));
+}
+
 void ScrollList::render(M5Canvas& canvas, int x, int y, int w, int h) {
     int rowH = Theme::LIST_ROW_H;
     _visibleRows = h / rowH;
@@ -107,24 +121,11 @@ void ScrollList::render(M5Canvas& canvas, int x, int y, int w, int h) {
         int ry = y + i * rowH;
         bool selected = (idx == _selected);
 
-        if (selected) {
-            canvas.fillRoundRect(x + 1, ry, w - 2, rowH - 1, 3, Theme::BG_HOVER);
-            canvas.fillRoundRect(x + 2, ry + 2, 3, rowH - 5, 1, Theme::PRIMARY);
-            canvas.setTextColor(Theme::PRIMARY);
-            canvas.drawString(">", x + 7, ry + 1);
-        } else {
-            uint16_t itemColor = (idx < (int)_itemColors.size() && _itemColors[idx] != 0)
-                                 ? _itemColors[idx] : Theme::TEXT_SECONDARY;
-            canvas.setTextColor(itemColor);
-        }
-
         if (!selected && (i + 1 < _visibleRows) && (idx + 1 < (int)_items.size())) {
             canvas.drawFastHLine(x + 8, ry + rowH - 1, w - 12, Theme::DIVIDER);
         }
 
-        int textX = x + (selected ? 16 : 9);
-        int textW = w - (selected ? 23 : 16);
-        drawFitted(canvas, _items[idx], textX, ry + 1, textW);
+        renderRow(canvas, _items[idx], x, ry, w, selected, idx < int(_itemColors.size()) ? _itemColors[idx] : 0);
     }
 
     if ((int)_items.size() > _visibleRows) {

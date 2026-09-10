@@ -72,8 +72,8 @@ void IRAM_ATTR Scrollwheel::isrEncoder() {
     uint8_t pinstate = (digitalRead(ROTARY_B) ? 0x02 : 0) | (digitalRead(ROTARY_A) ? 0x01 : 0);
     _qState = table[_qState & 0x0F][pinstate];
     uint8_t dir = _qState & 0x30;
-    if (dir == DIR_CCW)     _deltaY -= 1;  // A leads = up (existing sign convention)
-    else if (dir == DIR_CW) _deltaY += 1;  // B leads = down
+    if (dir == DIR_CCW && _deltaY > -127) _deltaY -= 1;  // A leads = up (existing sign convention)
+    else if (dir == DIR_CW && _deltaY < 127) _deltaY += 1;  // B leads = down
 }
 
 void IRAM_ATTR Scrollwheel::isrClick() { _clickFlag = true; }

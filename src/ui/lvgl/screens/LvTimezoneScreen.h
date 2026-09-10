@@ -18,7 +18,11 @@ public:
     // Pre-select an index (e.g., from saved config)
     void setSelectedIndex(int idx) { _selectedIdx = idx; }
 
+    void setSaving(bool saving);
+
 private:
+    bool _saving = false;
+    lv_obj_t* _saveTitle = nullptr;
     std::function<void(int)> _doneCb;
     int _selectedIdx = 6;  // Default: New York (EST/EDT)
     unsigned long _enterTime = 0;

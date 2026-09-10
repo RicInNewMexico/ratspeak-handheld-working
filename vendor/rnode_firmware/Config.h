@@ -159,6 +159,9 @@
 	uint8_t last_snr_raw	= 0x80;
 	uint8_t seq				= 0xFF;
 	uint16_t read_len		= 0;
+	#if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+		uint32_t split_rx_started_at = 0, split_rx_timeout_ms = 5000;
+	#endif
 	uint16_t host_write_len = 0;
 
 	// Incoming packet buffer
@@ -183,7 +186,11 @@
 		#define AIRTIME_BINLEN_MS (STATUS_INTERVAL_MS*DCD_SAMPLES)
 		#define AIRTIME_BINS ((AIRTIME_LONGTERM*1000)/AIRTIME_BINLEN_MS)
 		bool util_samples[DCD_SAMPLES];
-		uint16_t airtime_bins[AIRTIME_BINS];
+		#if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+			uint32_t airtime_bins[AIRTIME_BINS];
+		#else
+			uint16_t airtime_bins[AIRTIME_BINS];
+		#endif
 		float longterm_bins[AIRTIME_BINS];
 		int dcd_sample = 0;
 		float local_channel_util = 0.0;

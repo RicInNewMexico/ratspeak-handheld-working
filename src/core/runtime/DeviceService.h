@@ -2,7 +2,10 @@
 
 #if !defined(RSCARDPUTER)
 #include "ServicePump.h"
+#include "MaintenanceBarrier.h"
+#include "ScanResult.h"
 #include "config/UserConfig.h"
+#include "radio/RadioSettings.h"
 #include "protocol/ProtocolBackend.h"
 #include "reticulum/AnnounceManager.h"
 #include "reticulum/IdentityManager.h"
@@ -18,6 +21,8 @@ public:
                   IdentityManager& identities, FlashStore& flash, SDStore& sd);
     ~DeviceService(); // Runner must no longer be executing before destruction.
     bool begin(AnnounceManager* nodes);
+    // One binding attempt per service lifetime. Refusal leaves setup ownership
+    // intact and exposes only cached Failed status and explicit Restart recovery.
     void bindOwner();
     void tick();
     void poll() override;
@@ -26,18 +31,23 @@ public:
     Status& ownerStatus() { return _status; }
     void notice(const char* text);
     bool stopped() const { return _status.state == ServiceState::Stopped; }
+    bool settingsApplyPending() const { return _settingsSlot != ServiceMailbox::NoSlot || _config.settingsPending(); }
 
     // Installed once before ownership transfer; invoked only by the owner.
     std::function<void()> pollNetwork;
     std::function<void(Status&)> networkStatus;
-    std::function<void(const UserSettings&)> applyRadio;
+    // false cancels only the live continuation after maintenance closes admission.
+    std::function<RadioApply(const UserSettings&, bool)> applyRadio;
     std::function<void(const UserSettings&)> applyPeripherals;
     std::function<void()> homeReady;
     std::function<void(uint32_t)> diagnostics;
+    std::function<void()> closeAdmissions;
+    std::function<void()> pollSettlements;
+    std::function<bool()> settlementFailed;
     std::function<void()> beginQuiesce;
     std::function<bool()> quiescent;
     std::function<void()> startScan;
-    std::function<bool(String&)> finishScan;
+    std::function<ScanResult(String&)> finishScan;
 
 private:
     void refreshStatus();
@@ -45,8 +55,13 @@ private:
     void jsonResult(uint8_t slot, JsonDocument& doc, Result result = {});
     void runLifecycle(uint8_t slot);
     void history(uint8_t slot);
-    void historyChunk(uint8_t slot);
-    void closeHistory();
+    void pollHistory();
+    void finishHistory(const storage::Result&);
+    void pollSends();
+    void pollStorageWrites();
+    void pollMaintenance();
+    void pollSettings();
+    void finishSettings(uint8_t slot);
     ProtocolBackend& _backend;
     MessageStore& _messages;
     UserConfig& _config;
@@ -61,18 +76,25 @@ private:
     uint8_t* _arena = nullptr;
     char _scratch[ServiceMailbox::MaxPayload + 1] = {};
     uint32_t _lastStatus = 0, _lastStorageStatus = 0;
-    uint32_t _lastHistoryAccess = 0, _lastIdentityRetry = 0;
+    uint32_t _lastIdentityRetry = 0;
     uint32_t _nodeFingerprint = 0;
-    uint32_t _historyQuery = 0;
-    uint32_t _historyRevision = 0;
-    std::string _historyPeer;
-    MessageStore::HistoryCursor _history;
-    LXMFMessage _historyMessage;
-    uint32_t _historyMessageIndex = UINT32_MAX;
-    uint8_t _historySlot = ServiceMailbox::NoSlot;
+    // One retained storage query; normal mailbox work owns its terminal until
+    // consumed, including peer/mode changes and lifecycle settlement.
+    storage::Ticket _queryTicket;
+    uint32_t _queryRetryAt = 0;
+    uint8_t _querySlot = ServiceMailbox::NoSlot;
     uint8_t _scanSlot = ServiceMailbox::NoSlot;
+    uint8_t _settingsSlot = ServiceMailbox::NoSlot;
     uint8_t _lifecycleSlot = ServiceMailbox::NoSlot;
-    bool _quiesceStarted = false;
+    MaintenanceBarrier _maintenance;
+    bool _storageOwnerBound = false;
+    struct PendingSend {
+        outgoing::Ticket ticket;
+        bool cancelled = false;
+    };
+    PendingSend _sends[ServiceMailbox::NormalSlots];
+    storage::Ticket _storageWrites[ServiceMailbox::NormalSlots];
+    bool _outgoingPaused = false;
 };
 
 } // namespace handheld

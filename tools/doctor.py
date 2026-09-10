@@ -10,13 +10,12 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DEVICES = ("tdeck", "tpager", "cardputer")
+from release_catalog import BOARDS, ROOT
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", choices=DEVICES, default="tdeck")
+    parser.add_argument("--device", choices=BOARDS, default="tdeck")
     parser.add_argument(
         "--source",
         action="store_true",
@@ -46,7 +45,7 @@ def main() -> int:
         if result.returncode != 0:
             failures.append(f"missing Python module: {module}")
 
-    profile = "micro" if args.device == "cardputer" else "small"
+    profile = BOARDS[args.device].protocol_profile
     require_file(
         ROOT / "protocol/prebuilt/xtensa-esp32s3" / profile / "libratspeak_protocol.a",
         f"{profile} Rust firmware archive",

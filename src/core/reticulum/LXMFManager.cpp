@@ -8,40 +8,47 @@ bool LXMFManager::beginStoreOnly(MessageStore* store) {
     return true;
 }
 
-const std::vector<std::string>& LXMFManager::conversations() const {
-    if (_store) return _store->conversations();
-    static std::vector<std::string> empty;
-    return empty;
+handheld::storage::Submission LXMFManager::requestHistoryPage(const std::string& peerHex,
+        handheld::storage::HistoryEntry cursor, handheld::storage::HistoryDirection direction) {
+    return _store ? _store->requestHistoryPage(peerHex, cursor, 48, direction) : handheld::storage::Submission{};
 }
 
-std::vector<LXMFMessage> LXMFManager::getMessages(const std::string& peerHex) const {
-    if (_store) return _store->loadConversation(peerHex);
-    return {};
+handheld::storage::Submission LXMFManager::requestRecord(const handheld::storage::RecordKey& key,
+                                                       uint32_t offset, uint16_t capacity) {
+    return _store ? _store->requestRecord(key, offset, capacity) : handheld::storage::Submission{};
 }
 
-std::vector<LXMFMessage> LXMFManager::getRecentMessages(const std::string& peerHex,
-                                                        size_t maxMessages) const {
-    if (_store) return _store->loadConversationTail(peerHex, maxMessages);
-    return {};
+handheld::storage::Submission LXMFManager::requestConversationPage(handheld::storage::ConversationCursor cursor,
+        bool hasCursor, handheld::storage::ConversationOrder order,
+        handheld::storage::ConversationDirection direction, uint8_t limit) {
+    return _store ? _store->requestConversationPage(cursor, hasCursor, order, direction, limit) : handheld::storage::Submission{};
 }
 
-int LXMFManager::unreadCount(const std::string& peerHex) const {
-    if (!_store) return 0;
-    if (peerHex.empty()) return _store->totalUnreadCount();
-    const ConversationSummary* s = _store->getSummary(peerHex);
-    return s ? s->unreadCount : 0;
+handheld::storage::Submission LXMFManager::requestConversation(const handheld::storage::ConversationSelector& selector) {
+    return _store ? _store->requestConversation(selector) : handheld::storage::Submission{};
 }
 
-const ConversationSummary* LXMFManager::getConversationSummary(const std::string& peerHex) const {
-    if (!_store) return nullptr;
-    return _store->getSummary(peerHex);
+bool LXMFManager::readStoragePayload(handheld::storage::Ticket ticket, void* bytes, size_t length) const {
+    return _store && _store->readPayload(ticket, bytes, length);
 }
 
-void LXMFManager::markRead(const std::string& peerHex) {
-    if (_store) { _store->markConversationRead(peerHex); }
+int LXMFManager::unreadCount() const {
+    return _store ? _store->totalUnreadCount() : 0;
 }
 
-bool LXMFManager::deleteConversation(const std::string& peerHex) {
-    // Engine-side outbound queue/proof purge is the backend's concern.
-    return _store ? _store->deleteConversation(peerHex) : false;
+handheld::storage::Submission LXMFManager::requestMarkRead(const std::string& peerHex) {
+    return _store ? _store->requestMarkRead(peerHex) : handheld::storage::Submission{};
+}
+
+handheld::storage::Submission LXMFManager::requestDelete(const std::string& peerHex) {
+    return _store ? _store->requestDelete(peerHex) : handheld::storage::Submission{};
+}
+
+bool LXMFManager::pollStorageResult(handheld::storage::Ticket ticket,
+                                  handheld::storage::Result& result) const {
+    return _store && _store->peekResult(ticket, result);
+}
+
+bool LXMFManager::releaseStorageResult(handheld::storage::Ticket ticket) {
+    return _store && _store->releaseResult(ticket);
 }

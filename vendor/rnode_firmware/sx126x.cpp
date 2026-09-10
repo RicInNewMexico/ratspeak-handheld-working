@@ -5,6 +5,8 @@
 
 #if MODEM == SX1262
 #include "sx126x.h"
+#include "SX1262Timing.h"
+#include "RadioTimingPolicy.h"
 
 #if BOARD_MODEL == BOARD_CARDPUTER_ADV
   #include <M5Unified.h>
@@ -122,23 +124,24 @@
 #if BOARD_MODEL == BOARD_CARDPUTER_ADV
   static bool cardputer_adv_cap_rf_switch_ready = false;
 
-  static void cardputer_adv_enable_cap_rf_switch() {
-    if (cardputer_adv_cap_rf_switch_ready) { return; }
+  static bool cardputer_adv_enable_cap_rf_switch() {
+    if (cardputer_adv_cap_rf_switch_ready) { return true; }
 
     if (!m5::In_I2C.isEnabled()) {
       if (!m5::In_I2C.begin(I2C_NUM_0, CARDPUTER_ADV_I2C_SDA, CARDPUTER_ADV_I2C_SCL)) {
-        return;
+        return false;
       }
     }
 
     m5::PI4IOE5V6408_Class ioe(CARDPUTER_ADV_CAP_IOE_ADDR, 400000, &m5::In_I2C);
-    if (!ioe.begin()) { return; }
+    if (!ioe.begin()) { return false; }
 
     ioe.setDirection(CARDPUTER_ADV_CAP_RF_SW_PIN, true);
     ioe.setHighImpedance(CARDPUTER_ADV_CAP_RF_SW_PIN, false);
     ioe.digitalWrite(CARDPUTER_ADV_CAP_RF_SW_PIN, true);
     delay(5);
     cardputer_adv_cap_rf_switch_ready = true;
+    return true;
   }
 #endif
 
@@ -164,7 +167,7 @@ sx126x::sx126x() :
   _fifo_rx_addr_ptr(0),
   _packet({0}),
   _preinit_done(false),
-  #if BOARD_MODEL == BOARD_TDECK
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
     _irq_pending(false),
   #endif
   _onReceive(NULL)
@@ -185,15 +188,15 @@ bool sx126x::preInit() {
 
   // Check version (retry for up to 2 seconds)
   // TODO: Actually read version registers, not syncwords
-  long start = millis();
-  uint8_t syncmsb;
-  uint8_t synclsb;
-  while (((millis() - start) < 2000) && (millis() >= start)) {
+  const uint32_t start = millis();
+  uint8_t syncmsb = 0, synclsb = 0;
+  while (uint32_t(millis() - start) < 2000) {
       syncmsb = readRegister(REG_SYNC_WORD_MSB_6X);
       synclsb = readRegister(REG_SYNC_WORD_LSB_6X);
       if ( uint16_t(syncmsb << 8 | synclsb) == 0x1424 || uint16_t(syncmsb << 8 | synclsb) == 0x4434) {
           break;
       }
+      if (_io_failed) return false;
       delay(100);
   }
   if ( uint16_t(syncmsb << 8 | synclsb) != 0x1424 && uint16_t(syncmsb << 8 | synclsb) != 0x4434) {
@@ -213,7 +216,7 @@ void sx126x::writeRegister(uint16_t address, uint8_t value) {
 }
 
 uint8_t ISR_VECT sx126x::singleTransfer(uint8_t opcode, uint16_t address, uint8_t value) {
-  waitOnBusy();
+  if (!waitOnBusy()) return 0;
   
   uint8_t response;
   digitalWrite(_ss, LOW);
@@ -256,18 +259,30 @@ bool sx126x::loraMode() {
   return false;
 }
 
-void sx126x::waitOnBusy() {
-  unsigned long time = millis();
+bool sx126x::waitOnBusy(uint32_t capMs) {
+  if (_io_failed) return false;
+  if (_sleeping) {
+    // NSS wakes the chip; BUSY is high throughout sleep (datasheet 8.2.2).
+    digitalWrite(_ss, LOW);
+    delayMicroseconds(1000);
+    digitalWrite(_ss, HIGH);
+    _sleeping = false;
+  }
+  const uint32_t started = millis();
   if (_busy != -1) {
     while (digitalRead(_busy) == HIGH) {
-        if (millis() >= (time + 100)) { break; }
-        yield();
+      if (uint32_t(millis() - started) >= capMs) {
+        _io_failed = true;
+        return false;
+      }
+      yield();
     }
   }
+  return true;
 }
 
 void sx126x::executeOpcode(uint8_t opcode, uint8_t *buffer, uint8_t size) {
-  waitOnBusy();
+  if (!waitOnBusy()) return;
   digitalWrite(_ss, LOW);
   LORA_SPI.beginTransaction(_spiSettings);
   LORA_SPI.transfer(opcode);
@@ -277,7 +292,8 @@ void sx126x::executeOpcode(uint8_t opcode, uint8_t *buffer, uint8_t size) {
 }
 
 void sx126x::executeOpcodeRead(uint8_t opcode, uint8_t *buffer, uint8_t size) {
-  waitOnBusy();
+  memset(buffer, 0, size);
+  if (!waitOnBusy()) return;
   digitalWrite(_ss, LOW);
   LORA_SPI.beginTransaction(_spiSettings);
   LORA_SPI.transfer(opcode);
@@ -288,7 +304,7 @@ void sx126x::executeOpcodeRead(uint8_t opcode, uint8_t *buffer, uint8_t size) {
 }
 
 void sx126x::writeBuffer(const uint8_t* buffer, size_t size) {
-  waitOnBusy();
+  if (!waitOnBusy()) return;
   digitalWrite(_ss, LOW);
   LORA_SPI.beginTransaction(_spiSettings);
   LORA_SPI.transfer(OP_FIFO_WRITE_6X);
@@ -299,7 +315,8 @@ void sx126x::writeBuffer(const uint8_t* buffer, size_t size) {
 }
 
 void sx126x::readBuffer(uint8_t* buffer, size_t size) {
-  waitOnBusy();
+  memset(buffer, 0, size);
+  if (!waitOnBusy()) return;
   digitalWrite(_ss, LOW);
   LORA_SPI.beginTransaction(_spiSettings);
   LORA_SPI.transfer(OP_FIFO_READ_6X);
@@ -369,6 +386,10 @@ void sx126x::setPacketParams(long preamble_symbols, uint8_t headermode, uint8_t 
 }
 
 void sx126x::reset(void) {
+  _io_failed = _sleeping = _preinit_done = false;
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
+    _irq_pending = false;
+  #endif
   if (_reset != -1) {
     pinMode(_reset, OUTPUT);
     digitalWrite(_reset, LOW);
@@ -392,7 +413,7 @@ void sx126x::calibrate(void) {
   executeOpcode(OP_CALIBRATE_6X, &calibrate, 1);
 
   delay(5);
-  waitOnBusy();
+  waitOnBusy(500);
 }
 
 void sx126x::calibrate_image(long frequency) {
@@ -403,7 +424,7 @@ void sx126x::calibrate_image(long frequency) {
   else if (frequency >= 863E6 && frequency <= 870E6) { image_freq[0] = 0xD7; image_freq[1] = 0xDB; }
   else if (frequency >= 902E6 && frequency <= 928E6) { image_freq[0] = 0xE1; image_freq[1] = 0xE9; } // TODO: Allow higher freq calibration
   executeOpcode(OP_CALIBRATE_IMAGE_6X, image_freq, 2);
-  waitOnBusy();
+  waitOnBusy(500);
 }
 
 int sx126x::begin(long frequency) {
@@ -414,7 +435,7 @@ int sx126x::begin(long frequency) {
   if (_rxen != -1) { pinMode(_rxen, OUTPUT); }
 
   #if BOARD_MODEL == BOARD_CARDPUTER_ADV
-    cardputer_adv_enable_cap_rf_switch();
+    if (!cardputer_adv_enable_cap_rf_switch()) return false;
   #endif
 
   enableTCXO();
@@ -530,7 +551,7 @@ int sx126x::begin(long frequency) {
     }
   #endif
 
-  return 1;
+  return !_io_failed;
 }
 
 void sx126x::end() {
@@ -565,38 +586,41 @@ int sx126x::beginPacket(int implicitHeader) {
   _fifo_tx_addr_ptr = 0;
   setPacketParams(_preambleLength, _implicitHeaderMode, _payloadLength, _crcMode);
 
-  return 1;
+  return !_io_failed;
+}
+
+uint32_t sx126x::getAirtime(uint16_t physicalBytes) const {
+  return handheld::sx1262_timing::airtimeMs(physicalBytes, {
+      _sf, _bw, static_cast<uint8_t>(_cr + 4), static_cast<uint16_t>(_preambleLength),
+      _implicitHeaderMode != 0, _crcMode != 0, _ldro != 0});
 }
 
 int sx126x::endPacket() {
+  if (_io_failed) return 0;
   setPacketParams(_preambleLength, _implicitHeaderMode, _payloadLength, _crcMode);
   enableDio2RfSwitch();
-  uint8_t timeout[3] = {0}; // Put in single TX mode
+  uint8_t clear[2] = {0xFF, 0xFF};
+  executeOpcode(OP_CLEAR_IRQ_STATUS_6X, clear, 2);
+  const uint32_t airtime = getAirtime(_payloadLength);
+  if (!airtime || _io_failed) return 0;
+  // The complete physical frame may exceed twenty seconds on a valid preset.
+  // Same 1.5x + 2s allowance as Standalone, measured with wrap-safe elapsed time.
+  const uint32_t budget = handheld::radio_timing::transmitTimeoutMs(airtime);
+  const uint32_t started = millis();
+  uint8_t timeout[3] = {0};
   executeOpcode(OP_TX_6X, timeout, 3);
-
-  uint8_t buf[2];
-  buf[0] = 0x00;
-  buf[1] = 0x00;
-  executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
-
-  // Wait for TX done
-  bool timed_out = false;
-  uint32_t w_timeout = millis()+LORA_MODEM_TIMEOUT_MS;
-  while ((millis() < w_timeout) && ((buf[1] & IRQ_TX_DONE_MASK_6X) == 0)) {
-    buf[0] = 0x00;
-    buf[1] = 0x00;
-    executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
+  bool done = false;
+  while (!_io_failed) {
+    uint8_t irq[2] = {0};
+    executeOpcodeRead(OP_GET_IRQ_STATUS_6X, irq, 2);
+    done = (irq[1] & IRQ_TX_DONE_MASK_6X) != 0;
+    if (done || uint32_t(millis() - started) >= budget) break;
     yield();
   }
-
-  if (!(millis() < w_timeout)) { timed_out = true; }
-
-  // Clear IRQs
-  uint8_t mask[2];
-  mask[0] = 0x00;
-  mask[1] = IRQ_TX_DONE_MASK_6X;
-  executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
-  if (timed_out) { return 0; } else { return 1; }
+  if (!done || _io_failed) { standby(); return 0; }
+  clear[0] = 0x00; clear[1] = IRQ_TX_DONE_MASK_6X;
+  executeOpcode(OP_CLEAR_IRQ_STATUS_6X, clear, 2);
+  return !_io_failed;
 }
 
 unsigned long preamble_detected_at = 0;
@@ -694,6 +718,7 @@ size_t sx126x::write(uint8_t byte) { return write(&byte, sizeof(byte)); }
 size_t sx126x::write(const uint8_t *buffer, size_t size) {
   if ((_payloadLength + size) > MAX_PKT_LENGTH) { size = MAX_PKT_LENGTH - _payloadLength; }
   writeBuffer(buffer, size);
+  if (_io_failed) return 0;
   _payloadLength = _payloadLength + size;
   return size;
 }
@@ -701,7 +726,7 @@ size_t sx126x::write(const uint8_t *buffer, size_t size) {
 int ISR_VECT sx126x::available() {
   uint8_t buf[2] = {0};
   executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, buf, 2);
-  return buf[0] - _packetIndex;
+  return _io_failed || buf[0] <= _packetIndex ? 0 : buf[0] - _packetIndex;
 }
 
 int ISR_VECT sx126x::read(){
@@ -712,6 +737,7 @@ int ISR_VECT sx126x::read(){
     int size = rxbuf[0];
     _fifo_rx_addr_ptr = rxbuf[1];
     readBuffer(_packet, size);
+    if (_io_failed) return -1;
   }
 
   uint8_t byte = _packet[_packetIndex];
@@ -727,6 +753,7 @@ int sx126x::peek() {
       int size = rxbuf[0];
       _fifo_rx_addr_ptr = rxbuf[1];
       readBuffer(_packet, size);
+    if (_io_failed) return -1;
   }
 
   uint8_t b = _packet[_packetIndex];
@@ -802,10 +829,16 @@ void sx126x::receive(int size) {
 
 void sx126x::standby() {
   uint8_t byte = MODE_STDBY_XOSC_6X; // STDBY_XOSC
-  executeOpcode(OP_STANDBY_6X, &byte, 1); 
+  executeOpcode(OP_STANDBY_6X, &byte, 1);
+  waitOnBusy(800);
 }
 
-void sx126x::sleep() { uint8_t byte = 0x00; executeOpcode(OP_SLEEP_6X, &byte, 1); }
+void sx126x::sleep() {
+  standby();
+  uint8_t byte = 0x04; // Retain the programmed modem tuple for warm wake-up.
+  executeOpcode(OP_SLEEP_6X, &byte, 1);
+  if (!_io_failed) { _sleeping = true; delayMicroseconds(500); }
+}
 
 void sx126x::enableTCXO() {
   #if HAS_TCXO
@@ -832,6 +865,7 @@ void sx126x::enableTCXO() {
       uint8_t buf[4] = {MODE_TCXO_3_0V_6X, 0x00, 0xA0, 0x00};
     #endif
     executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
+    waitOnBusy(800);
   #endif
 }
 
@@ -913,9 +947,8 @@ long sx126x::getSignalBandwidth() {
 
 extern bool lora_low_datarate;
 void sx126x::handleLowDataRate() {
-  if ( long( (1<<_sf) / (getSignalBandwidth()/1000)) > 16)
-         { _ldro = 0x01; lora_low_datarate = true;  }
-    else { _ldro = 0x00; lora_low_datarate = false; }
+  _ldro = handheld::sx1262_timing::lowDataRateOptimize(_sf, _bw);
+  lora_low_datarate = _ldro != 0;
 }
 
 // TODO: Check if there's anything the sx1262 can do here
@@ -993,7 +1026,7 @@ void ISR_VECT sx126x::handleDio0Rise() {
   executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
   executeOpcode(OP_CLEAR_IRQ_STATUS_6X, buf, 2);
 
-  if ((buf[1] & IRQ_PAYLOAD_CRC_ERROR_MASK_6X) == 0) {
+  if ((buf[1] & IRQ_RX_DONE_MASK_6X) && (buf[1] & IRQ_PAYLOAD_CRC_ERROR_MASK_6X) == 0) {
     _packetIndex = 0;
     uint8_t rxbuf[2] = {0}; // Read packet length
     executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, rxbuf, 2);
@@ -1001,7 +1034,7 @@ void ISR_VECT sx126x::handleDio0Rise() {
     #if BOARD_MODEL == BOARD_TDECK && RNODE_TDECK_DIAG
       Serial.printf("[RNODE] sx1262 irq=0x%02X%02X len=%d\r\n", buf[0], buf[1], packetLength);
     #endif
-    if (_onReceive) { _onReceive(packetLength); }
+    if (!_io_failed && packetLength && _onReceive) { _onReceive(packetLength); }
   } else {
     #if BOARD_MODEL == BOARD_TDECK && RNODE_TDECK_DIAG
       Serial.printf("[RNODE] sx1262 irq=0x%02X%02X crc_error\r\n", buf[0], buf[1]);
@@ -1009,7 +1042,7 @@ void ISR_VECT sx126x::handleDio0Rise() {
   }
 }
 
-#if BOARD_MODEL == BOARD_TDECK
+#if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
 void sx126x::serviceInterrupt() {
   bool pending = false;
   noInterrupts();

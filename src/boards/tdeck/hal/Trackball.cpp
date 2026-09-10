@@ -51,8 +51,8 @@ void Trackball::update() {
     _hadMovement = (dx != 0 || dy != 0);
 }
 
-void IRAM_ATTR Trackball::isrUp()    { _deltaY--; }
-void IRAM_ATTR Trackball::isrDown()  { _deltaY++; }
-void IRAM_ATTR Trackball::isrLeft()  { _deltaX--; }
-void IRAM_ATTR Trackball::isrRight() { _deltaX++; }
+void IRAM_ATTR Trackball::isrUp()    { if (_deltaY > -127) _deltaY--; }
+void IRAM_ATTR Trackball::isrDown()  { if (_deltaY < 127) _deltaY++; }
+void IRAM_ATTR Trackball::isrLeft()  { if (_deltaX > -127) _deltaX--; }
+void IRAM_ATTR Trackball::isrRight() { if (_deltaX < 127) _deltaX++; }
 void IRAM_ATTR Trackball::isrClick() { _clickFlag = true; }

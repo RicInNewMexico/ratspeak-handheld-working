@@ -14,7 +14,11 @@ public:
 
     static constexpr int MAX_NAME_LEN = 16;
 
+    void setSaveStatus(const char* status, bool pending) { _saveStatus = status; _savePending = pending; }
+
 private:
+    const char* _saveStatus = nullptr;
+    bool _savePending = false;
     char _name[MAX_NAME_LEN + 1] = {0};
     int _nameLen = 0;
     std::function<void(const String&)> _doneCb;

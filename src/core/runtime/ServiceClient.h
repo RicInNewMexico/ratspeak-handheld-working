@@ -2,21 +2,24 @@
 
 #if !defined(RSCARDPUTER)
 #include "ServiceMailbox.h"
+#include "history/HistoryWindow.h"
+#include "history/ConversationWindow.h"
 #include "config/UserConfig.h"
 #include "reticulum/AnnounceManager.h"
 #include "reticulum/IdentityManager.h"
-#include "reticulum/LXMFManager.h"
+#include "reticulum/LXMFMessage.h"
 #include <array>
-#include <map>
+#include <functional>
 
 namespace handheld {
 class ServiceClient;
-enum class HistoryState : uint8_t { Closed, Loading, Ready, Retrying };
 
 class NodeView {
 public:
     explicit NodeView(ServiceClient& client) : _client(client) {}
     const std::vector<DiscoveredNode>& nodes() const { return _nodes; }
+    // Revision of the fully copied list, which may lag the backend Status.
+    uint32_t revision() const { return _revision; }
     int nodeCount() const { return _nodes.size(); }
     int nodesOnlineSince(unsigned long age) const;
     const DiscoveredNode* findNodeByHex(const std::string& hex) const;
@@ -30,28 +33,7 @@ private:
     friend class ServiceClient;
     ServiceClient& _client;
     std::vector<DiscoveredNode> _nodes;
-    std::map<std::string, std::string> _cachedNames;
-};
-
-class MessageViewModel {
-public:
-    explicit MessageViewModel(ServiceClient& client) : _client(client) {}
-    const std::vector<std::string>& conversations() const { return _conversations; }
-    const ConversationSummary* getConversationSummary(const std::string& peer) const;
-    std::vector<LXMFMessage> getRecentMessages(const std::string& peer, size_t max);
-    int unreadCount(const std::string& peer = "") const;
-    int queuedCount() const;
-    uint32_t storeRevision() const { return _revision; }
-    uint32_t historyRevision() const { return _historyRevision; }
-    bool markRead(const std::string& peer);
-    bool deleteConversation(const std::string& peer);
-private:
-    friend class ServiceClient;
-    ServiceClient& _client;
-    std::vector<std::string> _conversations;
-    std::map<std::string, ConversationSummary> _summaries;
     uint32_t _revision = 0;
-    uint32_t _historyRevision = 0;
 };
 
 // Read-only UI view of the protocol. There is deliberately no loop, storage,
@@ -78,22 +60,33 @@ class ServiceClient {
     Status _status;
 public:
     using Completion = std::function<void(const Result&)>;
+    // Text is a copied mailbox value valid only during the callback. Renderers
+    // copy names into their widget owner; no conversation-name map is retained.
+    using TextCompletion = std::function<void(const Result&, const char*)>;
     explicit ServiceClient(ServiceMailbox& mailbox)
-        : nodes(*this), messages(*this), protocol(_status), _mailbox(mailbox) {}
-    void initialize(const UserConfig& source) { config = source; _committed = source; _mailbox.readStatus(_status); }
+        : nodes(*this), protocol(_status), _mailbox(mailbox) {}
+    bool initialize(const UserConfig& source);
     void poll();
     const Status& status() const { return _status; }
     uint32_t action(Operation op, const std::string& peer = "", const std::string& body = "",
                     uint32_t argument = 0, Completion completion = {});
+    uint32_t requestPeerName(const std::string& peer, TextCompletion completion);
+    // Pending Send only. Completion is still consumed; navigation does not cancel.
+    bool cancelSend(uint32_t requestId) { return _mailbox.cancelSend(requestId); }
     bool applySettings(Completion completion = {}, bool applyRadio = true);
     bool available() const { return _mailbox.accepting(); }
-    bool settingsPending() const { return _settingsPending; }
+    bool settingsPending() const { return _settingsPending || _settingsQuery || _settingsRefresh; }
     void watchHistory(const std::string& peer);
     void closeHistory();
-    bool historyLoading() const { return _historyPending || _historyLoading; }
-    HistoryState historyState() const { return _historyState; }
-    const std::vector<LXMFMessage>& history() const { return _history; }
-    const std::string& historyPeer() const { return _historyPeer; }
+    void watchConversations();
+    void closeConversations();
+    history::ConversationWindow<64>& conversationWindow() { return _conversationWindow; }
+    const history::ConversationWindow<64>& conversationWindow() const { return _conversationWindow; }
+    history::HistoryWindow& historyWindow() { return _history; }
+    const history::HistoryWindow& historyWindow() const { return _history; }
+    bool historyStatusReady() const { return _history.statusReady(); }
+    uint32_t historyStatusRevision() const { return _history.statusRevision(); }
+    bool historyFreshnessAvailable() const { return _history.freshnessAvailable(); }
     const std::vector<IdentitySlot>& identities() const { return _identities; }
     int activeIdentity() const;
     uint32_t identityRevision() const { return _identityRevision; }
@@ -107,18 +100,21 @@ public:
     std::function<void(const char*)> onNotice;
     std::function<void()> onConfigApplied;
     NodeView nodes;
-    MessageViewModel messages;
     ProtocolView protocol;
     UserConfig config;
 
 private:
     using ValueCompletion = std::function<void(const Result&, const char*)>;
     uint32_t submit(Request request, const std::string& body, size_t capacity, ValueCompletion callback);
+    uint32_t submit(Request request, const void* body, size_t length, size_t capacity, ValueCompletion callback);
+    template<class Window> void submitReadQuery(Window&, uint32_t nonce, bool status,
+        Request, const void* body, size_t length, size_t capacity);
     void requestNodes();
-    void requestConversations();
     void requestHistory();
+    void requestConversationWindow();
     void requestIdentities();
     void requestSettings();
+    bool publishSettings(const char* bytes, size_t length);
     void tell(const char* text) { if (onNotice && text && *text) onNotice(text); }
     ServiceMailbox& _mailbox;
     struct Callback { uint32_t id = 0; ValueCompletion callback; };
@@ -126,26 +122,19 @@ private:
     char _scratch[ServiceMailbox::MaxPayload + 1] = {};
     UserConfig _committed;
     bool _settingsPending = false, _settingsQuery = false;
+    bool _configReady = false, _settingsRefresh = false;
+    uint32_t _lastSettingsQuery = 0;
     uint32_t _configRevision = 1;
     uint32_t _noticeRevision = 0, _incomingRevision = 0;
     bool _unhealthy = false;
-    uint32_t _nodeRevision = 0, _nodeCursorRevision = 0, _nodeOffset = 0;
+    uint32_t _nodeCursorRevision = 0, _nodeOffset = 0;
     bool _nodesPending = false;
     std::vector<DiscoveredNode> _nodeStaging;
-    uint32_t _convOffset = 0, _convCursorRevision = 0;
-    bool _conversationsPending = false, _conversationsLoaded = false;
-    std::vector<std::string> _convStaging;
-    std::map<std::string, ConversationSummary> _summaryStaging;
     uint32_t _identityRevision = 0;
     bool _identitiesPending = false;
     std::vector<IdentitySlot> _identities;
-    std::string _historyPeer;
-    std::vector<LXMFMessage> _history, _historyStaging;
-    uint32_t _historyRetryAt = 0;
-    uint32_t _historyQuery = 1, _historyIndex = 0, _bodyOffset = 0, _historyStoreRevision = 0;
-    bool _historyPending = false, _historyLoading = false;
-    HistoryState _historyState = HistoryState::Closed;
-    LXMFMessage _currentMessage;
+    history::HistoryWindow _history;
+    history::ConversationWindow<64> _conversationWindow;
     String _scanJson;
 };
 

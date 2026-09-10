@@ -4,40 +4,14 @@
 #include <Wire.h>
 #include "config/BoardConfig.h"
 
-// Input modes
-enum class InputMode {
-    Navigation,  // Arrow-like movement, hotkeys active
-    TextInput    // Character entry, Esc exits to Navigation
-};
-
-// Simplified key event for consumers
-struct KeyEvent {
-    char character;
-    bool ctrl;
-    bool shift;
-    bool fn;
-    bool alt;
-    bool opt;
-    bool enter;
-    bool del;
-    bool tab;
-    bool space;
-    // Directional arrows (from encoder/LVGL navigation)
-    bool up;
-    bool down;
-    bool left;
-    bool right;
-    // True when this event came from the T-Pager scroll wheel/click.
-    bool encoder;
-    // Synthesized auto-repeat while a key is held (backspace only).
-    // Handlers using backspace as back/dismiss navigation must ignore these.
-    bool repeat;
-};
+#include "input/KeyEvent.h"
 
 class Keyboard {
 public:
     bool begin();
     void update();
+    // Consume the wake burst and cancel synthesis until a fresh press.
+    void discardPending();
 
     // Mode control
     InputMode getMode() const { return _mode; }

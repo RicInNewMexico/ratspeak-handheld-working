@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <functional>
 #include "ratspeak_protocol.h"
+#include "protocol/OutgoingContract.h"
+#include "transport/TxLease.h"
+#include "runtime/ResourceBudget.h"
 
 class RustClock;
 class RustInterfacePump;
@@ -22,16 +25,16 @@ public:
         RustInterfacePump* pump = nullptr;
         RustLxmfEngine* lxmf = nullptr;
     };
-    // Called with (peerDest16, delivered) when an outbound resource resolves: true on a valid
+    // Called with the exact outgoing ticket when a resource resolves: true on a valid
     // delivery proof, false on cancellation/timeout — LXMF flips DELIVERED / FAILED.
-    using OutcomeCb = std::function<void(const uint8_t*, bool)>;
+    using OutcomeCb = std::function<void(handheld::outgoing::Ticket, bool)>;
 
     void begin(const Deps& deps) { _d = deps; }
     void setOutcomeCallback(OutcomeCb cb) { _outcome = cb; }
 
     // SENDER: start an outbound resource of `data` over the ACTIVE link (peerDest/linkId/key).
     // Returns false if a resource is already in flight or the ADV could not be built.
-    bool startSend(const uint8_t peerDest[16], const uint8_t linkId[16], const uint8_t key[64],
+    bool startSend(handheld::outgoing::Ticket ticket, const uint8_t peerDest[16], const uint8_t linkId[16], const uint8_t key[64],
                    uint8_t ifaceId, const uint8_t* data, size_t len);
     bool sending() const { return _out.active; }
     bool receiving() const { return _in.active; }
@@ -41,11 +44,22 @@ public:
     void onLinkFrame(const uint8_t peerDest[16], const uint8_t linkId[16], const uint8_t key[64],
                      uint8_t ifaceId, const rs_handheld_local_frame_t& f);
     void dropPeer(const uint8_t peerDest[16]);
+    void cancelSend(handheld::outgoing::Ticket);
     void loop();
     void endAll();
 
 private:
+    friend class RustLxmfEngine;
+    // One service-owned synchronous staging buffer. Outgoing encoding is copied
+    // into a packet or Rust Resource before a driver/callback can run. Incoming
+    // assembly is copied into storage before application notifications. Neither
+    // consumer retains a borrow across a poll or callback boundary.
+    uint8_t _codec[RS_HANDHELD_RESOURCE_DATA_MAX + 16] = {};
+    static_assert(sizeof(_codec) <= handheld::ResourceBudget::DirectCodecScratch,
+                  "Review shared codec staging budget");
     struct Out {
+        uint64_t linkBinding = 0;
+        handheld::outgoing::Ticket ticket;
         bool active = false;
         uint8_t peerDest[16] = {};
         uint8_t linkId[16] = {};
@@ -77,32 +91,24 @@ private:
         unsigned long startMs = 0;
         uint8_t reqRetriesLeft = 0;     // bounded part re-requests (Resource.py:613-628 MAX_RETRIES)
         bool requestPending = false;
+        bool cancelPending = false;
+        handheld::TxReceipt receipt;
     };
 
     bool frameLinkEncrypted(uint8_t ifaceId, const uint8_t linkId[16], const uint8_t key[64],
                             uint8_t packetType, uint8_t context, const uint8_t* plaintext,
-                            size_t len, bool retain = false);
+                            size_t len, bool retain = false, handheld::TxReceipt reservation = {});
     bool frameRawPart(uint8_t ifaceId, const uint8_t linkId[16], const uint8_t* part, size_t len);
     // Resource delivery proof: PT_PROOF/RESOURCE_PRF, PLAINTEXT on the link (Packet.py:196 —
     // "Resource proofs are not encrypted"; same as packet proofs over links, Packet.py:199).
-    void frameRawProof(uint8_t ifaceId, const uint8_t linkId[16], const uint8_t* proof, size_t len);
+    bool buildRawProof(const uint8_t linkId[16], const uint8_t* proof, size_t len,
+                       uint8_t raw[128], size_t& rawLen);
     void sendRequest();
     void servePendingParts();
     void cancelOutbound();
-    void closeInbound(bool cancel);
+    void closeInbound(bool cancel, bool keepReceipt = false);
     uint32_t waitMs(uint8_t iface, uint32_t packets, uint32_t minimum) const;
-    bool retainControl(uint8_t iface, const uint8_t* raw, size_t len);
     void closeOutbound(bool delivered, bool notify = true);
-
-    // Terminal frames survive transfer cleanup and temporary interface backpressure.
-    // Four short packets bound memory even if several peers repeatedly advertise while busy.
-    struct Control {
-        uint8_t raw[128] = {};
-        size_t len = 0;
-        uint8_t iface = UINT8_MAX;
-        unsigned long queuedMs = 0;
-    };
-    Control _control[4];
 
     Deps _d;
     Out _out;

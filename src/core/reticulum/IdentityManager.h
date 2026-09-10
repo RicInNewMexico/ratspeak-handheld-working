@@ -10,6 +10,7 @@ struct IdentitySlot {
     std::string hash;       // hex hash (first 32 chars)
     String displayName;     // per-identity display name
     String keyPath;         // storage path to .key file
+    bool nameComplete = false; // Explicit optional-name choice, including empty.
     bool active;            // currently loaded identity
 };
 
@@ -39,7 +40,9 @@ public:
 
     // Save display name for identity at index
     bool flushPending();
-    bool setDisplayName(int index, const String& name);
+    bool setDisplayName(int index, const String& name, bool complete = true);
+    // A settings intent names a validated key hash, never a mutable vector index.
+    bool validateSlot(int index) const;
 
     // Get the display name for identity at index
     String getDisplayName(int index) const;
@@ -69,7 +72,7 @@ public:
 
 private:
     void loadSlotMeta();
-    bool saveSlotMeta();
+    bool saveSlotMeta(int nameIndex = -1, const String* name = nullptr, bool complete = false);
     bool _metadataDirty = false;
     bool _metadataReadable = true;
     mutable bool _nvsMirrorPending = false;

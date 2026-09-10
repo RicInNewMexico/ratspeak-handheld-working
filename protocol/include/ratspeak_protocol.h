@@ -329,6 +329,13 @@ rs_handheld_status_t rs_handheld_rns_packet_ingest(rs_handheld_rns_t *ctx, const
                                          uint8_t interface_id, uint64_t now_ms,
                                          int32_t *out_action, rs_handheld_announce_event_t *out_event,
                                          rs_handheld_local_frame_t *out_local);
+/* Private handheld owner facts: call before ingest/tick. Zero generation or outbound=0
+ * retires requester permission; changed generations cannot inherit old discovery work.
+ * interface_id is0..6, outbound is0/1. Bitrate0 means unknown, sampled once per new owner. */
+rs_handheld_status_t rs_handheld_rns_update_interface(rs_handheld_rns_t *ctx,
+    uint8_t interface_id, uint32_t generation, int32_t interface_mode,
+    uint32_t bitrate_bps, uint8_t outbound);
+
 rs_handheld_status_t rs_handheld_rns_packet_ingest_with_mode(rs_handheld_rns_t *ctx,
                                          const uint8_t *raw, size_t raw_len,
                                          uint8_t interface_id, int32_t interface_mode,
@@ -403,6 +410,50 @@ rs_handheld_status_t rs_handheld_rns_poll_outbound(rs_handheld_rns_t *ctx, uint8
                                          size_t *out_len, uint8_t *out_interface_id,
                                          int32_t *out_reason);
 
+/* Opaque process-local lifetime metadata, never wire bytes or a persistent format.
+ * Capture once per constructed packet; retain unchanged on backpressure/retries.
+ * Validate at the current monotonic time immediately before driver admission.
+ * Once a split LoRa burst starts, it completes atomically. Queue waiting does not
+ * include on-air time. Drivers separately bind interface generations.
+ * The legacy poll above is for synchronous consumers; retaining drivers use this
+ * leased variant. Empty polls zero the token. No output token on a failed call. */
+#define RS_HANDHELD_TX_LIFETIME_BYTES 104
+rs_handheld_status_t rs_handheld_rns_poll_outbound_leased(rs_handheld_rns_t *ctx,
+    uint8_t *out, size_t out_cap, size_t *out_len, uint8_t *out_interface_id,
+    int32_t *out_reason, uint8_t out_lifetime[RS_HANDHELD_TX_LIFETIME_BYTES]);
+/* Private handheld retained owner. Selection copies bytes and latches exclusive mode;
+ * both legacy polls then return NOT_READY. Generations map interface ids0..6; zero is
+ * unavailable. blocked_targets skips only those interfaces for this pass. Identity is
+ * checked, non-reused queue ownership, not a packet hash. transfer=1 requires after=0
+ * and blocked=0 and transfers the selected oldest row to the existing C++ held slot.
+ * Otherwise its bytes stay queued until every target is acknowledged or retired.
+ * Outputs are mutually disjoint/outside ctx/node; only generations/out_generations
+ * may alias. Capacity refusal consumes no row. Empty selection writes length/id/targets0.
+ * Never keep a selected identity across context destruction/reopening. */
+rs_handheld_status_t rs_handheld_rns_outbound_select(rs_handheld_rns_t *ctx,
+    uint64_t after_identity, uint8_t blocked_targets, const uint32_t generations[7],
+    int32_t transfer, uint8_t *out, size_t out_cap, size_t *out_len,
+    uint64_t *out_identity, uint8_t *out_targets, uint32_t out_generations[7],
+    uint8_t out_lifetime[RS_HANDHELD_TX_LIFETIME_BYTES]);
+/* Clear admitted/terminal bits only. RETRY means identity has already retired. */
+rs_handheld_status_t rs_handheld_rns_outbound_ack(rs_handheld_rns_t *ctx,
+    uint64_t identity, uint8_t completed_targets);
+/* Also removes permission from rows not yet selected; replacement never rebinds them. */
+rs_handheld_status_t rs_handheld_rns_outbound_retire_interface(rs_handheld_rns_t *ctx,
+    uint8_t interface_id);
+rs_handheld_status_t rs_handheld_rns_capture_outbound_lifetime(const rs_handheld_rns_t *ctx,
+    const uint8_t *raw, size_t raw_len, uint64_t now_ms,
+    uint8_t out_lifetime[RS_HANDHELD_TX_LIFETIME_BYTES]);
+/* Deferred proof construction: preserve its original birth and total wait (1..120000 ms).
+ * Reject rollback, overflow and an expired wait. Capture current protocol dependencies;
+ * never extend their deadlines. Host receipt/session generations remain required. */
+rs_handheld_status_t rs_handheld_rns_capture_outbound_lifetime_at(const rs_handheld_rns_t *ctx,
+    const uint8_t *raw, size_t raw_len, uint64_t now_ms, uint64_t born_ms, uint32_t max_wait_ms,
+    uint8_t out_lifetime[RS_HANDHELD_TX_LIFETIME_BYTES]);
+rs_handheld_status_t rs_handheld_rns_outbound_lifetime_is_live(const rs_handheld_rns_t *ctx,
+    const uint8_t lifetime[RS_HANDHELD_TX_LIFETIME_BYTES], uint8_t interface_id,
+    uint64_t now_ms, int32_t *out_live);
+
 /* Run time-based maintenance (table expiry + dispatch of due announce rebroadcasts). Call
  * periodically with a monotonic millisecond clock. RS_HANDHELD_ERR_NOT_READY if no node is open. */
 rs_handheld_status_t rs_handheld_rns_tick(rs_handheld_rns_t *ctx, uint64_t now_ms);
@@ -436,6 +487,9 @@ rs_handheld_status_t rs_handheld_rns_route(const rs_handheld_rns_t *ctx,
                                  const uint8_t destination_hash[16], uint64_t now_ms,
                                  rs_handheld_route_t *out_route);
 
+/* Discard a failed route before rediscovery; retain the peer identity. Idempotent. */
+rs_handheld_status_t rs_handheld_rns_drop_path(rs_handheld_rns_t *ctx,
+                                            const uint8_t destination_hash[16]);
 /* Originate a path request for destination_hash[16] and queue it (poll via poll_outbound).
  * tag[16] is a caller-supplied random request tag. RS_HANDHELD_ERR_NOT_READY if no node is open. */
 rs_handheld_status_t rs_handheld_rns_request_path(rs_handheld_rns_t *ctx, const uint8_t destination_hash[16],
@@ -562,6 +616,13 @@ rs_handheld_status_t rs_handheld_rns_lxmf_parse_auto(rs_handheld_rns_t *ctx,
                                            rs_handheld_lxmf_message_t *out_message,
                                            uint8_t out_resolved_public_key[64]);
 
+/* Exact full packed length using the construction encoder, with no identity,
+ * body access, or allocation. Compare with RS_HANDHELD_RESOURCE_DATA_MAX for
+ * outgoing admission. Returns ERR_CAPACITY on unrepresentable lengths, leaving
+ * out_size unchanged. Title/content bin8/bin16/bin32 transitions are included. */
+rs_handheld_status_t rs_handheld_lxmf_packed_size(size_t title_len, size_t content_len,
+                                               size_t *out_size);
+
 /* Build a FULL packed LXMF message for LINK/RESOURCE (DIRECT) delivery: dest(16) ||
  * source(16) || signature(64) || msgpack payload — NO ECIES wrap (link session crypto replaces it),
  * byte-identical to Python LXMessage.pack(). Send it either as a single link data packet
@@ -593,6 +654,22 @@ rs_handheld_status_t rs_handheld_rns_lxmf_parse_link(const rs_handheld_rns_t *ct
                                            uint8_t *title, size_t title_cap, size_t *out_title_len,
                                            uint8_t *content, size_t content_cap,
                                            size_t *out_content_len, int32_t *out_is_reaction);
+
+/* Validated, immutable-input-relative direct message spans. The caller must keep
+ * the exact packed input alive and unchanged while using the offsets. This uses
+ * the same validation as parse_link and retains no input or decoded body. */
+typedef struct rs_handheld_lxmf_view {
+    uint8_t message_id[32];
+    uint8_t source_hash[16];
+    double timestamp;
+    uint32_t title_offset, title_len;
+    uint32_t content_offset, content_len;
+    int32_t is_reaction;
+} rs_handheld_lxmf_view_t;
+rs_handheld_status_t rs_handheld_rns_lxmf_parse_link_view(const rs_handheld_rns_t *ctx,
+                                           const uint8_t *data, size_t data_len,
+                                           const uint8_t source_public_key[64],
+                                           rs_handheld_lxmf_view_t *out_view);
 
 /* ---- Proof / delivery-status / dedup: byte-exact with Python RNS 1.3.8 ----
  * A proof of receipt is the receiver's Ed25519 signature over the proven packet's full 32-byte hash:

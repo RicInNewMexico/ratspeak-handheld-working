@@ -49,7 +49,11 @@ public:
     void setDoneCallback(DoneCb cb) { _doneCb = cb; }
     void setSelectedIndex(int idx) { _selectedIdx = idx; }
 
+    void setSaveStatus(const char* status, bool pending) { _saveStatus = status; _savePending = pending; }
+
 private:
+    const char* _saveStatus = nullptr;
+    bool _savePending = false;
     DoneCb _doneCb;
     ScrollList _list;
     int _selectedIdx = 0;  // Start at top of list

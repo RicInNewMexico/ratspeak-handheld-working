@@ -7,19 +7,16 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-BOARDS = {
-    "tdeck": ("rsdeck", "16MB"),
-    "tpager": ("rspager", "16MB"),
-    "cardputer": ("rscardputer", "8MB"),
-}
-PACKAGES = ("full", "standalone", "rnode")
+from release_catalog import BOARDS, PACKAGES, ROOT
+from release_identity import firmware_version, validate_version, source_identity
+from release_images import flash_settings, verify_factory
+
+
 NOTICES = {
     "LICENSE": "LICENSE",
     "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
@@ -29,51 +26,17 @@ NOTICES = {
 }
 
 
-def source_identity(root: Path) -> tuple[str, bool]:
-    try:
-        top = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"], cwd=root, text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        if Path(top).resolve() != root.resolve():
-            raise ValueError("not the source repository root")
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    except (subprocess.CalledProcessError, ValueError):
-        # Source-release archives have no Git history. Let users build them, but
-        # never label a local archive build as an unmodified official checkout.
-        metadata = root.parent / "SOURCE.json"
-        if not metadata.is_file():
-            raise ValueError("source identity requires a Git checkout or the complete release source archive") from None
-        revision = json.loads(metadata.read_text()).get("sources", {}).get(root.name, "")
-        if not re.fullmatch(r"[0-9a-f]{40}", revision):
-            raise ValueError("invalid source-archive identity")
-        return revision, True
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("packaging requires a Git checkout with a full source commit")
-    status = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=root, text=True
-    )
-    return revision, bool(status.strip())
-
-
-def firmware_version(root: Path, board: str) -> str:
-    config = (root / "src/boards" / board / "config/BoardConfig.h").read_text()
-    match = re.search(r'^#define RSDECK_VERSION_STRING\s+"([^"]+)"', config, re.MULTILINE)
-    if not match:
-        raise ValueError("board firmware version is missing")
-    return match.group(1)
-
-
 def make_manifest(
     image: bytes, name: str, board: str, package: str, flash_size: str,
     version: str, revision: str, dirty: bool,
 ) -> dict:
     if board not in BOARDS or package not in PACKAGES:
         raise ValueError("unsupported board or package")
-    brand, expected_flash = BOARDS[board]
+    capability = BOARDS[board]
+    brand, expected_flash = capability.artifact_prefix, capability.flash_size
     if name != f"{brand}-{package}" or flash_size != expected_flash:
         raise ValueError("package name/flash size does not match the selected board")
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
-        raise ValueError("invalid firmware version")
+    validate_version(version)
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or not isinstance(dirty, bool):
         raise ValueError("invalid source identity")
     capacity = int(expected_flash.removesuffix("MB")) * 1024 * 1024
@@ -90,8 +53,7 @@ def make_manifest(
         "sourceDirty": dirty,
         "chipFamily": "ESP32-S3",
         "flashSize": flash_size,
-        "flashMode": "dio",
-        "flashFreq": "80m",
+        **flash_settings(image, board),
         "parts": [{
             "path": f"{name}.bin", "offset": "0x0000", "size": len(image),
             "sha256": hashlib.sha256(image).hexdigest(),
@@ -139,6 +101,7 @@ def main() -> int:
         image, args.name, args.device, args.package, args.flash_size,
         firmware_version(ROOT, args.device), revision, dirty,
     )
+    verify_factory(image, args.device, args.package, manifest["version"], revision, dirty, ROOT)
     write_package(args.output, image, manifest, ROOT)
     print(f"firmware package written to {args.output} (source {revision}, dirty={dirty})")
     return 0

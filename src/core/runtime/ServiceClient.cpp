@@ -1,8 +1,27 @@
 #include "ServiceClient.h"
+#include "storage/MessageRecord.h"
+#include <freertos/FreeRTOS.h>
 #if !defined(RSCARDPUTER)
 #include <cstring>
 
 namespace handheld {
+
+bool ServiceClient::initialize(const UserConfig& source) {
+    UserConfig editable, committed;
+    if (!editable.tryAssign(source) || !committed.tryAssign(source)) return false;
+    config.swap(editable); _committed.swap(committed);
+    _configReady = true;
+    _mailbox.readStatus(_status);
+    return true;
+}
+
+bool ServiceClient::publishSettings(const char* bytes, size_t length) {
+    UserConfig editable, committed;
+    if (!length || !editable.decode(bytes, length) || !committed.tryAssign(editable)) return false;
+    config.swap(editable); _committed.swap(committed);
+    _configReady = true; _settingsRefresh = false;
+    return true;
+}
 
 int NodeView::nodesOnlineSince(unsigned long age) const {
     int count = 0; for (const auto& node : _nodes) if (node.lastSeen && millis() >= node.lastSeen && millis() - node.lastSeen <= age) ++count;
@@ -14,9 +33,7 @@ const DiscoveredNode* NodeView::findNodeByHex(const std::string& hex) const {
 }
 std::string NodeView::lookupName(const std::string& hex) const {
     const auto* node = findNodeByHex(hex);
-    if (node) return node->name;
-    const auto it = _cachedNames.find(hex);
-    return it == _cachedNames.end() ? std::string() : it->second;
+    return node ? node->name : std::string();
 }
 bool NodeView::saveNode(const std::string& hex) { return _client.action(Operation::SaveContact, hex) != 0; }
 bool NodeView::unsaveNode(const std::string& hex) { return deleteContactByHex(hex); }
@@ -24,30 +41,17 @@ bool NodeView::deleteContactByHex(const std::string& hex) { return _client.actio
 bool NodeView::setContactName(const std::string& hex, const std::string& name) { return _client.action(Operation::RenameContact, hex, name) != 0; }
 bool NodeView::addManualContact(const std::string& hex, const std::string& name) { return _client.action(Operation::SaveContact, hex, name) != 0; }
 
-const ConversationSummary* MessageViewModel::getConversationSummary(const std::string& peer) const {
-    const auto it = _summaries.find(peer); return it == _summaries.end() ? nullptr : &it->second;
-}
-std::vector<LXMFMessage> MessageViewModel::getRecentMessages(const std::string& peer, size_t max) {
-    _client.watchHistory(peer);
-    const auto& history = _client.history();
-    if (history.size() <= max) return history;
-    return {history.end() - max, history.end()};
-}
-int MessageViewModel::unreadCount(const std::string& peer) const {
-    if (peer.empty()) return _client.status().unread;
-    const auto* summary = getConversationSummary(peer); return summary ? summary->unreadCount : 0;
-}
-int MessageViewModel::queuedCount() const { return _client.status().queued; }
-bool MessageViewModel::markRead(const std::string& peer) { return _client.action(Operation::MarkRead, peer) != 0; }
-bool MessageViewModel::deleteConversation(const std::string& peer) { return _client.action(Operation::DeleteConversation, peer) != 0; }
-
 uint32_t ServiceClient::submit(Request request, const std::string& body, size_t capacity, ValueCompletion callback) {
+    return submit(request, body.data(), body.size(), capacity, std::move(callback));
+}
+
+uint32_t ServiceClient::submit(Request request, const void* body, size_t length, size_t capacity, ValueCompletion callback) {
     request.generation = _status.generation;
     Callback* pending = nullptr;
     for (auto& item : _callbacks) if (!item.id) { pending = &item; break; }
     if (!pending) { tell("Device busy; try again"); return 0; }
     uint32_t id = 0;
-    const auto admitted = _mailbox.submit(request, body.data(), body.size(), capacity, id);
+    const auto admitted = _mailbox.submit(request, body, length, capacity, id, millis());
     if (admitted != Admission::Admitted) {
         if (!queryOperation(request.operation)) tell(admitted == Admission::NotReady ? "Device not ready" : "Device busy; try again");
         return 0;
@@ -68,32 +72,76 @@ uint32_t ServiceClient::action(Operation op, const std::string& peer, const std:
     });
 }
 
+uint32_t ServiceClient::requestPeerName(const std::string& peer, TextCompletion completion) {
+    uint8_t decoded[16];
+    if (!storage::decodeHex(peer.data(), peer.size(), decoded, sizeof(decoded))) return 0;
+    Request request; request.operation = Operation::PeerName;
+    strlcpy(request.peer, peer.c_str(), sizeof(request.peer));
+    return submit(request, "", ServiceMailbox::MaxPayload, std::move(completion));
+}
+
 bool ServiceClient::applySettings(Completion completion, bool applyRadio) {
-    if (_settingsPending || _settingsQuery) { config = _committed; tell("Settings save in progress"); return false; }
+    if (!_configReady) { tell("Settings unavailable; retry"); return false; }
+    if (settingsPending()) { tell("Settings save in progress"); return false; }
     Request request; request.operation = Operation::ApplySettings; request.revision = _configRevision;
     request.argument = applyRadio;
     const String encoded = config.encode();
-    const auto id = submit(request, encoded.c_str(), 4096,
-        [this, completion](const Result& result, const char* json) {
+    UserConfig rollback;
+    if (encoded.isEmpty() || !rollback.tryAssign(_committed)) {
+        tell("Settings memory unavailable; retry"); return false;
+    }
+    ValueCompletion callback;
+    try {
+        callback = [this, completion = std::move(completion)](const Result& result, const char* json) {
             _settingsPending = false;
-            if (result.length && config.decode(json)) {
-                _committed = config; _configRevision = result.revision;
-                if (onConfigApplied) onConfigApplied();
+            Result shown = result;
+            if ((result.outcome == Outcome::Ok || result.outcome == Outcome::Cancelled) &&
+                publishSettings(json, result.length)) {
+                _configRevision = result.revision;
+                if (result.outcome == Outcome::Ok && onConfigApplied) onConfigApplied();
                 if (result.outcome != Outcome::Ok) tell(result.detail);
             } else {
-                config = _committed;
-                tell(result.detail[0] ? result.detail : "Save failed");
-                if (result.outcome == Outcome::Stale) _configRevision = 0;
+                if (result.settingsCommitted && result.outcome != Outcome::Stale) {
+                    shown.outcome = Outcome::NotReady;
+                    strlcpy(shown.detail, "Settings saved; refresh pending", sizeof shown.detail);
+                    _settingsRefresh = true;
+                } else if (result.outcome == Outcome::Stale) {
+                    _settingsRefresh = true;
+                }
+                tell(shown.detail[0] ? shown.detail : "Save failed");
             }
-            if (completion) completion(result);
-        });
+            if (completion) completion(shown);
+        };
+    } catch (const std::bad_alloc&) {
+        tell("Settings memory unavailable; retry"); return false;
+    }
+    // Prepare the callback and restoration before admission. Neither a local
+    // refusal nor later cancellation needs an allocating settings copy.
+    config.swap(rollback);
+    const auto id = submit(request, encoded.c_str(), encoded.length(), UserConfig::SnapshotLimit,
+        std::move(callback));
     _settingsPending = id != 0;
-    if (!id) config = _committed;
     return id != 0;
 }
 
 void ServiceClient::poll() {
+    const auto previousGeneration = _status.generation;
     _mailbox.readStatus(_status);
+    if (previousGeneration != _status.generation) {
+        // Names and saved aliases belong to an identity. Drop the previous
+        // publication immediately, but retain any accepted request until its
+        // stale callback retires below.
+        nodes._nodes.clear(); nodes._revision = 0;
+        _nodeStaging.clear(); _nodeOffset = 0; _nodeCursorRevision = 0;
+    }
+    if (_history.mode() != history::HistoryWindow::Mode::Closed &&
+        _history.identityGeneration() != _status.generation) _history.close();
+    _history.observeStatusRevision(_status.statusRevision);
+    _history.observeHistoryRevision(_status.historyRevision);
+    if (_conversationWindow.identityGeneration() != _status.generation &&
+        _conversationWindow.state() != history::ConversationWindow<64>::State::Closed) _conversationWindow.close();
+    _conversationWindow.observeRevision(_status.storeRevision);
+    _conversationWindow.observeStatusRevision(_status.statusRevision);
     const bool unhealthy = _status.state == ServiceState::Running &&
         millis() - _status.heartbeat > 5000;
     if (unhealthy && !_unhealthy) tell("Device service stalled; wait or reset device");
@@ -103,7 +151,11 @@ void ServiceClient::poll() {
         if (slot == ServiceMailbox::NoSlot) break;
         const auto request = _mailbox.request(slot);
         auto result = _mailbox.result(slot);
-        _mailbox.read(slot, _scratch, result.length); _scratch[result.length] = 0;
+        if (result.length >= sizeof(_scratch) || !_mailbox.read(slot, _scratch, result.length)) {
+            result.outcome = Outcome::Failed; result.storageError = storage::Error::Internal;
+            result.length = 0;
+        }
+        _scratch[result.length] = 0;
         ValueCompletion callback;
         for (auto& item : _callbacks) if (item.id == request.id) {
             callback = std::move(item.callback); item.id = 0; break;
@@ -117,17 +169,13 @@ void ServiceClient::poll() {
         _incomingRevision = _status.incomingRevision; tell("New message");
     }
     if (!_mailbox.accepting() || _unhealthy) return;
-    if (!_settingsPending && !_settingsQuery && static_cast<int32_t>(_status.configRevision - _configRevision) > 0) requestSettings();
-    if (!_nodesPending && (_nodeOffset || _nodeRevision != _status.nodeRevision)) requestNodes();
-    // Revision zero is valid after loading persisted messages at boot. Until
-    // the first complete snapshot arrives, an empty UI cache is not up to date.
-    if (!_conversationsPending && (!_conversationsLoaded || _convOffset ||
-        messages._revision != _status.storeRevision)) requestConversations();
+    if (!_settingsPending && !_settingsQuery &&
+        (_settingsRefresh || static_cast<int32_t>(_status.configRevision - _configRevision) > 0) &&
+        uint32_t(millis() - _lastSettingsQuery) >= 1000) requestSettings();
+    if (!_nodesPending && (_nodeOffset || nodes._revision != _status.nodeRevision)) requestNodes();
     if (!_identitiesPending && _identityRevision != _status.identityRevision) requestIdentities();
-    if (!_historyPeer.empty() && !_historyPending &&
-        static_cast<int32_t>(millis() - _historyRetryAt) >= 0 &&
-        (_historyLoading || _historyState != HistoryState::Ready ||
-         messages._historyRevision != _status.storeRevision)) requestHistory();
+    requestHistory();
+    requestConversationWindow();
 }
 
 void ServiceClient::requestNodes() {
@@ -145,107 +193,100 @@ void ServiceClient::requestNodes() {
         }
         _nodeCursorRevision = result.revision;
         if (result.more) _nodeOffset = result.next;
-        else { nodes._nodes.swap(_nodeStaging); _nodeStaging.clear(); _nodeOffset = 0; _nodeRevision = result.revision; }
-    }) != 0;
-}
-
-void ServiceClient::requestConversations() {
-    Request request; request.operation = Operation::Conversations; request.offset = _convOffset; request.revision = _convCursorRevision;
-    if (!_convOffset) { _convStaging.clear(); _summaryStaging.clear(); nodes._cachedNames.clear(); }
-    _conversationsPending = submit(request, "", 4096, [this](const Result& result, const char* data) {
-        _conversationsPending = false;
-        JsonDocument doc;
-        if (result.outcome != Outcome::Ok || deserializeJson(doc, data) || !doc.is<JsonArray>()) {
-            _convOffset = 0; return;
-        }
-        for (JsonObject row : doc.as<JsonArray>()) {
-            const std::string peer = row["peer"] | ""; _convStaging.push_back(peer);
-            nodes._cachedNames[peer] = row["name"] | "";
-            auto& s = _summaryStaging[peer]; s.lastTimestamp = row["time"]; s.lastPreview = row["preview"] | "";
-            s.lastIncoming = row["incoming"]; s.unreadCount = row["unread"]; s.totalCount = row["total"];
-            s.hasOutgoing = row["outgoing"]; s.hasPending = row["pending"]; s.hasFailed = row["failed"];
-            s.lastOutgoingStatus = LXMFStatus(row["status"].as<uint8_t>()); s.lastOutgoingCounter = row["counter"];
-            s.pendingCount = row["pendingCount"]; s.failedCount = row["failedCount"];
-        }
-        _convCursorRevision = result.revision;
-        if (result.more) _convOffset = result.next;
-        else {
-            messages._conversations.swap(_convStaging); messages._summaries.swap(_summaryStaging);
-            _convStaging.clear(); _summaryStaging.clear(); _convOffset = 0; messages._revision = result.revision;
-            _conversationsLoaded = true;
-        }
+        else { nodes._nodes.swap(_nodeStaging); _nodeStaging.clear(); _nodeOffset = 0; nodes._revision = result.revision; }
     }) != 0;
 }
 
 void ServiceClient::watchHistory(const std::string& peer) {
-    if (_historyPeer == peer) return;
-    _historyPeer = peer; _history.clear(); _historyStaging.clear(); _currentMessage = {};
-    _historyIndex = _bodyOffset = 0; ++_historyQuery; _historyPending = false;
-    _historyLoading = true; _historyRetryAt = millis(); messages._historyRevision = 0;
-    _historyState = HistoryState::Loading;
+    uint8_t decoded[16];
+    if (!storage::decodeHex(peer.data(), peer.size(), decoded, 16)) { closeHistory(); return; }
+    if (_history.mode() != history::HistoryWindow::Mode::Closed &&
+        _history.identityGeneration() == _status.generation && !memcmp(_history.peer(), decoded, 16)) return;
+    _history.open(decoded, _status.generation);
 }
 void ServiceClient::closeHistory() {
-    if (_mailbox.accepting()) action(Operation::CloseHistory);
-    _historyPeer.clear(); _history.clear(); _historyStaging.clear(); _currentMessage = {};
-    ++_historyQuery; _historyPending = _historyLoading = false;
-    _historyState = HistoryState::Closed;
+    // A mode/peer change invalidates presentation, never the callback that owns
+    // an accepted mailbox result. Hidden views still copy/release that result.
+    _history.close();
 }
 
 void ServiceClient::requestHistory() {
-    if (!_historyLoading) {
-        _historyLoading = true; _historyIndex = _bodyOffset = 0; _historyStaging.clear(); ++_historyQuery;
-    }
-    Request request; request.operation = !_historyIndex && !_bodyOffset ? Operation::History : Operation::MessageBody;
-    request.offset = _historyIndex; request.argument = _bodyOffset; request.query = _historyQuery;
-    request.revision = _historyStoreRevision; strlcpy(request.peer, _historyPeer.c_str(), sizeof(request.peer));
-    const auto query = _historyQuery;
-    _historyPending = submit(request, "", 4096, [this, query](const Result& result, const char* data) {
-        if (query != _historyQuery) return;
-        _historyPending = false;
-        JsonDocument doc;
-        if (result.outcome != Outcome::Ok || deserializeJson(doc, data)) {
-            _historyLoading = false; _historyIndex = _bodyOffset = 0; _historyStaging.clear();
-            _historyRetryAt = millis() + 1000;
-            if (result.outcome != Outcome::Stale) {
-                // Initial failures are shown inline. Keep an existing snapshot
-                // visible on refresh failure, with at most one notice per retry episode.
-                if (_historyState != HistoryState::Retrying && !_history.empty())
-                    tell("Couldn't refresh messages; retrying");
-                _historyState = HistoryState::Retrying;
-            }
-            return;
-        }
-        _historyStoreRevision = result.revision;
-        if (result.total) {
-            if (!_bodyOffset) {
-                _currentMessage = {};
-                _currentMessage.sourceHash.assignHex(doc["source"] | ""); _currentMessage.destHash.assignHex(doc["dest"] | "");
-                _currentMessage.timestamp = doc["time"]; _currentMessage.incoming = doc["incoming"];
-                _currentMessage.status = LXMFStatus(doc["status"].as<uint8_t>()); _currentMessage.read = doc["read"];
-                _currentMessage.messageId.assignHex(doc["msgid"] | "");
-                _currentMessage.savedCounter = doc["counter"]; _currentMessage.receiveCounter = doc["receive"];
-            }
-            rs::Bytes body; body.assignHex(doc["body"] | "");
-            _currentMessage.content.append(reinterpret_cast<const char*>(body.data()), body.size());
-            if (doc["bodyEnd"].as<bool>()) {
-                _historyStaging.push_back(std::move(_currentMessage)); ++_historyIndex; _bodyOffset = 0;
-            } else _bodyOffset = result.next;
-        }
-        if (!result.more) {
-            _history.swap(_historyStaging); _historyStaging.clear(); _historyLoading = false;
-            _historyIndex = _bodyOffset = 0; messages._historyRevision = result.revision;
-            _historyState = HistoryState::Ready;
-        }
-    }) != 0;
+    const auto query = _history.next(millis());
+    using Window = history::HistoryWindow;
+    if (query.kind == Window::Kind::None) return;
+    Request request;
+    request.operation = query.kind == Window::Kind::Page ? Operation::HistoryPage :
+                        query.kind == Window::Kind::Status ? Operation::HistoryStatus : Operation::ReadRecord;
+    request.query = query.nonce; request.argument = query.cursor.counter; request.incoming = query.cursor.incoming;
+    request.offset = query.offset; request.historyDirection = query.direction;
+    request.statusRevision = query.statusRevision;
+    storage::encodeHex(query.peer, 16, request.peer);
+    submitReadQuery(_history, query.nonce, query.kind == Window::Kind::Status, request, nullptr, 0, query.capacity);
+}
+
+void ServiceClient::watchConversations() { _conversationWindow.resume(_status.generation); }
+void ServiceClient::closeConversations() { _conversationWindow.close(); }
+
+void ServiceClient::requestConversationWindow() {
+    using Window = history::ConversationWindow<64>;
+    const auto query = _conversationWindow.next(millis());
+    if (query.kind == Window::Kind::None) return;
+    Request request; request.query = query.nonce;
+    request.operation = query.kind == Window::Kind::Page ? Operation::ConversationPage :
+        query.kind == Window::Kind::Detail ? Operation::ConversationDetail : Operation::HistoryStatus;
+    request.statusRevision = query.statusRevision; request.argument = query.selector.counter;
+    storage::encodeHex(query.selector.cursor.peer, 16, request.peer);
+    ConversationQuery envelope;
+    envelope.selector = query.selector; envelope.order = query.order; envelope.direction = query.direction;
+    envelope.hasCursor = query.hasCursor;
+    const bool status = query.kind == Window::Kind::Status;
+    submitReadQuery(_conversationWindow, query.nonce, status, request, status ? nullptr : &envelope,
+                    status ? 0 : sizeof(envelope), query.capacity);
+}
+
+template<class Window>
+void ServiceClient::submitReadQuery(Window& window, uint32_t nonce, bool status, Request request,
+                                     const void* body, size_t length, size_t capacity) {
+    const auto id = submit(request, body, length, capacity,
+        [this, &window, nonce, status](const Result& result, const char* data) {
+            storage::Result stored;
+            stored.key = result.key; stored.length = result.length; stored.total = result.total;
+            stored.nextOffset = result.next; stored.more = result.more;
+            stored.revision = status ? result.statusRevision : result.revision;
+            stored.outcome = result.outcome == Outcome::Ok ? storage::Outcome::Committed :
+                             result.outcome == Outcome::Cancelled ? storage::Outcome::Cancelled : storage::Outcome::Failed;
+            stored.error = result.storageError;
+            if (result.outcome == Outcome::Stale) stored.error = storage::Error::Stale;
+            else if (result.outcome != Outcome::Ok && stored.error == storage::Error::None)
+                stored.error = storage::Error::Unavailable;
+            // The poll loop copied the payload and retired its mailbox credit.
+            // Both windows consume that same stable copy with their own lineage.
+            const bool copied = window.result(nonce, stored, data, result.length, millis());
+            configASSERT(copied);
+            if (!copied) { tell("Message query ownership failed"); return; }
+            const bool released = window.released(nonce);
+            configASSERT(released);
+            if (!released) tell("Message query release failed");
+        });
+    if (id) {
+        const bool admitted = window.admitted(nonce, {id, 0});
+        configASSERT(admitted);
+        if (!admitted) tell("Message query ownership failed");
+    } else window.rejected(nonce, _mailbox.accepting()
+        ? storage::Rejection::Busy : storage::Rejection::Unavailable, millis());
 }
 
 void ServiceClient::requestSettings() {
     Request request; request.operation = Operation::Settings;
-    _settingsQuery = submit(request, "", 4096, [this](const Result& result, const char* data) {
+    _lastSettingsQuery = millis();
+    _settingsQuery = submit(request, "", UserConfig::SnapshotLimit, [this](const Result& result, const char* data) {
         _settingsQuery = false;
-        if (result.outcome == Outcome::Ok && config.decode(data)) {
-            _committed = config; _configRevision = result.revision;
+        if (result.outcome == Outcome::Ok && publishSettings(data, result.length)) {
+            _configRevision = result.revision;
             if (onConfigApplied) onConfigApplied();
+        } else {
+            _settingsRefresh = true;
+            tell("Settings refresh pending");
         }
     }) != 0;
 }

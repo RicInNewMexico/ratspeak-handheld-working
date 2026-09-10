@@ -11,6 +11,9 @@
 #include <Arduino.h>
 #include <string.h>
 
+static_assert(RustLinkManager::MAX_LINKS <= RustIncomingDelivery::NoLink,
+              "Receipt link-slot sentinel must not overlap a Link owner slot");
+
 namespace {
 // Python RNS 1.2.5 Link.py constants.
 constexpr unsigned long KEEPALIVE_MS = 360000;             // KEEPALIVE_MAX
@@ -19,6 +22,7 @@ constexpr unsigned long ESTABLISHMENT_TIMEOUT_PER_HOP_MS = 6000;  // DEFAULT_PER
 constexpr unsigned long STALE_GRACE_MS = 5000;             // STALE_GRACE
 constexpr double KEEPALIVE_PER_RTT = 360.0 / 1.75;         // KEEPALIVE_MAX / KEEPALIVE_MAX_RTT
 constexpr double KEEPALIVE_TIMEOUT_FACTOR = 4.0;
+constexpr uint32_t KEEPALIVE_QUEUE_WAIT_MS = 120000;
 
 void secureZero(uint8_t* p, size_t n) {
     volatile uint8_t* v = p;
@@ -67,7 +71,10 @@ RustLinkManager::Link* RustLinkManager::findByLinkId(const uint8_t linkId[16]) {
 
 RustLinkManager::Link* RustLinkManager::allocLink() {
     for (auto& l : _links) {
-        if (l.state == State::Free || l.state == State::Closed) return &l;
+        auto& generation = _generations[&l - _links];
+        if ((l.state == State::Free || l.state == State::Closed) && generation != UINT32_MAX) {
+            ++generation; return &l;
+        }
     }
     // Pool full: reclaim the oldest responder half-open. Every initiator retry
     // arrives under a fresh link_id, so lost handshakes would otherwise pin all
@@ -75,29 +82,54 @@ RustLinkManager::Link* RustLinkManager::allocLink() {
     // Active/InitRequested/Stale slots carry real sessions — never evicted.
     Link* oldest = nullptr;
     for (auto& l : _links) {
-        if (l.state != State::RespPending) continue;
+        if (l.state != State::RespPending || _generations[&l - _links] == UINT32_MAX) continue;
         if (!oldest || (long)(oldest->requestMs - l.requestMs) > 0) oldest = &l;
     }
     if (oldest) {
         Serial.println("[RUST-LINK] slot pressure: evicting oldest half-open responder");
         closeLink(*oldest);
+        ++_generations[oldest - _links];
         return oldest;
     }
     return nullptr;
 }
 
 void RustLinkManager::closeLink(Link& l) {
+    if (_d.lxmf) _d.lxmf->incoming().dropLink(uint8_t(&l - _links), _generations[&l - _links]);
     if (l.state != State::Free && l.state != State::Closed) {
         rs_handheld_rns_link_unregister(_d.ctx, l.linkId);
     }
     secureZero(l.sessionKey, sizeof(l.sessionKey));
     secureZero(l.ephPriv, sizeof(l.ephPriv));
     l.haveKey = false;
+    l.keepalivePending = false;
+    l.keepaliveInterfaceGeneration = 0;
     l.state = State::Closed;
 }
 
 void RustLinkManager::endAll() {
     for (auto& l : _links) closeLink(l);
+}
+
+bool RustLinkManager::receiptBinding(uint8_t iface, const uint8_t linkId[16], uint8_t& slot,
+                                    uint32_t& generation) const {
+    for (uint8_t index = 0; index < MAX_LINKS; ++index) {
+        const auto& link = _links[index];
+        if (!receiptLive(index, _generations[index], iface) || memcmp(link.linkId, linkId, 16)) continue;
+        slot = index; generation = _generations[index]; return true;
+    }
+    return false;
+}
+
+bool RustLinkManager::receiptLive(uint8_t slot, uint32_t generation, uint8_t iface) const {
+    if (slot >= MAX_LINKS || !generation || _generations[slot] != generation) return false;
+    const auto& link = _links[slot];
+    return link.haveKey && link.iface == iface && link.state != State::Free && link.state != State::Closed;
+}
+
+const uint8_t* RustLinkManager::receiptPeer(uint8_t slot, uint32_t generation) const {
+    if (slot >= MAX_LINKS || !receiptLive(slot, generation, _links[slot].iface) || !_links[slot].initiator) return nullptr;
+    return _links[slot].peerDest;
 }
 
 bool RustLinkManager::frameToDest(uint8_t ifaceId, const uint8_t dest[16], uint8_t headerType,
@@ -171,7 +203,12 @@ bool RustLinkManager::ensureLink(const uint8_t dest[16], const uint8_t pubkey[64
         (_d.pump ? _d.pump->interfaceTxWaitMs(l->iface, 2) : 0);
     l->requestMs = millis();
     l->lastInboundMs = l->requestMs;
-    rs_handheld_rns_link_register(_d.ctx, linkId);
+    if (rs_handheld_rns_link_register(_d.ctx, linkId) != RS_HANDHELD_OK) {
+        secureZero(x25519, sizeof(x25519));
+        secureZero(ed25519, sizeof(ed25519));
+        closeLink(*l);
+        return false;
+    }
 
     // LINKREQUEST -> the destination (SINGLE), packet_type LINKREQUEST, context None.
     const bool accepted = frameToDest(l->iface, dest, route.header_type, route.next_hop, RustWire::PT_LINKREQUEST,
@@ -239,6 +276,49 @@ void RustLinkManager::sendTeardown(Link& l) {
     }
 }
 
+void RustLinkManager::queueKeepalive(Link& l) {
+    if (l.keepalivePending) return; // duplicate requests never renew a held echo
+    l.keepalivePending = true;
+    l.keepaliveAttempted = true;
+    l.keepaliveBornMs = _d.clock ? _d.clock->nowMs() : uint64_t(millis());
+    l.keepaliveInterfaceGeneration = _d.pump ? _d.pump->interfaceGeneration(l.iface) : 0;
+}
+
+void RustLinkManager::retryKeepalive(Link& l) {
+    if (!l.keepalivePending || !l.haveKey) return;
+    const uint64_t now = _d.clock ? _d.clock->nowMs() : uint64_t(millis());
+    if (now < l.keepaliveBornMs || now - l.keepaliveBornMs >= KEEPALIVE_QUEUE_WAIT_MS) {
+        l.keepalivePending = false;
+        Serial.println("[RUST-LINK] pending keepalive expired before admission");
+        return;
+    }
+    if (!_d.pump) return;
+    const uint32_t generation = _d.pump->interfaceGeneration(l.iface);
+    if (l.keepaliveInterfaceGeneration && generation != l.keepaliveInterfaceGeneration) {
+        l.keepalivePending = false;
+        Serial.println("[RUST-LINK] pending keepalive lost its interface");
+        return;
+    }
+    if (!generation) return;
+    l.keepaliveInterfaceGeneration = generation;
+    const uint8_t payload = l.initiator ? 0xFF : 0xFE;
+    uint8_t raw[20]; size_t length = 0;
+    if (rs_handheld_rns_packet_build(0, RustWire::PT_DATA, RustWire::DT_LINK,
+        RustWire::CTX_KEEPALIVE, nullptr, l.linkId, &payload, 1, raw, sizeof(raw),
+        &length) != RS_HANDHELD_OK || !length) return;
+    handheld::TxLease lease;
+    if (!_d.pump->captureLeaseAt(l.iface, raw, length, l.keepaliveBornMs,
+                                KEEPALIVE_QUEUE_WAIT_MS, lease)) return;
+    const uint32_t ownerGeneration = _generations[&l - _links];
+    const uint64_t born = l.keepaliveBornMs;
+    const bool admitted = _d.pump->sendLeased(raw, length, lease);
+    if (_generations[&l - _links] != ownerGeneration || !l.keepalivePending ||
+        l.keepaliveBornMs != born || l.state == State::Free || l.state == State::Closed ||
+        !admitted) return;
+    l.keepalivePending = false;
+    if (l.initiator) l.lastKeepaliveSentMs = millis();
+}
+
 void RustLinkManager::onLinkRequest(const rs_handheld_local_frame_t& f, uint8_t ifaceId) {
     if (!_d.ourDestHash) return;
     // Responder: a peer opened a link to our delivery dest.
@@ -277,8 +357,11 @@ void RustLinkManager::onLinkRequest(const rs_handheld_local_frame_t& f, uint8_t 
     l->hops = f.hops ? f.hops : 1;  // responder establishment timeout scales per Link.py:207
     l->requestMs = millis();
     l->lastInboundMs = l->requestMs;
-    memcpy(l->peerDest, _d.ourDestHash, 16);  // link addressed at our dest until identified
-    rs_handheld_rns_link_register(_d.ctx, linkId);
+    memcpy(l->peerDest, _d.ourDestHash, 16);  // responder routing placeholder, never an authenticated source
+    if (rs_handheld_rns_link_register(_d.ctx, linkId) != RS_HANDHELD_OK) {
+        closeLink(*l);
+        return;
+    }
     // LRPROOF is a PROOF packet (context Lrproof) addressed to the link_id.
     if (!frameToDest(l->iface, linkId, 0, nullptr, RustWire::PT_PROOF, RustWire::DT_LINK,
                      RustWire::CTX_LRPROOF, proof, proofLen)) { closeLink(*l); return; }
@@ -294,6 +377,7 @@ void RustLinkManager::onLinkData(Link& l, const rs_handheld_local_frame_t& f) {
         return;
     }
     l.lastInboundMs = millis();
+    if (l.initiator) l.keepalivePending = false; // peer activity makes an unsent request unnecessary
     if (l.state == State::Stale) l.state = State::Active;  // any inbound revives (Link.py:983-984)
 
     if (f.context == RustWire::CTX_LRRTT) {
@@ -318,8 +402,8 @@ void RustLinkManager::onLinkData(Link& l, const rs_handheld_local_frame_t& f) {
         // Responder echoes 0xFE to a 0xFF request, plaintext (Link.py:1149-1153,
         // Packet.py:205-208); an inbound 0xFE is liveness credit only.
         if (!l.initiator && f.payload_len == 1 && f.payload[0] == 0xFF) {
-            uint8_t resp = 0xFE;
-            sendLinkFrame(l, RustWire::CTX_KEEPALIVE, &resp, 1);
+            queueKeepalive(l);
+            retryKeepalive(l);
         }
         return;
     }
@@ -349,24 +433,22 @@ void RustLinkManager::onLinkData(Link& l, const rs_handheld_local_frame_t& f) {
         if (rs_handheld_rns_link_decrypt(l.sessionKey, f.payload, f.payload_len, pt, sizeof(pt),
                                          &ptLen) == RS_HANDHELD_OK &&
             _d.lxmf) {
-            const bool parsed = _d.lxmf->onDirectPayload(pt, ptLen);
+            RustIncomingDelivery::ReceiptSeed seed;
+            uint8_t raw[128]; size_t rawLen = 0;
             if (!l.initiator) {
-                if (parsed) {
-                    // PROVE_ALL parity (Link.py:986-1001): prove after cryptographic parse,
-                    // while valid duplicates/reactions still flip the sender's receipt.
-                    uint8_t proof[RS_HANDHELD_PROOF_MAX];
-                    size_t proofLen = 0;
-                    if (rs_handheld_rns_proof_build(_d.ctx, f.packet_hash, 0, proof,
-                                                    sizeof(proof), &proofLen) == RS_HANDHELD_OK) {
-                        frameToDest(l.iface, l.linkId, 0, nullptr, RustWire::PT_PROOF,
-                                    RustWire::DT_LINK, RustWire::CTX_NONE, proof, proofLen);
-                    }
-                }
-            } else {
-                // Initiator-role proof needs the ephemeral Ed25519 seed we zeroize at request
-                // build; Python LXMF never delivers toward the initiator. Log-if-seen.
-                Serial.println("[RUST-LINK] inbound data on initiator link (proof skipped)");
+                uint8_t proof[RS_HANDHELD_PROOF_MAX]; size_t proofLen = 0;
+                if (rs_handheld_rns_proof_build(_d.ctx, f.packet_hash, 0, proof,
+                    sizeof(proof), &proofLen) != RS_HANDHELD_OK ||
+                    rs_handheld_rns_packet_build(0, RustWire::PT_PROOF, RustWire::DT_LINK,
+                    RustWire::CTX_NONE, nullptr, l.linkId, proof, proofLen, raw, sizeof(raw),
+                    &rawLen) != RS_HANDHELD_OK || !rawLen) return;
             }
+            // Initiator-role packet proofs require a discarded ephemeral signing
+            // key; preserve the existing no-proof policy while still storing safely.
+            if (!_d.lxmf->incoming().captureSeed(seed,
+                l.initiator ? RustIncomingDelivery::Kind::NoProof : RustIncomingDelivery::Kind::LinkPacket,
+                l.iface, raw, rawLen, l.linkId)) return;
+            _d.lxmf->onDirectPayload(pt, ptLen, seed);
         }
     }
 }
@@ -399,6 +481,15 @@ void RustLinkManager::onLocalFrame(const rs_handheld_local_frame_t& f, uint8_t i
 
 bool RustLinkManager::sendLinkData(const uint8_t dest[16], const uint8_t* plaintext, size_t len,
                                    uint8_t* outHash) {
+    uint8_t raw[500]; size_t rawLength = 0;
+    if (!buildLinkDataPacket(dest, plaintext, len, raw, sizeof(raw), rawLength)) return false;
+    if (outHash) rs_handheld_rns_packet_hash(raw, rawLength, 0, outHash);
+    return _d.pump && _d.pump->sendTo(activeLinkIface(dest), raw, rawLength);
+}
+
+bool RustLinkManager::buildLinkDataPacket(const uint8_t dest[16], const uint8_t* plaintext, size_t len,
+    uint8_t* raw, size_t capacity, size_t& rawLength) {
+    rawLength = 0;
     Link* l = findByDest(dest);
     if (!l || l->state != State::Active || !l->haveKey) return false;
     uint8_t iv[16];
@@ -409,7 +500,8 @@ bool RustLinkManager::sendLinkData(const uint8_t dest[16], const uint8_t* plaint
         RS_HANDHELD_OK) {
         return false;
     }
-    return sendLinkFrame(*l, RustWire::CTX_NONE, enc, encLen, outHash);
+    return rs_handheld_rns_packet_build(0, RustWire::PT_DATA, RustWire::DT_LINK, RustWire::CTX_NONE,
+        nullptr, l->linkId, enc, encLen, raw, capacity, &rawLength) == RS_HANDHELD_OK && rawLength;
 }
 
 const uint8_t* RustLinkManager::activeLinkKey(const uint8_t dest[16]) const {
@@ -448,15 +540,20 @@ size_t RustLinkManager::activeCount() const {
 void RustLinkManager::loop() {
     unsigned long now = millis();
     for (auto& l : _links) {
+        if (l.state == State::Active || l.state == State::Stale || l.state == State::RespPending)
+            retryKeepalive(l);
         if (l.state == State::Active) {
             // Python watchdog (Link.py:786-810): baseline is last INBOUND/proof/activation.
             if (now - l.lastInboundMs >= l.keepaliveMs) {
                 // Only the initiator schedules keepalives, on the two-condition rule
                 // (quiet inbound AND quiet since our last 0xFF — Link.py:792-794).
-                if (l.initiator && now - l.lastKeepaliveSentMs >= l.keepaliveMs) {
-                    uint8_t ka = 0xFF;
-                    sendLinkFrame(l, RustWire::CTX_KEEPALIVE, &ka, 1);
-                    l.lastKeepaliveSentMs = now;
+                const uint64_t clockNow = _d.clock ? _d.clock->nowMs() : uint64_t(now);
+                if (l.initiator && !l.keepalivePending &&
+                    now - l.lastKeepaliveSentMs >= l.keepaliveMs &&
+                    (!l.keepaliveAttempted || (clockNow >= l.keepaliveBornMs &&
+                     clockNow - l.keepaliveBornMs >= l.keepaliveMs))) {
+                    queueKeepalive(l);
+                    retryKeepalive(l);
                 }
                 if (now - l.lastInboundMs >= l.staleTimeMs) {
                     l.state = State::Stale;

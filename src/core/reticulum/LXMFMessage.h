@@ -5,10 +5,12 @@
 #include <string>
 
 #include "util/Bytes.h"
+#include "storage/StorageContract.h"
 
 // Application and storage record; wire encoding lives in the Rust protocol library.
 // Preserve field meanings and the on-disk JSON schema when changing this type.
-enum class LXMFStatus : uint8_t { DRAFT = 0, QUEUED, SENDING, SENT, DELIVERED, FAILED };
+// Append new values: existing numeric statuses are persisted on disk.
+enum class LXMFStatus : uint8_t { DRAFT = 0, QUEUED, SENDING, SENT, DELIVERED, FAILED, UNCONFIRMED };
 
 struct LXMFMessage {
     rs::Bytes sourceHash;
@@ -27,6 +29,13 @@ struct LXMFMessage {
     uint32_t receiveCounter = 0;  // Monotonic receive order (used by Ratcom)
     rs::Bytes messageId;
 
+    // Transient view metadata only. Storage/wire codecs never serialize these
+    // fields; status above presents the desired fact while persistence retries.
+    LXMFStatus durableStatus = LXMFStatus::DRAFT;
+    handheld::storage::Error statusError = handheld::storage::Error::None;
+    bool statusPending = false;
+    bool txSuppressed = false;
+
     const char* statusStr() const {
         switch (status) {
             case LXMFStatus::DRAFT: return "DRAFT";
@@ -35,6 +44,7 @@ struct LXMFMessage {
             case LXMFStatus::SENT: return "SENT";
             case LXMFStatus::DELIVERED: return "DELIVERED";
             case LXMFStatus::FAILED: return "FAILED";
+            case LXMFStatus::UNCONFIRMED: return "UNCONFIRMED";
         }
         return "?";
     }

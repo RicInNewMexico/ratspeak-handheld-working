@@ -7,14 +7,34 @@ import argparse
 import hashlib
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 from source_fingerprint import source_fingerprint
+from release_identity import archive_inputs, check_workspace, load_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PREBUILT = ROOT / "protocol/prebuilt/xtensa-esp32s3"
 HEADER = ROOT / "protocol/include/ratspeak_protocol.h"
+
+
+def verify_exports(output: str, expected: set[str], profile: str) -> None:
+    # `nm -g` also lists undefined U references; a matching name alone proves
+    # nothing. Require exactly one strong text definition for every ABI function.
+    # Accept the optional Mach-O C prefix for native fixture archives.
+    definitions = Counter(re.findall(
+        r"^\s*[0-9a-fA-F]+\s+T\s+_?(rs_handheld_[A-Za-z0-9_]+)\s*$",
+        output, re.MULTILINE,
+    ))
+    missing = sorted(name for name in expected if definitions[name] == 0)
+    duplicate = sorted(name for name in expected if definitions[name] > 1)
+    unexpected = sorted(set(definitions) - expected)
+    if missing or duplicate or unexpected:
+        raise SystemExit(
+            f"{profile} archive C ABI definitions differ: missing={missing}, "
+            f"duplicate={duplicate}, unexpected={unexpected}"
+        )
 
 
 def main() -> int:
@@ -25,6 +45,7 @@ def main() -> int:
         help="allow development archives built with uncommitted Lite changes",
     )
     args = parser.parse_args()
+    check_workspace(ROOT, allow_dirty=args.allow_dirty)
 
     header = HEADER.read_text(encoding="utf-8")
     expected = set(re.findall(r"\b(rs_handheld_[A-Za-z0-9_]+)\s*\(", header))
@@ -34,8 +55,8 @@ def main() -> int:
             key, value = line.split(": ", 1)
             provenance[key] = value
 
-    if len(expected) != 88:
-        raise SystemExit(f"C ABI declaration count drifted: expected 88, found {len(expected)}")
+    if len(expected) != 99:
+        raise SystemExit(f"C ABI declaration count drifted: expected 99, found {len(expected)}")
 
     source_roots = {
         "rsReticulumLite": ROOT.parent / "rsReticulumLite",
@@ -63,6 +84,10 @@ def main() -> int:
     # without making the provenance depend on that commit's own identifier.
     if provenance.get("ratspeak-handheld.source-sha256") != source_fingerprint(ROOT):
         raise SystemExit("ratspeak-handheld archive provenance is stale: source fingerprint differs")
+    if provenance.get("source-graph-sha256") != archive_inputs(ROOT):
+        raise SystemExit("archive provenance is stale: selected Lite source graph fingerprint differs")
+    if provenance.get("toolchain") != load_identity(ROOT)["archive_toolchain"]:
+        raise SystemExit("archive toolchain differs from release identity")
 
     for profile in ("small", "micro"):
         archive = PREBUILT / profile / "libratspeak_protocol.a"
@@ -73,10 +98,7 @@ def main() -> int:
                 f"{profile} archive hash mismatch: provenance={recorded}, actual={digest}"
             )
         output = subprocess.check_output(["nm", "-g", str(archive)], text=True, errors="replace")
-        exported = {name for name in expected if re.search(rf"\b{name}$", output, re.MULTILINE)}
-        missing = sorted(expected - exported)
-        if missing:
-            raise SystemExit(f"{profile} archive is missing C ABI symbols: {', '.join(missing)}")
+        verify_exports(output, expected, profile)
 
     qualifier = ", dirty development provenance allowed" if args.allow_dirty else ""
     print(

@@ -119,6 +119,11 @@ pub unsafe extern "C" fn rs_handheld_rns_resource_advertise_build(
         if data.is_null() && data_len != 0 {
             return RsHandheldStatus::ErrInvalidArg;
         }
+        // SAFETY: live non-null context per the caller contract. Exhaustion is
+        // explicit; never reuse a generation while old driver bytes may exist.
+        if unsafe { &*ctx }.resource_generations[0] == u32::MAX {
+            return RsHandheldStatus::ErrCapacity;
+        }
         // SAFETY: non-null + correctly sized per the contract.
         let data = if data_len == 0 {
             &[][..]
@@ -151,7 +156,9 @@ pub unsafe extern "C" fn rs_handheld_rns_resource_advertise_build(
             }
         }
         // SAFETY: `ctx` valid per the contract.
-        unsafe { &mut *ctx }.resource_out = Some(out);
+        let ctx = unsafe { &mut *ctx };
+        ctx.resource_generations[0] += 1;
+        ctx.resource_out = Some(out);
         RsHandheldStatus::Ok
     })
 }
@@ -350,6 +357,11 @@ pub unsafe extern "C" fn rs_handheld_rns_resource_advertise_accept(
         {
             return RsHandheldStatus::ErrInvalidArg;
         }
+        // SAFETY: non-null context checked above; preserve any previous transfer
+        // and caller outputs when this finite generation space is exhausted.
+        if unsafe { &*ctx }.resource_generations[1] == u32::MAX {
+            return RsHandheldStatus::ErrCapacity;
+        }
         // SAFETY: non-null + correctly sized per the contract.
         let adv = unsafe { core::slice::from_raw_parts(adv, adv_len) };
         let parsed = match ResourceAdv::parse(adv) {
@@ -377,7 +389,9 @@ pub unsafe extern "C" fn rs_handheld_rns_resource_advertise_accept(
             }
         }
         // SAFETY: `ctx` valid per the contract.
-        unsafe { &mut *ctx }.resource_in = Some(inbound);
+        let ctx = unsafe { &mut *ctx };
+        ctx.resource_generations[1] += 1;
+        ctx.resource_in = Some(inbound);
         RsHandheldStatus::Ok
     })
 }

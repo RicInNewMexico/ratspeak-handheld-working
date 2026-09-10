@@ -3,6 +3,7 @@
 #include <lvgl.h>
 #include "runtime/RuntimeMetrics.h"
 #include "Theme.h"
+#include "LvFailureDisplay.h"
 
 // Double-buffered 10-line strips in PSRAM for DMA flush
 static lv_color_t* s_buf1 = nullptr;
@@ -28,7 +29,7 @@ bool Display::begin() {
     if (!initializeSharedSPIBus()) return false;
     SharedSPILock bus;
     if (!bus.locked()) return false;
-    _gfx.init();
+    if (!_gfx.init()) return false;
     _gfx.setRotation(3);  // Landscape: 480x222, keyboard-side down
     _gfx.setBrightness(0);
     _gfx.fillScreen(TFT_BLACK);
@@ -41,6 +42,7 @@ bool Display::begin() {
 
 bool Display::beginLVGL() {
     s_gfx = &_gfx;
+    handheld_lvgl_failure_display(handheld::showLvglFailure<LGFX_TPager>, s_gfx);
 
     lv_init();
 
@@ -55,6 +57,9 @@ bool Display::beginLVGL() {
 
     if (!s_buf1 || !s_buf2) {
         Serial.println("[LVGL] FATAL: buffer allocation failed!");
+        heap_caps_free(s_buf1);
+        heap_caps_free(s_buf2);
+        s_buf1 = s_buf2 = nullptr;
         return false;
     }
 
@@ -67,7 +72,13 @@ bool Display::beginLVGL() {
     disp_drv.ver_res = Theme::SCREEN_H;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+    if (!lv_disp_drv_register(&disp_drv)) {
+        Serial.println("[LVGL] FATAL: display registration failed!");
+        heap_caps_free(s_buf1);
+        heap_caps_free(s_buf2);
+        s_buf1 = s_buf2 = nullptr;
+        return false;
+    }
 
     Serial.printf("[LVGL] Display driver registered (%dx%d, double-buffered 20-line DMA)\n",
                   Theme::SCREEN_W, Theme::SCREEN_H);

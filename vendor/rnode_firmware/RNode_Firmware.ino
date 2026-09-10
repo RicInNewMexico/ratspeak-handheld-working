@@ -15,6 +15,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include "RatspeakBuildIdentity.h"
 #include "Utilities.h"
 #if BOARD_MODEL == BOARD_CARDPUTER_ADV
   #include "RsCardputerModeSwitch.h"
@@ -61,10 +62,6 @@ volatile bool serial_buffering = false;
 #endif
 
 char sbuf[128];
-
-#if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
-  bool packet_ready = false;
-#endif
 
 #if BOARD_MODEL == BOARD_TPAGER
   // XL9555 expander rail sequencing, replicated from the rsPager standalone
@@ -130,6 +127,13 @@ char sbuf[128];
 #endif
 
 void setup() {
+  #if BOARD_MODEL == BOARD_CARDPUTER_ADV
+    ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("cardputer", "rnode"));
+  #elif BOARD_MODEL == BOARD_TDECK
+    ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("tdeck", "rnode"));
+  #elif BOARD_MODEL == BOARD_TPAGER
+    ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("tpager", "rnode"));
+  #endif
   #if MCU_VARIANT == MCU_ESP32
     boot_seq();
     EEPROM.begin(EEPROM_SIZE);
@@ -448,10 +452,6 @@ inline void kiss_write_packet() {
   serial_write(FEND);
   host_write_len = 0;
 
-  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
-    packet_ready = false;
-  #endif
-
   #if MCU_VARIANT == MCU_ESP32
     #if HAS_BLE
       bt_flush();
@@ -459,18 +459,21 @@ inline void kiss_write_packet() {
   #endif
 }
 
-inline void getPacketData(uint16_t len) {
-  #if MCU_VARIANT != MCU_NRF52
-    while (len-- && read_len < MTU) {
-      pbuf[read_len++] = LoRa->read();
-    }  
-  #else
+inline bool getPacketData(uint16_t len) {
+  if (read_len > MTU || len > MTU - read_len) return false;
+  bool complete = true;
+  #if MCU_VARIANT == MCU_NRF52
     BaseType_t int_mask = taskENTER_CRITICAL_FROM_ISR();
-    while (len-- && read_len < MTU) {
-      pbuf[read_len++] = LoRa->read();
-    }
+  #endif
+  while (len--) {
+    const int value = LoRa->read();
+    if (value < 0) { complete = false; break; }
+    pbuf[read_len++] = static_cast<uint8_t>(value);
+  }
+  #if MCU_VARIANT == MCU_NRF52
     taskEXIT_CRITICAL_FROM_ISR(int_mask);
   #endif
+  return complete;
 }
 
 void ISR_VECT receive_callback(int packet_size) {
@@ -482,15 +485,21 @@ void ISR_VECT receive_callback(int packet_size) {
     Serial.printf("[RNODE] rx callback packet_size=%d promisc=%d\r\n", packet_size, promisc);
   #endif
 
+  if (packet_size <= (promisc ? 0 : HEADER_L) || packet_size > SINGLE_MTU) {
+    read_len = 0; seq = SEQ_UNSET; return;
+  }
+  expirePartialPacket();
+  bool ready = false;
   if (!promisc) {
     // The standard operating mode allows large
     // packets with a payload up to 500 bytes,
     // by combining two raw LoRa packets.
     // We read the 1-byte header and extract
     // packet sequence number and split flags
-    uint8_t header   = LoRa->read(); packet_size--;
+    const int value = LoRa->read();
+    if (value < 0) { read_len = 0; seq = SEQ_UNSET; return; }
+    uint8_t header = static_cast<uint8_t>(value); packet_size--;
     uint8_t sequence = packetSequence(header);
-    bool    ready    = false;
 
     if (isSplitPacket(header) && seq == SEQ_UNSET) {
       // This is the first part of a split
@@ -503,13 +512,14 @@ void ISR_VECT receive_callback(int packet_size) {
       #endif
       
       seq = sequence;
+      rememberPartialPacket();
 
       #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
         last_rssi = LoRa->packetRssi();
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
 
-      getPacketData(packet_size);
+      if (!getPacketData(packet_size)) { read_len = 0; seq = SEQ_UNSET; return; }
 
     } else if (isSplitPacket(header) && seq == sequence) {
       // This is the second part of a split
@@ -520,7 +530,7 @@ void ISR_VECT receive_callback(int packet_size) {
         last_snr_raw = (last_snr_raw+LoRa->packetSnrRaw())/2;
       #endif
 
-      getPacketData(packet_size);
+      if (!getPacketData(packet_size)) { read_len = 0; seq = SEQ_UNSET; return; }
       seq = SEQ_UNSET;
       ready = true;
 
@@ -535,13 +545,14 @@ void ISR_VECT receive_callback(int packet_size) {
         read_len = 0;
       #endif
       seq = sequence;
+      rememberPartialPacket();
 
       #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
         last_rssi = LoRa->packetRssi();
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
 
-      getPacketData(packet_size);
+      if (!getPacketData(packet_size)) { read_len = 0; seq = SEQ_UNSET; return; }
 
     } else if (!isSplitPacket(header)) {
       // This is not a split packet, so we
@@ -564,84 +575,91 @@ void ISR_VECT receive_callback(int packet_size) {
         last_snr_raw = LoRa->packetSnrRaw();
       #endif
 
-      getPacketData(packet_size);
+      if (!getPacketData(packet_size)) { read_len = 0; seq = SEQ_UNSET; return; }
       ready = true;
     }
 
-    if (ready) {
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
-        // We first signal the RSSI of the
-        // recieved packet to the host.
-        kiss_indicate_stat_rssi();
-        kiss_indicate_stat_snr();
-
-        // And then write the entire packet
-        host_write_len = read_len;
-        kiss_write_packet(); read_len = 0;
-      
-      #else
-        // Allocate packet struct, but abort if there
-        // is not enough memory available.
-        modem_packet_t *modem_packet = (modem_packet_t*)malloc(sizeof(modem_packet_t) + read_len);
-        if(!modem_packet) { memory_low = true; return; }
-
-        // Get packet RSSI and SNR
-        #if MCU_VARIANT == MCU_ESP32
-          modem_packet->snr_raw = LoRa->packetSnrRaw();
-          modem_packet->rssi = LoRa->packetRssi(modem_packet->snr_raw);
-        #endif
-
-        // Send packet to event queue, but free the
-        // allocated memory again if the queue is
-        // unable to receive the packet.
-        modem_packet->len = read_len;
-        memcpy(modem_packet->data, pbuf, read_len); read_len = 0;
-        #if BOARD_MODEL == BOARD_TDECK
-        if (!modem_packet_queue || xQueueSend(modem_packet_queue, &modem_packet, 0) != pdPASS) {
-            #if RNODE_TDECK_DIAG
-            Serial.println("[RNODE] rx queue failed");
-            #endif
-            free(modem_packet);
-        } else {
-            #if RNODE_TDECK_DIAG
-            Serial.printf("[RNODE] rx queued len=%u rssi=%d snr_raw=%u\r\n", modem_packet->len, modem_packet->rssi, modem_packet->snr_raw);
-            #endif
-        }
-        #else
-        if (!modem_packet_queue || xQueueSendFromISR(modem_packet_queue, &modem_packet, NULL) != pdPASS) {
-            free(modem_packet);
-        }
-        #endif
-      #endif
-    }  
   } else {
-    // In promiscuous mode, raw packets are
-    // output directly to the host
+    // Raw frames use the same completed-packet owner as ordinary frames.
     read_len = 0;
-
+    seq = SEQ_UNSET;
     #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
       last_rssi = LoRa->packetRssi();
       last_snr_raw = LoRa->packetSnrRaw();
-      getPacketData(packet_size);
+    #endif
+    if (!getPacketData(packet_size)) { read_len = 0; return; }
+    ready = true;
+  }
 
+  if (ready) {
+    #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
       // We first signal the RSSI of the
       // recieved packet to the host.
       kiss_indicate_stat_rssi();
       kiss_indicate_stat_snr();
 
       // And then write the entire packet
-      kiss_write_packet();
-
+      host_write_len = read_len;
+      kiss_write_packet(); read_len = 0;
+    
     #else
-      getPacketData(packet_size);
-      packet_ready = true;
+      // Allocate packet struct, but abort if there
+      // is not enough memory available.
+      modem_packet_t *modem_packet = (modem_packet_t*)malloc(sizeof(modem_packet_t) + read_len);
+      if(!modem_packet) { memory_low = true; read_len = 0; return; }
+
+      // Get packet RSSI and SNR
+      #if MCU_VARIANT == MCU_ESP32
+        modem_packet->snr_raw = LoRa->packetSnrRaw();
+        modem_packet->rssi = LoRa->packetRssi(modem_packet->snr_raw);
+        #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+          if (LoRa->ioFailed()) { free(modem_packet); read_len = 0; seq = SEQ_UNSET; return; }
+        #endif
+      #endif
+
+      // Send packet to event queue, but free the
+      // allocated memory again if the queue is
+      // unable to receive the packet.
+      modem_packet->len = read_len;
+      memcpy(modem_packet->data, pbuf, read_len); read_len = 0;
+      #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
+      if (!modem_packet_queue || xQueueSend(modem_packet_queue, &modem_packet, 0) != pdPASS) {
+          #if RNODE_TDECK_DIAG
+          Serial.println("[RNODE] rx queue failed");
+          #endif
+          free(modem_packet);
+      } else {
+          #if RNODE_TDECK_DIAG
+          Serial.printf("[RNODE] rx queued len=%u rssi=%d snr_raw=%u\r\n", modem_packet->len, modem_packet->rssi, modem_packet->snr_raw);
+          #endif
+      }
+      #else
+      if (!modem_packet_queue || xQueueSendFromISR(modem_packet_queue, &modem_packet, NULL) != pdPASS) {
+          free(modem_packet);
+      }
+      #endif
     #endif
   }
 }
 
 bool startRadio() {
+  const auto configured = []() {
+    #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+      if (LoRa->ioFailed()) {
+        radio_online = false;
+        radio_error = true;
+        LoRa->end();
+        kiss_indicate_error(ERROR_INITRADIO);
+        kiss_indicate_radiostate();
+        led_indicate_error(0);
+        return false;
+      }
+    #endif
+    return true;
+  };
   update_radio_lock();
   if (!radio_online && !console_active) {
+    resetPartialPacket();
     if (!radio_locked && hw_ready) {
       #if BOARD_MODEL == BOARD_TDECK && RNODE_TDECK_DIAG
         Serial.printf("[RNODE] startRadio freq=%ld bw=%ld sf=%d cr=%d txp=%d\r\n", lora_freq, lora_bw, lora_sf, lora_cr, lora_txp);
@@ -671,6 +689,7 @@ bool startRadio() {
         LoRa->enableCrc();
         LoRa->onReceive(receive_callback);
         lora_receive();
+        if (!configured()) return false;
 
         // Flash an info pattern to indicate
         // that the radio is now on
@@ -695,13 +714,17 @@ bool startRadio() {
     // If radio is already on, re-arm receive. Host reconnects normally replay
     // radio parameters before RADIO_STATE=ON; SX1262 reconfiguration uses
     // standby, so the final ON command must put the modem back in RX.
-    if (radio_online && !console_active) { lora_receive(); }
+    if (radio_online && !console_active) {
+      lora_receive();
+      if (!configured()) return false;
+    }
     kiss_indicate_radiostate();
     return true;
   }
 }
 
 void stopRadio() {
+  resetPartialPacket();
   if (!radio_online) return;
   #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER
     radio_online = false;
@@ -741,6 +764,9 @@ bool queue_full() { return (queue_height >= CONFIG_QUEUE_MAX_LENGTH || queued_by
 
 volatile bool queue_flushing = false;
 void flush_queue(void) {
+  #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+    SerialBT.pollSession();
+  #endif
   if (!queue_flushing) {
     queue_flushing = true;
     led_tx_on();
@@ -754,6 +780,10 @@ void flush_queue(void) {
     while (!fifo16_isempty_locked(&packet_starts)) {
     #endif
 
+      #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+        SerialBT.pollSession();
+        if (fifo16_isempty(&packet_starts)) break;
+      #endif
       uint16_t start = fifo16_pop(&packet_starts);
       uint16_t length = fifo16_pop(&packet_lengths);
 
@@ -785,6 +815,9 @@ void flush_queue(void) {
 }
 
 void pop_queue() {
+  #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+    SerialBT.pollSession();
+  #endif
   if (!queue_flushing) {
     queue_flushing = true; led_tx_on();
     #if BOARD_MODEL == BOARD_TDECK && RNODE_TDECK_DIAG
@@ -827,6 +860,11 @@ void pop_queue() {
 
 void add_airtime(uint16_t written) {
   #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+      // Use the programmed physical frame, including rounded symbol groups.
+      // Completed-frame bin attribution remains the existing RNode policy.
+      const uint32_t packet_cost_ms = LoRa->getAirtime(written);
+    #else
     float lora_symbols = 0;
     float packet_cost_ms = 0.0;
     int ldr_opt = 0; if (lora_low_datarate) ldr_opt = 1;
@@ -854,6 +892,8 @@ void add_airtime(uint16_t written) {
         packet_cost_ms += lora_symbols * lora_symbol_time_ms;
       }
     
+    #endif
+
     #endif
 
     uint16_t cb = current_airtime_bin();
@@ -932,7 +972,8 @@ void transmit(uint16_t size) {
       if (!implicit) { LoRa->beginPacket(); }
       else           { LoRa->beginPacket(size); }
       for (uint16_t i=0; i < size; i++) { LoRa->write(tbuf[i]); written++; }
-      LoRa->endPacket(); add_airtime(written);
+      if (!LoRa->endPacket()) { handleModemTimeout(); return; }
+      add_airtime(written);
     }
 
   } else { kiss_indicate_error(ERROR_TXFAILED); led_indicate_error(5); }
@@ -1852,8 +1893,13 @@ void tx_queue_handler() {
 void work_while_waiting() { loop(); }
 
 void loop() {
+  #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+    SerialBT.pollSession();
+  #endif
+  expirePartialPacket();
   if (radio_online) {
-    #if MODEM == SX1262 && BOARD_MODEL == BOARD_TDECK
+    #if MODEM == SX1262 && (BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV)
+      if (LoRa->ioFailed()) { handleModemTimeout(); return; }
       LoRa->serviceInterrupt();
     #endif
 
@@ -2065,6 +2111,23 @@ void button_event(uint8_t event, unsigned long duration) {
   #endif
 }
 
+#if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+// Sketch-owner retirement only. CMD_DATA writes directly into packet_queue
+// before its closing FEND, so its partial cursor and completed old-host work
+// must retire with the serial FIFO/decoder. An active synchronous TX may finish.
+void retire_ble_serial_session() {
+  fifo_init(&serialFIFO, serialBuffer, CONFIG_UART_BUFFER_SIZE);
+  IN_FRAME = false; ESCAPE = false; frame_len = 0; command = CMD_UNKNOWN;
+  fifo16_init(&packet_starts, packet_starts_buf, CONFIG_QUEUE_MAX_LENGTH);
+  fifo16_init(&packet_lengths, packet_lengths_buf, CONFIG_QUEUE_MAX_LENGTH);
+  queue_height = 0; queued_bytes = 0; queue_cursor = 0; current_packet_start = 0;
+  if (modem_packet_queue) {
+    modem_packet_t *packet = nullptr;
+    while (xQueueReceive(modem_packet_queue, &packet, 0) == pdTRUE) free(packet);
+  }
+}
+#endif
+
 volatile bool serial_polling = false;
 void serial_poll() {
   serial_polling = true;
@@ -2074,6 +2137,10 @@ void serial_poll() {
   #else
   while (!fifo_isempty(&serialFIFO)) {
   #endif
+    #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+      SerialBT.pollSession();
+      if (fifo_isempty(&serialFIFO)) break;
+    #endif
     char sbyte = fifo_pop(&serialFIFO);
     serial_callback(sbyte);
   }
@@ -2087,6 +2154,9 @@ void serial_poll() {
   #define MAX_CYCLES 10
 #endif
 void buffer_serial() {
+  #if MCU_VARIANT == MCU_ESP32 && HAS_BLE && !HAS_BLUETOOTH
+    SerialBT.pollSession();
+  #endif
   if (!serial_buffering) {
     serial_buffering = true;
 
@@ -2110,7 +2180,9 @@ void buffer_serial() {
       #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
         if (!fifo_isfull_locked(&serialFIFO)) { fifo_push_locked(&serialFIFO, Serial.read()); }
       #elif HAS_BLUETOOTH || HAS_BLE == true || HAS_WIFI
-        if      (bt_state == BT_STATE_CONNECTED) { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, SerialBT.read()); } }
+        if      (bt_state == BT_STATE_CONNECTED) {
+          if (!fifo_isfull(&serialFIFO)) { int value = SerialBT.read(); if (value >= 0) fifo_push(&serialFIFO, value); }
+        }
         #if HAS_WIFI
         else if (wifi_host_is_connected())       { if (!fifo_isfull(&serialFIFO)) { fifo_push(&serialFIFO, wifi_remote_read()); } }
         #endif

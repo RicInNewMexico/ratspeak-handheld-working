@@ -28,7 +28,7 @@ bool WiFiInterface::isSTAConnected() const {
     return WiFi.status() == WL_CONNECTED;
 }
 
-void WiFiInterface::startAP() {
+bool WiFiInterface::startAP() {
     // Generate SSID from chip ID if not set
     if (_apSSID.isEmpty()) {
         uint32_t chip = ESP.getEfuseMac() & 0xFFFF;
@@ -38,8 +38,11 @@ void WiFiInterface::startAP() {
     }
 
     // AP-only mode — saves ~20KB vs WIFI_AP_STA
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(_apSSID.c_str(), _apPassword.c_str());
+    if (!WiFi.mode(WIFI_AP) || !WiFi.softAP(_apSSID.c_str(), _apPassword.c_str())) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
 
     Serial.printf("[WIFI] AP started: %s @ %s\n",
                   _apSSID.c_str(),
@@ -47,10 +50,14 @@ void WiFiInterface::startAP() {
 
     _server.begin();
     _apActive = true;
+    return true;
 }
 
 bool WiFiInterface::start() {
-    startAP();
+    if (_online) return true;
+    if (_generation == UINT32_MAX) return false;
+    ++_generation;
+    if (!_txBuffer || !startAP()) return false;
     _online = true;
     return true;
 }
@@ -163,27 +170,8 @@ std::vector<WiFiInterface::ScanResult> WiFiInterface::scanNetworks(int maxResult
         Serial.printf("[WIFI] Scan poll result: %d\n", n);
     }
 
-    if (n > 0) {
-        for (int i = 0; i < n; i++) {
-            String ssid = WiFi.SSID(i);
-            if (ssid.isEmpty()) continue;
-            int rssi = WiFi.RSSI(i);
-            bool enc = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-            bool found = false;
-            for (auto& r : results) {
-                if (r.ssid == ssid) {
-                    if (rssi > r.rssi) r.rssi = rssi;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) results.push_back({ssid, rssi, enc});
-        }
-        WiFi.scanDelete();
-        std::sort(results.begin(), results.end(),
-                  [](const ScanResult& a, const ScanResult& b) { return a.rssi > b.rssi; });
-        if ((int)results.size() > maxResults) results.resize(maxResults);
-    }
+    if (n >= 0) results = getScanResults(maxResults);
+    WiFi.scanDelete();
 
     // Restore previous WiFi mode
     if (prevMode == WIFI_OFF) {
@@ -218,25 +206,29 @@ std::vector<WiFiInterface::ScanResult> WiFiInterface::getScanResults(int maxResu
     int n = WiFi.scanComplete();
     if (n <= 0) return results;
 
-    for (int i = 0; i < n; i++) {
+    // Bound our copy independently of the SDK-owned scan list. Keep the
+    // strongest unique names without first allocating one row per AP.
+    const size_t capacity = static_cast<size_t>(std::max(0, std::min(maxResults, 15)));
+    results.reserve(capacity);
+    for (int i = 0; i < n && capacity; ++i) {
         String ssid = WiFi.SSID(i);
         if (ssid.isEmpty()) continue;
-        int rssi = WiFi.RSSI(i);
-        bool enc = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-        bool found = false;
-        for (auto& r : results) {
-            if (r.ssid == ssid) {
-                if (rssi > r.rssi) r.rssi = rssi;
-                found = true;
-                break;
-            }
+        const int rssi = WiFi.RSSI(i);
+        const bool encrypted = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        auto same = std::find_if(results.begin(), results.end(),
+            [&](const ScanResult& row) { return row.ssid == ssid; });
+        if (same != results.end()) {
+            if (rssi > same->rssi) { same->rssi = rssi; same->encrypted = encrypted; }
+        } else if (results.size() < capacity) {
+            results.push_back({ssid, rssi, encrypted});
+        } else {
+            auto weakest = std::min_element(results.begin(), results.end(),
+                [](const ScanResult& a, const ScanResult& b) { return a.rssi < b.rssi; });
+            if (rssi > weakest->rssi) *weakest = {ssid, rssi, encrypted};
         }
-        if (!found) results.push_back({ssid, rssi, enc});
     }
-    WiFi.scanDelete();
     std::sort(results.begin(), results.end(),
               [](const ScanResult& a, const ScanResult& b) { return a.rssi > b.rssi; });
-    if ((int)results.size() > maxResults) results.resize(maxResults);
     Serial.printf("[WIFI] Async scan: %d networks found\n", (int)results.size());
     return results;
 }

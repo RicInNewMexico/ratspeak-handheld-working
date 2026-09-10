@@ -10,10 +10,7 @@
 #define BOARD_CONFIRM_INPUT_NAME "enter"
 #define BOARD_DEFAULT_BRIGHTNESS 100
 
-#define RSDECK_VERSION_MAJOR  2
-#define RSDECK_VERSION_MINOR  1
-#define RSDECK_VERSION_PATCH  0
-#define RSDECK_VERSION_STRING "2.1.0"
+#include "config/FirmwareVersion.h"
 #define BOARD_RELEASE_REPO    "ratspeak/ratspeak-handheld"
 #define HAS_CONTACT_RENAME    false
 
@@ -56,9 +53,8 @@
 #define BOARD_DEFAULT_AUTOIFACE_MAX_PEERS 4
 #define STORAGE_ASYNC_WRITES         1      // WriteQueue task defers 0.5-4s LittleFS writes
 #define USERCONFIG_NVS_BACKUP        1      // Tier-3 full-JSON config copy in NVS
-#define TCP_SHARED_BUFFERS           1      // One static buffer set (~18KB heap at 4 conns)
 #define LEGACY_READ_CTR_MIGRATION    1      // One-time .read_ctr -> read:true rewrite
-#define LEGACY_MSG_FILENAME_MIGRATION 1     // Pre-2.0 filename rename pass (!fs_migrated)
+#define LEGACY_MSG_FILENAME_MIGRATION 1     // Pre-2.0 filenames; scan every available medium at boot
 #define LEGACY_GPS_LOC_MIGRATION     1      // Donor v2.0.3 wrote gps_loc
 #define ANNOUNCE_MAX_NODES           50
 #define ANNOUNCE_MAX_NAME_CACHE      60

@@ -7,7 +7,7 @@
 #include <freertos/task.h>
 #include <functional>
 #include <atomic>
-#include <string>
+#include <cstddef>
 
 class TCPClientInterface {
 public:
@@ -16,14 +16,17 @@ public:
 
     bool start();
     void stop();
-    void loop();
+    // Caller supplies the remaining round allowance. Byte and frame caps also
+    // bound work when the clock does not advance. Partial RX is connection-owned.
+    void loop(unsigned long budgetMs = 25, size_t byteBudget = 1024);
 
     bool isConnected() {
-        if (_connectState == CS_CONNECTING) return false;
+        if (!reapConnectTask()) return false;
         return _client.connected();
     }
-    bool canDestroy() const { return _connectState != CS_CONNECTING; }
-    const String& host() const { return _host; }
+    bool canDestroy() { return reapConnectTask(); }
+    uint32_t generation() const { return _generation; }
+    const char* host() const { return _host; }
     uint16_t port() const { return _port; }
 
     // Raw-frame seam for the backend pump: HDLC-deframed RX frames go to
@@ -36,12 +39,13 @@ private:
     bool send_outgoing(const uint8_t* data, size_t len);
     void tryConnect();
     bool sendFrame(const uint8_t* data, size_t len);
-    int readFrame();
+    int readFrame(unsigned long start, unsigned long budgetMs, size_t& bytesLeft);
     static void connectTaskFn(void* arg);
+    bool reapConnectTask();
     void waitForConnectTask();
 
     // WiFiClient::connect() blocks. Run it in a one-shot task and let the
-    // main loop claim the result before touching _client again.
+    // owner reclaim the permanently suspended task before claiming its result.
     enum ConnectState : uint8_t {
         CS_IDLE       = 0,
         CS_CONNECTING = 1,
@@ -52,28 +56,24 @@ private:
     TaskHandle_t _connectTask = nullptr;
 
     RawSink _rawSink;
-    std::string _name;
+    char _name[32] = {};
+    bool _valid = false;
     std::atomic<bool> _online{false};
+    uint32_t _generation = 0; // owner-only; advances before every socket attempt
 
     WiFiClient _client;
-    String _host;
+    char _host[254] = {};
     uint16_t _port;
     unsigned long _lastAttempt = 0;
     unsigned long _lastRxTime = 0;
-#if TCP_SHARED_BUFFERS
-    // One static buffer set for all connections — main loop drives them
-    // sequentially; saves ~6KB internal heap per extra connection (no PSRAM)
-    static uint8_t* _rxBuffer;
-    static uint8_t* _txBuffer;
-    static uint8_t* _wrapBuffer;
-    static bool _buffersAllocated;
-#else
-    uint8_t* _rxBuffer = nullptr;
-    uint8_t* _txBuffer = nullptr;    // PSRAM-allocated send frame buffer
-    uint8_t* _wrapBuffer = nullptr;  // PSRAM-allocated packet rewrite buffer
-#endif
-    static constexpr size_t RX_BUFFER_SIZE = 2048;
-    static constexpr size_t TX_BUFFER_SIZE = RX_BUFFER_SIZE * 2 + 2;
+    // The Rust pump accepts a 500-byte RNS frame. Each connection owns its
+    // partial frame; only synchronous TX scratch is shared by the protocol owner.
+    static constexpr size_t RX_BUFFER_SIZE = 500;
+    static constexpr size_t WRAP_BUFFER_SIZE = RX_BUFFER_SIZE + 16;
+    static constexpr size_t TX_BUFFER_SIZE = WRAP_BUFFER_SIZE * 2 + 2;
+    uint8_t _rxBuffer[RX_BUFFER_SIZE] = {};
+    static uint8_t _txBuffer[TX_BUFFER_SIZE];
+    static uint8_t _wrapBuffer[WRAP_BUFFER_SIZE];
 
     // Exponential reconnect backoff: 1s → ×2 (+0-20% jitter) → 5min cap
     unsigned long _reconnectBackoff = 1000;
@@ -95,7 +95,6 @@ private:
     static constexpr uint8_t FRAME_ESC   = 0x7D;
     static constexpr uint8_t FRAME_XOR   = 0x20;
     static constexpr unsigned long TCP_KEEPALIVE_TIMEOUT_MS = 300000; // 5 min
-    static constexpr unsigned long TCP_LOOP_BUDGET_MS = 25;
 
 public:
     unsigned long lastRxTime() const { return _lastRxTime; }

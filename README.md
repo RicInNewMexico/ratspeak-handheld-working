@@ -12,21 +12,25 @@
 
 </div>
 
-Ratspeak Handheld combines [rsDeck](https://github.com/ratspeak/rsDeck),
-[rsPager](https://github.com/ratspeak/rsPager), and
-[rsCardputer](https://github.com/ratspeak/rsCardputer) in one repo.
-The Reticulum and LXMF core is now written in Rust, replacing
-our half-baked microReticulum fork. Over time, this repo will evolve to support more handheld devices, but is intentionally slim during the first beta rollout.
+Ratspeak Handheld is shared firmware for Reticulum/LXMF messaging on the
+T-Deck Plus, T-Pager and Cardputer Adv. Its Rust core uses rsReticulumLite and
+rsLXMFLite, with shared C++ storage, transport and device services. T-Deck and
+T-Pager share the LVGL interface; Cardputer uses a compact Canvas interface.
+
+**Candidate documentation:** this source tree describes the next unified
+candidate. Published beta builds may differ. Check the selected release's notes;
+these instructions do not mean the candidate has been published or hardware-qualified.
 
 ## Devices
 
-| Device | Release |
-| --- |  --- |
-| LilyGo T-Deck Plus | Beta |
-| LilyGo T-Pager | Beta |
-| M5Stack Cardputer Adv* | In Testing |
+| Device | Display and controls | Radio |
+| --- | --- | --- |
+| LilyGO T-Deck Plus | 320×240, keyboard, trackball and touch | Integrated LoRa |
+| LilyGO T-Pager (SX1262) | 480×222, keyboard and scroll encoder | Integrated LoRa |
+| M5Stack Cardputer Adv | 240×135, keyboard | **Cap LoRa-1262 required for LoRa** |
 
-*Cardputer Adv requires the Cap LoRa-1262 for LoRa connectivity.
+Cardputer support remains beta. An SD card is optional for normal messaging on
+all three boards. Use hardware and an antenna suited to your operating band.
 
 ## Modes
 
@@ -35,19 +39,44 @@ The firmware supports two different modes, available at each startup:
 - **Standalone** — all-in-one encrypted LXMF messaging over LoRa or Wi-Fi.
 - **RNode** — radio for Ratspeak, Sideband, or another Reticulum client.
 
+The launcher starts your last selected mode after seven seconds. Using the
+controls stops the countdown; select a mode and confirm with Enter or a click.
+On T-Deck, tap the other card to select it; tap the selected card to start. If a mode cannot
+start, the launcher shows an error and lets you try again.
 
+## Controls and messaging
+
+On T-Deck, use the trackball or touch. On T-Pager, turn the encoder to move,
+click or press Enter to select, and use Backspace to return to tab navigation.
+Under **Settings → LoRa**, unlock **Developer Radio Controls** as prompted.
+In **Frequency**, **A/D** selects a digit, the encoder tunes it, **Enter** saves
+and **Alt+Backspace** cancels. No touch or horizontal encoder is required.
+Cardputer uses **Fn+arrows**, **Enter**, **Fn+`** to go back, and **Ctrl+H** for help.
+
+A send first saves the message; `sent` means transmission started, while
+`delivered` requires a verified delivery proof. A separate `save retry` or
+`storage error` can appear even after delivery. See the
+[handheld guide](https://docs.ratspeak.org/docs/hardware/handheld-guide) for
+controls, history, status labels and recovery.
 
 ## Install
 
 For a fresh installation, use your device's `*-full.zip` package from
 [Releases](https://github.com/ratspeak/ratspeak-handheld/releases) or a local
 build. Open the [Ratspeak web flasher](https://ratspeak.org/download.html#dl-custom),
-choose **Flash** under **Build your own**, and upload the `.zip`.
+choose **Flash** under **Build your own**, and upload the `.zip`. Check the
+selected board, source repository and version; automatic download presets may
+point to an earlier release.
 
 Full packages include the launcher and both modes; they are not data-preserving
 updates. **Back up your identity and data before flashing**; see the
 [backup and installation guide](https://docs.ratspeak.org/docs/hardware/flashing-firmware#before-flashing)
 if your device already has firmware installed.
+
+Raw application BINs preserve data only when written to the matching application
+slot without erasing flash or changing the partition table. The correct slot
+depends on the installed layout; a raw BIN is not a replacement for a full
+installation package. Back up first when changing layouts or firmware modes.
 
 On the T-Pager, the buttons are **Reset**, **Boot**, and **Power**, left to right
 with the screen facing you. Reset restarts the device; in Standalone, tap Boot
@@ -71,7 +100,12 @@ make package DEVICE=tdeck
 ```
 
 Use `DEVICE=tpager` or `DEVICE=cardputer` for the other boards. Packaging builds
-the launcher and both modes, checks image sizes, and writes the files to `dist/`.
+the launcher and both modes, validates their identities and installation layout,
+and writes the files to `dist/`.
+
+RNode mode automatically refreshes its stored image hash to allow custom builds
+and upgrades. That bookkeeping does not authenticate firmware. Check downloaded
+packages against the release checksums and use a source you trust.
 
 Normal builds use the included Rust libraries; a Rust toolchain is not needed.
 Shared firmware lives in `src/core/`, board support in `src/boards/`, user
@@ -79,8 +113,8 @@ interfaces in `src/ui/`, and the Rust protocol bridge in `protocol/`.
 Run `make check DEVICE=tdeck` to check a build, or `make check-all` for all boards.
 
 For Rust development, keep `rsReticulumLite`, `rsLXMFLite`, `rsReticulum`, and
-`rsLXMF` beside this checkout, using the revisions in the
-[build workflow](.github/workflows/build.yml). Run `make protocol-check` for host
+`rsLXMF` beside this checkout, using the selected revisions in
+[`tools/release_identity.json`](tools/release_identity.json). Run `make protocol-check` for host
 and cross-target checks. To rebuild the included libraries, install esp-rs
 1.95.0.0 and run `bash protocol/build-xtensa.sh`; its locked dependencies must
 already be cached. The script records source revisions and hashes in

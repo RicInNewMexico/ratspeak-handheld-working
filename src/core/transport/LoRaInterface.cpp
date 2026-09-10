@@ -1,9 +1,13 @@
 #include "LoRaInterface.h"
+#include "runtime/ResourceBudget.h"
 #include "config/BoardConfig.h"
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
 #include <string.h>
+
+static_assert(sizeof(LoRaInterface) <= handheld::ResourceBudget::LoRaRetainedBytes,
+              "LoRa fixed payload, lease, RX and driver state must fit the adopted budget");
 
 // RNode on-air framing constants (from RNode_Firmware Framing.h / Config.h)
 // Every LoRa packet has a 1-byte header: upper nibble = random sequence, lower nibble = flags
@@ -13,8 +17,9 @@
 #define RNODE_SINGLE_MTU    (MAX_PACKET_SIZE - RNODE_HEADER_L)  // 254 bytes payload per frame
 
 LoRaInterface::LoRaInterface(SX1262* radio, const char* name)
-    : _name(name ? name : "LoRaInterface"), _radio(radio)
+    : _radio(radio)
 {
+    snprintf(_name, sizeof(_name), "%s", name ? name : "LoRaInterface");
     refreshRadioTiming(true);
 }
 
@@ -23,58 +28,184 @@ LoRaInterface::~LoRaInterface() {
 }
 
 bool LoRaInterface::start() {
+    if (_changingOwner || _notifying) return false;
+    if (_online) return !_maintenance;
+    if (_generation == UINT32_MAX) return false;
     if (!_radio || !_radio->isRadioOnline()) {
         Serial.println("[LORA_IF] Radio not available");
         _online = false;
         return false;
     }
     _online = true;
+    _maintenance = _maintenanceTxFailed = false;
+    _reconfigurePending = false;
+    ++_generation;
     refreshRadioTiming(true);
     _radio->receive();
+    if (!_radio->isRadioOnline()) { stop(); return false; }
     Serial.println("[LORA_IF] Interface started (split-packet enabled, MTU=500)");
     return true;
 }
 
 void LoRaInterface::stop() {
     _online = false;
-    _txQueue.clear();
-    _txData.clear();
-    _splitTxRemaining.clear();
-    _splitRxBuffer.clear();
+    _reconfigurePending = false;
+    const bool changing = _changingOwner;
+    _changingOwner = true;
+    while (_txCount) removeQueued(0, handheld::TxReceiptEvent::Dropped, "interface stopped");
+    _txLength = 0;
+    _splitRxLength = 0;
     _txPending = _splitTxPending = _splitRxPending = false;
     _pacingActive = false;
+    _changingOwner = changing;
     Serial.println("[LORA_IF] Interface stopped");
 }
 
-bool LoRaInterface::send_outgoing(const uint8_t* rawData, size_t rawLen) {
-    if (!_online || !_radio || !rawData || rawLen == 0) return false;
+void LoRaInterface::beginMaintenance() {
+    if (_maintenance) return;
+    // Set the gate before returning any receipt: callbacks may reenter stop,
+    // maintenance or admission. The active payload has no receipt references.
+    _maintenance = true;
+    _reconfigurePending = false;
+    // Count before callbacks can recursively stop and empty the remaining queue.
+    for (size_t i = 0; i < _txCount; ++i)
+        if (!_txQueue[i].lease.generation && _maintenanceDroppedRaw != UINT32_MAX)
+            ++_maintenanceDroppedRaw;
+    const bool changing = _changingOwner;
+    _changingOwner = true;
+    while (_txCount) {
+        removeQueued(0, handheld::TxReceiptEvent::Dropped, "maintenance");
+    }
+    _splitRxPending = false;
+    _splitRxLength = 0;
+    _changingOwner = changing;
+}
+
+void LoRaInterface::pollMaintenance() {
+    if (!_maintenance || !_online || !_radio || _changingOwner || _notifying ||
+        _maintenanceTxFailed) return;
+    pollActiveTx(true);
+}
+
+void LoRaInterface::setTxValidator(void* context, TxValidator validator) {
+    // Discard old-context queued bytes before replacing a validator. The active
+    // radio burst owns a fixed payload copy and no longer references a context.
+    const bool changing = _changingOwner;
+    _changingOwner = true;
+    for (size_t i = 0; i < _txCount;) {
+        if (_txQueue[i].lease.generation)
+            removeQueued(i, handheld::TxReceiptEvent::Dropped, "validator changed");
+        else ++i;
+    }
+    _validatorContext = context;
+    _validator = validator;
+    _changingOwner = changing;
+}
+
+void LoRaInterface::setReceiptHook(void* context, handheld::TxReceiptHook hook) {
+    const bool changing = _changingOwner;
+    _changingOwner = true;
+    for (size_t i = 0; i < _txCount;) {
+        if (_txQueue[i].lease.receipt().valid())
+            removeQueued(i, handheld::TxReceiptEvent::Dropped, "receipt owner changed");
+        else ++i;
+    }
+    _receiptContext = context;
+    _receiptHook = hook;
+    _changingOwner = changing;
+}
+
+void LoRaInterface::notifyReceipt(handheld::TxReceipt receipt, handheld::TxReceiptEvent event) {
+    if (!receipt.valid() || !_receiptHook) return;
+    const bool notifying = _notifying;
+    _notifying = true;
+    _receiptHook(_receiptContext, receipt, event);
+    _notifying = notifying;
+}
+
+bool LoRaInterface::queueLive(const QueuedFrame& frame) const {
+    if (frame.lease.generation) {
+        return _validator && _validator(_validatorContext, frame.lease);
+    }
+    // Diagnostic raw packets have no protocol state, but still have a finite
+    // immutable age. Unsigned elapsed time handles the 32-bit millis rollover.
+    const uint32_t age = static_cast<uint32_t>(millis()) - frame.queuedAt;
+    return age < 120000;
+}
+
+void LoRaInterface::removeQueued(size_t index, handheld::TxReceiptEvent event, const char* cause) {
+    const auto receipt = _txQueue[index].lease.receipt();
+    for (size_t i = index + 1; i < _txCount; ++i) _txQueue[i - 1] = _txQueue[i];
+    --_txCount;
+    _txQueue[_txCount].length = 0;
+    if (event == handheld::TxReceiptEvent::Dropped) {
+        if (_queuedDropped != UINT32_MAX) ++_queuedDropped;
+        Serial.printf("[LORA_IF] queued TX dropped: %s (total=%lu)\n",
+                      cause, static_cast<unsigned long>(_queuedDropped));
+    }
+    // No queue reference survives this callback, which may retire/reuse the
+    // receipt or quiesce the pump. Admissions during callbacks are backpressured.
+    notifyReceipt(receipt, event);
+}
+
+void LoRaInterface::discardExpired() {
+    for (size_t i = 0; i < _txCount;) {
+        if (!queueLive(_txQueue[i]))
+            removeQueued(i, handheld::TxReceiptEvent::Dropped,
+                         _txQueue[i].lease.generation ? "lease expired or retired" : "raw queue deadline");
+        else ++i;
+    }
+}
+
+handheld::TxOffer LoRaInterface::send_outgoing(const uint8_t* rawData, size_t rawLen,
+                                              const handheld::TxLease* lease) {
+    using handheld::TxOffer;
+    const auto receipt = lease ? lease->receipt() : handheld::TxReceipt{};
+    if (_changingOwner || _notifying || _reconfigurePending) return TxOffer::Blocked;
+    const auto reject = [&]() {
+        notifyReceipt(receipt, handheld::TxReceiptEvent::Dropped);
+        return TxOffer::Rejected;
+    };
+    if (!isOnline() || _maintenance || !rawData || rawLen == 0) return reject();
     refreshRadioTiming();
+    discardExpired();
 
     // Reject packets exceeding Reticulum MTU (500 bytes)
     if (rawLen > RETICULUM_MTU) {
         Serial.printf("[LORA_IF] TX DROPPED: exceeds Reticulum MTU (%d > %d)\n",
             (int)rawLen, (int)RETICULUM_MTU);
-        return false;
+        return reject();
     }
     // Queue TX when radio is busy OR when we're waiting for split frame 2.
     // Transmitting during split RX would put the radio in TX mode, causing
     // frame 2 to be lost (LoRa is half-duplex).
-    if (_txPending || _splitTxPending || _splitRxPending || !pacingReady() || !_txQueue.empty()) {
-        if ((int)_txQueue.size() < TX_QUEUE_MAX) {
-            _txQueue.emplace_back(rawData, rawData + rawLen);
+    if (!_online || _maintenance || (lease && (!lease->generation || !_validator ||
+                  !_validator(_validatorContext, *lease)))) return reject();
+    if (_txPending || _splitTxPending || _splitRxPending || !pacingReady() || _txCount) {
+        if (_txCount < TX_QUEUE_MAX) {
+            auto& frame = _txQueue[_txCount++];
+            memcpy(frame.data.data(), rawData, rawLen);
+            frame.length = rawLen;
+            frame.queuedAt = static_cast<uint32_t>(millis());
+            frame.lease = lease ? *lease : handheld::TxLease{};
             if (_splitRxPending) {
-                Serial.printf("[LORA_IF] TX deferred (split RX pending, %d in queue)\n", (int)_txQueue.size());
+                Serial.printf("[LORA_IF] TX deferred (split RX pending, %d in queue)\n", (int)_txCount);
             } else {
-                Serial.printf("[LORA_IF] TX queued (%d in queue)\n", (int)_txQueue.size());
+                Serial.printf("[LORA_IF] TX queued (%d in queue)\n", (int)_txCount);
             }
         } else {
             // Acceptance is a promise to retain this packet; never evict an earlier one.
-            return false;
+            return TxOffer::Blocked;
         }
-        return true;
+        return TxOffer::Queued;
     }
 
-    return transmitNow(std::vector<uint8_t>(rawData, rawData + rawLen));
+    // Validity is checked before the first physical frame. Once begun, a split
+    // exchange is atomic even when its on-air duration exceeds the wait ceiling.
+    if (lease && !_validator(_validatorContext, *lease)) return reject();
+    if (!transmitNow(rawData, rawLen)) return TxOffer::Blocked;
+    notifyReceipt(receipt, handheld::TxReceiptEvent::Started);
+    return TxOffer::Started;
 }
 
 bool LoRaInterface::pacingReady() const {
@@ -96,10 +227,16 @@ uint32_t LoRaInterface::txWaitBudgetMs(uint32_t packets) const {
 }
 
 bool LoRaInterface::drainTx() {
-    if (_txPending || _splitTxPending || _splitRxPending || !pacingReady() || _txQueue.empty())
+    if (_changingOwner || _notifying || !_online || _maintenance) return false;
+    discardExpired();
+    if (!_online || _txPending || _splitTxPending || _splitRxPending || !pacingReady() || !_txCount)
         return false;
-    if (transmitNow(_txQueue.front())) {
-        _txQueue.pop_front();
+    while (_txCount && !queueLive(_txQueue[0]))
+        removeQueued(0, handheld::TxReceiptEvent::Dropped,
+                     _txQueue[0].lease.generation ? "lease expired or retired" : "raw queue deadline");
+    if (!_txCount) return false;
+    if (transmitNow(_txQueue[0].data.data(), _txQueue[0].length)) {
+        removeQueued(0, handheld::TxReceiptEvent::Started);
         return true;
     }
     // A driver failure must not spin or remove an accepted packet. Retry on the next second.
@@ -109,10 +246,14 @@ bool LoRaInterface::drainTx() {
     return false;
 }
 
-bool LoRaInterface::transmitNow(const std::vector<uint8_t>& data) {
+bool LoRaInterface::transmitNow(const uint8_t* data, size_t len) {
     refreshRadioTiming();
+    // Copy before touching the radio; split frame two never allocates or depends
+    // on a queue slot that can be compacted during the active burst.
+    memcpy(_txData.data(), data, len);
+    _txLength = len;
     uint8_t header = (uint8_t)(random(256)) & RNODE_NIBBLE_SEQ;
-    bool needsSplit = (data.size() > RNODE_SINGLE_MTU);
+    bool needsSplit = (len > RNODE_SINGLE_MTU);
 
     if (needsSplit) {
         header |= RNODE_FLAG_SPLIT;
@@ -120,38 +261,36 @@ bool LoRaInterface::transmitNow(const std::vector<uint8_t>& data) {
         size_t firstLen = RNODE_SINGLE_MTU;
 
         Serial.printf("[LORA_IF] TX SPLIT: %d bytes in 2 frames (seq=0x%02X)\n",
-            (int)data.size(), header & RNODE_NIBBLE_SEQ);
+            (int)len, header & RNODE_NIBBLE_SEQ);
 
         if (!_radio->beginPacket()) return false;
-        _radio->write(header);
-        _radio->write(data.data(), firstLen);
+        if (_radio->write(header) != 1 || _radio->write(_txData.data(), firstLen) != firstLen)
+            return false;
         if (!_radio->endPacket(true)) { _radio->receive(); return false; }
 
         // Save remaining data for second frame
         _splitTxPending = true;
-        _splitTxRemaining.assign(data.data() + firstLen, data.data() + data.size());
         _splitTxHeader = header;
 
         Serial.printf("[LORA_IF] TX SPLIT frame 1: %d+1 bytes (remaining: %d)\n",
-            (int)firstLen, (int)_splitTxRemaining.size());
+            (int)firstLen, (int)(len - firstLen));
     } else {
         // Single frame: fits in one LoRa packet
         if (!_radio->beginPacket()) return false;
-        _radio->write(header);
-        _radio->write(data.data(), data.size());
+        if (_radio->write(header) != 1 || _radio->write(_txData.data(), len) != len)
+            return false;
         if (!_radio->endPacket(true)) { _radio->receive(); return false; }
 
-        Serial.printf("[LORA_IF] TX %d+1 bytes (hdr=0x%02X)\n", (int)data.size(), header);
+        Serial.printf("[LORA_IF] TX %d+1 bytes (hdr=0x%02X)\n", (int)len, header);
     }
 
     _txPending = true;
-    _txData = data;
     _nextTxMs = (uint32_t)millis() +
-        (uint32_t)ceilf(packetAirtimeMs(data.size()) / AIRTIME_THROTTLE);
+        (uint32_t)ceilf(packetAirtimeMs(len) / AIRTIME_THROTTLE);
     _pacingActive = true;
 
     // Track airtime
-    size_t airBytes = needsSplit ? (RNODE_SINGLE_MTU + RNODE_HEADER_L) : (data.size() + RNODE_HEADER_L);
+    size_t airBytes = needsSplit ? (RNODE_SINGLE_MTU + RNODE_HEADER_L) : (len + RNODE_HEADER_L);
     float airtimeMs = _radio->getAirtime(airBytes);
     unsigned long txNow = millis();
     if (txNow - _airtimeWindowStart >= AIRTIME_WINDOW_MS) {
@@ -168,28 +307,38 @@ bool LoRaInterface::transmitNow(const std::vector<uint8_t>& data) {
     return true;
 }
 
-void LoRaInterface::loop() {
-    if (!_online || !_radio) return;
-    refreshRadioTiming();
-
-    // Handle async TX completion
+void LoRaInterface::pollActiveTx(bool completionOnly) {
     if (_txPending) {
         if (!_radio->isTxBusy()) {
+            if (_radio->txFailed()) {
+                Serial.println("[LORA_IF] TX failed before complete burst");
+                if (completionOnly) _maintenanceTxFailed = true;
+                else stop();
+                return;
+            }
             _txPending = false;
 
             // If split TX pending, send the second frame immediately
             if (_splitTxPending) {
-                size_t frame2Size = _splitTxRemaining.size();
+                size_t frame2Size = _txLength - RNODE_SINGLE_MTU;
                 Serial.printf("[LORA_IF] TX SPLIT frame 2: %d+1 bytes\n", (int)frame2Size);
 
-                if (!_radio->beginPacket()) { stop(); return; }
-                _radio->write(_splitTxHeader);
-                _radio->write(_splitTxRemaining.data(), frame2Size);
-                if (!_radio->endPacket(true)) { stop(); return; }
+                const auto failed = [&] {
+                    // Preserve the unsent second half for the maintenance
+                    // controller's explicit failure/reset policy. It is not a
+                    // drained burst and must not be silently retried or freed.
+                    if (completionOnly) _maintenanceTxFailed = true;
+                    else stop();
+                };
+                if (!_radio->beginPacket()) { failed(); return; }
+                if (_radio->write(_splitTxHeader) != 1 ||
+                    _radio->write(_txData.data() + RNODE_SINGLE_MTU, frame2Size) != frame2Size) {
+                    failed(); return;
+                }
+                if (!_radio->endPacket(true)) { failed(); return; }
 
                 _splitTxPending = false;
                 _txPending = true;
-                _splitTxRemaining.clear();
 
                 // Track airtime for second frame (must use saved size before clear)
                 float airtimeMs = _radio->getAirtime(frame2Size + RNODE_HEADER_L);
@@ -197,12 +346,22 @@ void LoRaInterface::loop() {
                 return;
             }
 
-            _txData.clear();
+            _txLength = 0;
 
-            if (!drainTx()) _radio->receive();
+            if (!completionOnly && !drainTx()) _radio->receive();
         }
         return;
     }
+}
+
+void LoRaInterface::loop() {
+    if (_maintenance) { pollMaintenance(); return; }
+    if (!_online || !_radio || _changingOwner || _notifying) return;
+    if (!_radio->isRadioOnline()) { stop(); return; }
+    refreshRadioTiming();
+    discardExpired();
+    if (!_online || _maintenance) return;
+    if (_txPending) { pollActiveTx(false); return; }
 
     // Split RX timeout: discard stale partial packets and drain deferred TX
     if (_splitRxPending && (millis() - _splitRxTimestamp > _splitRxTimeoutMs)) {
@@ -210,7 +369,7 @@ void LoRaInterface::loop() {
         Serial.printf("[LORA_IF] RX SPLIT timeout after %lums (limit=%lums frame=%.0fms), discarding partial\n",
                       age, _splitRxTimeoutMs, _singleFrameAirtimeMs);
         _splitRxPending = false;
-        _splitRxBuffer.clear();
+        _splitRxLength = 0;
     }
 
     // Periodic RX debug
@@ -237,6 +396,7 @@ void LoRaInterface::loop() {
     }
 
     uint8_t raw[MAX_PACKET_SIZE];
+    if (packetSize > static_cast<int>(sizeof(raw))) { _radio->receive(); return; }
     memcpy(raw, _radio->packetBuffer(), packetSize);
 
     // Capture signal quality before any further processing
@@ -248,13 +408,21 @@ void LoRaInterface::loop() {
     uint8_t seq = header & RNODE_NIBBLE_SEQ;
     bool isSplit = (header & RNODE_FLAG_SPLIT) != 0;
 
+    // A saved retune waits for the existing split, not an endless stream of
+    // replacement first halves. Preserve its original deadline and bytes.
+    if (_reconfigurePending && isSplit && (!_splitRxPending || seq != _splitRxSeq)) {
+        if (!drainTx() && !_txPending) _radio->receive();
+        return;
+    }
+
     if (isSplit) {
         // Split packet handling
         if (!_splitRxPending) {
             // First frame of a split packet
             _splitRxPending = true;
             _splitRxSeq = seq;
-            _splitRxBuffer.assign(raw + RNODE_HEADER_L, raw + RNODE_HEADER_L + payloadSize);
+            memcpy(_splitRxBuffer.data(), raw + RNODE_HEADER_L, payloadSize);
+            _splitRxLength = payloadSize;
             _splitRxTimestamp = millis();
 
             Serial.printf("[LORA_IF] RX SPLIT frame 1: %d bytes (seq=0x%02X), RSSI=%d, SNR=%.1f, timeout=%lums\n",
@@ -266,25 +434,25 @@ void LoRaInterface::loop() {
             Serial.printf("[LORA_IF] RX SPLIT frame 2: %d bytes (seq=0x%02X), RSSI=%d, SNR=%.1f, age=%lums\n",
                 payloadSize, seq, _lastRxRssi, _lastRxSnr, millis() - _splitRxTimestamp);
 
-            _splitRxBuffer.insert(_splitRxBuffer.end(), raw + RNODE_HEADER_L, raw + RNODE_HEADER_L + payloadSize);
-            int totalSize = _splitRxBuffer.size();
+            const size_t totalSize = _splitRxLength + payloadSize;
             _splitRxPending = false;
 
-            Serial.printf("[LORA_IF] RX SPLIT reassembled: %d bytes total\n", totalSize);
+            Serial.printf("[LORA_IF] RX SPLIT reassembled: %d bytes total\n", (int)totalSize);
 
             // RX-side MTU cap (mirrors the TX-side check): two adversarial 255-byte
             // frames can reassemble past the Reticulum MTU — drop, don't hand up.
-            if (totalSize > (int)RETICULUM_MTU) {
-                Serial.printf("[LORA_IF] RX SPLIT over MTU (%d) — dropped\n", totalSize);
-                _splitRxBuffer.clear();
+            if (totalSize > RETICULUM_MTU) {
+                Serial.printf("[LORA_IF] RX SPLIT over MTU (%d) — dropped\n", (int)totalSize);
+                _splitRxLength = 0;
                 if (!drainTx() && !_txPending) _radio->receive();
                 return;
             }
+            memcpy(_splitRxBuffer.data() + _splitRxLength, raw + RNODE_HEADER_L, payloadSize);
 
             if (_rawSink) {
-                _rawSink(_splitRxBuffer.data(), _splitRxBuffer.size());
+                _rawSink(_splitRxBuffer.data(), totalSize);
             }
-            _splitRxBuffer.clear();
+            _splitRxLength = 0;
 
             // Drain any TX that was deferred during split RX hold
             if (!drainTx() && !_txPending) _radio->receive();
@@ -295,7 +463,8 @@ void LoRaInterface::loop() {
             Serial.printf("[LORA_IF] RX SPLIT new seq (had 0x%02X, got 0x%02X), previous frame 2 lost\n",
                 _splitRxSeq, seq);
             _splitRxSeq = seq;
-            _splitRxBuffer.assign(raw + RNODE_HEADER_L, raw + RNODE_HEADER_L + payloadSize);
+            memcpy(_splitRxBuffer.data(), raw + RNODE_HEADER_L, payloadSize);
+            _splitRxLength = payloadSize;
             _splitRxTimestamp = millis();
             _radio->receive();
             return;
@@ -332,10 +501,12 @@ float LoRaInterface::airtimeUtilization() const {
 
 unsigned long LoRaInterface::computeSplitRxTimeoutMs(float frameAirtimeMs) const {
     if (frameAirtimeMs <= 0) return SPLIT_RX_TIMEOUT_FLOOR_MS;
-    float raw = frameAirtimeMs * SPLIT_RX_TIMEOUT_MULT + SPLIT_RX_TIMEOUT_MARGIN_MS;
-    unsigned long rounded = (unsigned long)(ceil(raw / 500.0f) * 500.0f);
-    return std::min(SPLIT_RX_TIMEOUT_CEIL_MS,
-                    std::max(SPLIT_RX_TIMEOUT_FLOOR_MS, rounded));
+    // Bound before converting to integer, including NaN/infinity from a
+    // malformed timing provider. The ceiling covers every supported tuple.
+    if (!std::isfinite(frameAirtimeMs) || frameAirtimeMs >= SPLIT_RX_TIMEOUT_CEIL_MS)
+        return SPLIT_RX_TIMEOUT_CEIL_MS;
+    return handheld::radio_timing::splitReceiveTimeoutMs(
+        static_cast<uint32_t>(ceilf(frameAirtimeMs)));
 }
 
 void LoRaInterface::refreshRadioTiming(bool forceLog) {
@@ -345,7 +516,8 @@ void LoRaInterface::refreshRadioTiming(bool forceLog) {
     }
 
     unsigned long now = millis();
-    if (!forceLog && _lastTimingRefreshMs != 0 && (now - _lastTimingRefreshMs) < 1000) return;
+    // Configuration setters are cheap to observe and may run just before TX.
+    // Do not retain the previous modem's timeout/bitrate for another second.
     _lastTimingRefreshMs = now;
 
     uint32_t newBitrate = _radio->getBitrate();

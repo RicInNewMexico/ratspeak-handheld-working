@@ -3,18 +3,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "storage/ConversationView.h"
 
 namespace handheld {
 
 enum class Operation : uint8_t {
-    Nodes, Conversations, History, MessageBody, Settings, Identities, Scan,
+    Nodes, PeerName, ConversationPage, ConversationDetail, HistoryPage, ReadRecord, HistoryStatus, Settings, Identities, Scan,
     Send, MarkRead, DeleteConversation, SaveContact, DeleteContact, RenameContact,
     ApplySettings, Announce, CreateIdentity, ImportIdentity, Diagnostics,
-    HomeReady, CloseHistory, Restart, PowerOff, SwitchIdentity, FormatSD, WipeSD, FactoryReset,
+    HomeReady, Restart, PowerOff, SwitchIdentity, FormatSD, WipeSD, FactoryReset,
     EnableSDAndRestart, ClearOldDataAndRestart
 };
 enum class Admission : uint8_t { Admitted, Busy, NotReady, Invalid };
-enum class Outcome : uint8_t { Ok, Failed, Stale, Invalid, NotReady };
+enum class Outcome : uint8_t { Ok, Failed, Stale, Invalid, NotReady, Cancelled };
 enum class ServiceState : uint8_t { Starting, Running, Quiescing, Stopped, Failed };
 
 constexpr bool lifecycleOperation(Operation op) {
@@ -27,27 +28,51 @@ constexpr bool queryOperation(Operation op) {
 struct Request {
     uint32_t id = 0;
     uint32_t generation = 0;
+    uint32_t admittedAt = 0;
     uint32_t query = 0;
     uint32_t revision = 0;
+    uint32_t statusRevision = 0;
     uint32_t offset = 0;
     uint32_t argument = 0;
     Operation operation = Operation::Nodes;
     char peer[33] = {};
+    bool incoming = false; // HistoryPage boundary / ReadRecord stable selector.
+    storage::HistoryDirection historyDirection = storage::HistoryDirection::Before;
 };
+
+// Summary selectors travel in the existing payload arena. Avoid enlarging every
+// mailbox request just to carry one query's full double timestamp and options.
+struct ConversationQuery {
+    storage::ConversationSelector selector;
+    storage::ConversationOrder order = storage::ConversationOrder::Recent;
+    storage::ConversationDirection direction = storage::ConversationDirection::After;
+    uint8_t hasCursor = 0;
+    uint8_t reserved[5] = {};
+};
+static_assert(sizeof(ConversationQuery) == 40 && std::is_trivially_copyable<ConversationQuery>::value,
+              "Conversation IPC uses a bounded copied envelope");
 
 struct Result {
     Outcome outcome = Outcome::Failed;
+    storage::RecordKey key;
+    storage::Error storageError = storage::Error::None;
     uint32_t revision = 0;
+    uint32_t statusRevision = 0;
     uint32_t next = 0;
     uint32_t total = 0;
     uint16_t length = 0;
     bool more = false;
+    bool txSuppressed = false;
+    bool settingsCommitted = false; // Survives a later UI snapshot/copy failure.
+    uint8_t retainedOwners = 0; // Immutable maintenance failure snapshot.
     char detail[80] = {};
 };
 
 struct Status {
     uint32_t generation = 1;
     uint32_t storeRevision = 0;
+    uint32_t historyRevision = 0; // Structural invalidation only; MAX is exhausted.
+    uint32_t statusRevision = 0; // Outgoing network/status-persistence overlay.
     uint32_t nodeRevision = 0;
     uint32_t configRevision = 1;
     uint32_t identityRevision = 1;
@@ -88,6 +113,9 @@ struct Status {
     char publicKey[129] = {};
     char notice[80] = {};
     uint32_t noticeRevision = 0;
+    uint8_t maintenancePending = 0;
+    uint8_t maintenanceFailedPending = 0;
+    storage::Error maintenanceError = storage::Error::None;
 };
 
 static_assert(std::is_trivially_copyable<Request>::value, "Request must be a value record");

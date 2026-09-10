@@ -24,6 +24,7 @@ public:
     int  beginPacket(int implicitHeader = 0);
     int  endPacket(bool async = false);
     bool isTxBusy();
+    bool txFailed() const { return _txFailed; }
     size_t write(uint8_t byte);
     size_t write(const uint8_t* buffer, size_t size);
 
@@ -102,7 +103,8 @@ private:
     void rxAntEnable();
     void calibrate();
     bool calibrate_image(uint32_t frequency);
-    void startXoscRobust();
+    bool startXoscRobust();
+    void failIo();
     void enableTCXO();
     void enableDio2RfSwitch();
     void setModulationParams(uint8_t sf, uint8_t bw, uint8_t cr, int ldro);
@@ -144,6 +146,9 @@ private:
     uint8_t _imageCalBand = 0xFF;
     uint32_t _busyTimeouts = 0;
     bool _txActive = false;
+    bool _txFailed = false;
+    bool _ioFailed = false;
+    bool _sleeping = false;
     uint32_t _txStartMs = 0;
     uint32_t _txBudgetMs = 0;  // elapsed-form (millis()-wrap safe), never an absolute deadline
 

@@ -47,9 +47,5 @@ private:
 };
 
 inline File sharedSPIFile(File file) {
-#if defined(RSCARDPUTER)
-    return file;
-#else
     return file ? File(std::make_shared<SPIFileImpl>(std::move(file))) : File();
-#endif
 }

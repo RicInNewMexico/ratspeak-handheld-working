@@ -4,15 +4,17 @@
 #include "widgets/ScrollList.h"
 #include "widgets/TextInput.h"
 #include "config/UserConfig.h"
+#include "config/SettingsTransaction.h"
 #include "storage/FlashStore.h"
 #include "storage/SDStore.h"
-#include "radio/SX1262.h"
+#include "radio/RadioSettings.h"
 #include <WiFi.h>
 #include "audio/AudioNotify.h"
 #include "power/PowerManager.h"
-#include "transport/WiFiInterface.h"
+#include "runtime/ScanResult.h"
 #include "transport/TCPClientInterface.h"
 #include "protocol/ProtocolBackend.h"
+#include "runtime/ServiceMessages.h"
 #include <vector>
 
 class SettingsScreen : public Screen {
@@ -22,16 +24,30 @@ public:
     const char* title() const override { return "Settings"; }
     void onEnter() override;
 
-    void setUserConfig(UserConfig* cfg) { _config = cfg; }
+    void setUserConfig(UserConfig* cfg) { _config = cfg; _candidateReady = cfg && _candidate.tryAssign(*cfg); _candidateDirty = false; }
     void setFlashStore(FlashStore* flash) { _flash = flash; }
     void setSDStore(SDStore* sd) { _sdStore = sd; }
-    void setRadio(SX1262* radio) { _radio = radio; }
+    using RadioApplyCallback = RadioApply (*)(const UserSettings&, bool);
+    void setRadioApply(RadioApplyCallback callback) { _radioApply = callback; }
+    bool radioApplyPending() const { return _radioApplyPending; }
+    bool pollRadioApply(bool accepting); // Global owner loop, including while hidden.
     void setAudio(AudioNotify* audio) { _audio = audio; }
     void setPower(PowerManager* power) { _power = power; }
-    void setWiFi(WiFiInterface* wifi) { _wifi = wifi; }
-    void setTCPClients(std::vector<TCPClientInterface*>* clients) { _tcpClients = clients; }
+    struct NetworkActions {
+        bool (*startScan)() = nullptr;
+        handheld::ScanResult (*finishScan)(String&) = nullptr;
+        bool (*connect)() = nullptr;
+        void (*disconnect)() = nullptr;
+    };
+    void setNetworkActions(NetworkActions actions) { _network = actions; }
+    bool pollNetworkResults(); // Global loop: retire an owned scan even while hidden.
     void setBackend(ProtocolBackend* backend) { _backend = backend; }
     void setIdentityHash(const String& hash) { _identityHash = hash; }
+    using SaveCallback = std::function<SettingsTransaction::Result(UserConfig&)>;
+    void setSaveCallback(SaveCallback cb) { _saveCb = cb; }
+    // Called once after an initially pending transaction settles on the board.
+    void applyCommitted(bool refreshCandidate = true);
+    void setMaintenanceCallback(std::function<bool(handheld::Operation)> cb) { _maintenanceCb = cb; }
 
     // Callback for back navigation
     using BackCallback = std::function<void()>;
@@ -65,19 +81,25 @@ private:
     void startEditing(int field, const std::string& currentValue);
     void commitEdit(const std::string& value);
     std::string getCurrentValue(SubMenu menu, int field);
-    void applyAndSave();
-    void applyRadioPreset(int preset);  // 0=Balanced, 1=Long Range, 2=Fast
+    bool applyAndSave();
+    void applyRadioPreset(int preset);
+    void finishRadioApply(RadioApply result);
     void factoryReset();
+    void requestMaintenance(handheld::Operation operation);
     void showToast(const char* msg, unsigned long durationMs = 1500);
 
     UserConfig* _config = nullptr;
+    UserConfig _candidate;
+    bool _candidateReady = false, _candidateDirty = false;
     FlashStore* _flash = nullptr;
     SDStore* _sdStore = nullptr;
-    SX1262* _radio = nullptr;
+    RadioApplyCallback _radioApply = nullptr;
+    bool _radioApplyPending = false, _presetAnnouncePending = false;
     AudioNotify* _audio = nullptr;
     PowerManager* _power = nullptr;
-    WiFiInterface* _wifi = nullptr;
-    std::vector<TCPClientInterface*>* _tcpClients = nullptr;
+    NetworkActions _network;
+    bool _scanPending = false;
+    handheld::ScanResult _scanOutcome = handheld::ScanResult::Ready;
     ProtocolBackend* _backend = nullptr;
     String _identityHash;
 
@@ -89,6 +111,8 @@ private:
     std::string _tcpPendingHost;
     std::string _editLabel;
     BackCallback _backCb;
+    SaveCallback _saveCb;
+    std::function<bool(handheld::Operation)> _maintenanceCb;
 
     // WiFi scan state
     struct WiFiNetwork { String ssid; int32_t rssi; uint8_t encType; };

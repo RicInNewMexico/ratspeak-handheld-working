@@ -20,7 +20,12 @@ void init(Keyboard* kb, Scrollwheel* sw, TouchInput* touch);
 #endif
 
 // Feed a KeyEvent into the LVGL keypad indev (called from main loop)
-void feedKey(const KeyEvent& evt);
+bool feedKey(const KeyEvent& evt);
+bool canAcceptKey();
+// Call for every dispatched key, including keys handled directly by a screen.
+void noteKeyActivity();
+// Clear stale renderer events and reject a touch held across display-off.
+void setEnabled(bool enabled);
 
 // Get the LVGL input group (for focusing widgets)
 lv_group_t* group();

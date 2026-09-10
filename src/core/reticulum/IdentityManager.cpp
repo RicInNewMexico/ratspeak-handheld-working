@@ -1,6 +1,7 @@
 #include "IdentityManager.h"
 #include "runtime/TaskOwner.h"
 #include "config/Config.h"
+#include "config/UserConfig.h"
 #include "protocol/RustEntropy.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
@@ -45,11 +46,23 @@ bool IdentityManager::begin(FlashStore* flash, SDStore* sd) {
                 bytesRead == sizeof(keyData)) {
                 identityHashFromKey(keyData, slot.hash);
             }
+            // On a pre-slot installation, two disagreeing raw key copies give
+            // no evidence that either is a newer identity. Preserve both for
+            // recovery instead of replacing an intact NVS key during import.
+            uint8_t nvsKey[64];
+            const bool conflictingNvs = !slot.hash.empty() && readNvsIdentityKey(nvsKey) &&
+                memcmp(nvsKey, keyData, sizeof(nvsKey)) != 0;
+            memset(nvsKey, 0, sizeof(nvsKey));
+            if (conflictingNvs) {
+                memset(keyData, 0, sizeof(keyData));
+                Serial.println("[IDMGR] Legacy identity copies disagree; preserving identity data");
+                return false;
+            }
             if (!slot.hash.empty()
                 && _flash->writeAtomic(slot.keyPath.c_str(), keyData, sizeof(keyData))) {
                 _slots.push_back(slot);
                 _activeIdx = 0;
-                saveSlotMeta();
+                _metadataDirty = true;
             }
         }
     } else {
@@ -66,17 +79,17 @@ bool IdentityManager::begin(FlashStore* flash, SDStore* sd) {
                         && _flash->writeAtomic(migratedPath.c_str(), keyData, sizeof(keyData))) {
                         _slots[i].keyPath = migratedPath;
                         if (_slots[i].hash.empty()) _slots[i].hash = keyHash;
+                        _metadataDirty = true;
                     }
                 }
             }
             if (_slots[i].active && activeIdx < 0) activeIdx = i;
         }
         _activeIdx = activeIdx;
-        saveSlotMeta();
     }
 
-    // A stale active slot (missing/corrupt/mismatched key) is equivalent to no
-    // active marker. PATH_IDENTITY remains the authoritative active mirror.
+    // Validate the catalogued active slot before reconciling the switch mirror.
+    // Stage an invalid marker without discarding independent recovery evidence.
     if (_activeIdx >= 0) {
         uint8_t activeKey[64];
         size_t activeLen = 0;
@@ -90,14 +103,15 @@ bool IdentityManager::begin(FlashStore* flash, SDStore* sd) {
         if (!activeValid) {
             _slots[_activeIdx].active = false;
             _activeIdx = -1;
-            saveSlotMeta();
+            // Stage the marker repair until a valid recovery source has been
+            // selected. A contradictory mirror must not rewrite the catalogue.
+            _metadataDirty = true;
         }
     }
 
-    // A partially-written slots.json may contain slots but no usable active
-    // slot. Adopt PATH_IDENTITY instead of allowing ProtocolRuntime to overwrite it.
-    // PATH_IDENTITY is the switch commit point. A power loss before slots.json
-    // updates must not reactivate an older slot and overwrite the NVS backup.
+    // PATH_IDENTITY is the switch commit point, but a raw 64-byte file is not
+    // self-authenticating. Reconcile it against a catalogue hash or an exact
+    // unlisted staged slot; an unknown mirror alone cannot replace an identity.
     if (_flash->exists(PATH_IDENTITY) && !adoptPathIdentityWhenNoActive()) return false;
 
     if (_activeIdx >= 0) mirrorActiveIdentityToNvs();
@@ -126,11 +140,30 @@ bool IdentityManager::adoptPathIdentityWhenNoActive() {
     }
     if (index < 0) {
         if ((int)_slots.size() >= MAX_IDENTITIES) return false;
-        int slotNum = nextFreeSlotNum();
-        if (slotNum < 0) return false;
+        // createIdentityFromRaw commits a separate slot key before the active
+        // mirror and metadata. Recover that interrupted operation only when its
+        // exact independent slot bytes still exist. The finite slot namespace
+        // is the same one used by nextFreeSlotNum; no directory or body cache.
+        String stagedPath;
+        for (int slotNum = 0; slotNum < MAX_IDENTITIES * 2; ++slotNum) {
+            const String candidate = slotKeyPath(slotNum);
+            bool listed = false;
+            for (const auto& slot : _slots) if (slot.keyPath == candidate) { listed = true; break; }
+            if (listed || !_flash->exists(candidate.c_str())) continue;
+            uint8_t staged[64]; size_t length = 0;
+            const bool matches = _flash->readFileFully(candidate.c_str(), staged, sizeof(staged), length)
+                && length == sizeof(staged) && memcmp(key, staged, sizeof(staged)) == 0;
+            memset(staged, 0, sizeof(staged));
+            if (matches) { stagedPath = candidate; break; }
+        }
+        if (stagedPath.isEmpty()) {
+            memset(key, 0, sizeof(key));
+            Serial.println("[IDMGR] Active mirror has no verified slot; preserving identity data");
+            return false;
+        }
         IdentitySlot slot;
         slot.hash = keyHash;
-        slot.keyPath = slotKeyPath(slotNum);
+        slot.keyPath = stagedPath;
         slot.active = false;
         _slots.push_back(slot);
         index = (int)_slots.size() - 1;
@@ -376,11 +409,32 @@ bool IdentityManager::switchTo(int index) {
     return true;
 }
 
-bool IdentityManager::setDisplayName(int index, const String& name) {
+bool IdentityManager::setDisplayName(int index, const String& name, bool complete) {
     handheld::assertDeviceOwner();
-    if (index < 0 || index >= (int)_slots.size()) return false;
-    _slots[index].displayName = name;
-    return saveSlotMeta();
+    if (!_metadataReadable || index < 0 || index >= (int)_slots.size()) return false;
+    String publication;
+    if (!UserConfig::trySetString(publication, name.c_str(), name.length())) return false;
+    // Serialize a staged name directly into the existing catalogue. A failed
+    // write must not publish an attempted name or make dirty retry adopt it.
+    const bool wasDirty = _metadataDirty;
+    if (!saveSlotMeta(index, &name, complete)) { _metadataDirty = wasDirty; return false; }
+    std::swap(_slots[index].displayName, publication);
+    _slots[index].nameComplete = complete;
+    return _slots[index].displayName == name;
+}
+
+bool IdentityManager::validateSlot(int index) const {
+    handheld::assertDeviceOwner();
+    if (!_metadataReadable || !_flash || index < 0 || index >= (int)_slots.size()) return false;
+    for (int other = 0; other < (int)_slots.size(); ++other)
+        if (other != index && _slots[other].hash == _slots[index].hash) return false;
+    uint8_t key[64], hash[16]; size_t size = 0;
+    if (!_flash->readFileFully(_slots[index].keyPath.c_str(), key, sizeof key, size) || size != sizeof key ||
+        rs_handheld_rns_validate_identity(key, hash, nullptr) != RS_HANDHELD_OK) return false;
+    static constexpr char digits[] = "0123456789abcdef";
+    char hex[33]{};
+    for (size_t i = 0; i < sizeof hash; ++i) { hex[2*i] = digits[hash[i] >> 4]; hex[2*i+1] = digits[hash[i] & 15]; }
+    return _slots[index].hash == hex;
 }
 
 String IdentityManager::getDisplayName(int index) const {
@@ -401,45 +455,101 @@ void IdentityManager::refresh() {
     loadSlotMeta();
 }
 
+namespace {
+constexpr size_t MetadataBytes = 32768; // Existing complete-record read limit.
+// The pinned parser retains each string's geometric capacity and can overlap
+// old/new blocks while growing the current string: <3x selected input bytes,
+// plus the bounded <=8-row nodes, allocator headers and SDK pool reserve.
+// This is a ceiling, not an up-front allocation; Card admits each increment.
+constexpr size_t MetadataJsonBytes = 3 * MetadataBytes + 8192;
+
+// The pinned SDK owns all JSON parsing. Keep only the five fields consumed by
+// this catalogue, so ignored legacy extensions cannot grow the metadata DOM.
+// This filter is a stateless value: constructing it cannot allocate or fail.
+struct SlotMetadataFilter {
+    enum Level : uint8_t { Root, Slots, Slot, Value, Discard } level = Root;
+    bool allow() const { return level != Discard; }
+    bool allowArray() const { return level == Slots; }
+    bool allowObject() const { return level == Root || level == Slot; }
+    bool allowValue() const { return level != Discard; }
+    SlotMetadataFilter operator[](JsonString key) const {
+        const auto is = [&](const char* text) {
+            const size_t length = strlen(text);
+            return key.size() == length && !memcmp(key.c_str(), text, length);
+        };
+        if (level == Root && is("slots")) return {Slots};
+        if (level == Slot && (is("hash") || is("name") || is("name_complete") ||
+                             is("path") || is("active"))) return {Value};
+        return {Discard};
+    }
+    template<class Index> SlotMetadataFilter operator[](Index) const {
+        return {level == Slots ? Slot : Discard};
+    }
+};
+
+bool stageSlotHash(std::string& value, const char* bytes) {
+    using handheld::config::Memory;
+    const size_t length = strlen(bytes);
+    // libstdc++ may double the fresh string's SSO capacity on first growth.
+    // Reserve that actual upper bound before assigning; no unchecked copy is
+    // used to publish a catalogue row.
+    if (length > value.capacity()) {
+        const size_t capacity = std::max(length, 2 * value.capacity());
+        if (!Memory::admits(Memory::charge(capacity + 1))) return false;
+        value.reserve(length);
+    }
+    value.assign(bytes, length);
+    return value.size() == length && (!length || !memcmp(value.data(), bytes, length)) &&
+        Memory::admits(0);
+}
+}
+
 void IdentityManager::loadSlotMeta() {
     handheld::assertDeviceOwner();
-    _metadataReadable = true;
-    String json = _flash->readString(META_PATH);
-    if (json.isEmpty()) {
-        _metadataReadable = !_flash->exists(META_PATH) && !_flash->exists((String(META_PATH) + ".bak").c_str());
-        if (_metadataReadable) _slots.clear();
-        return;
-    }
-
-    JsonDocument doc;
-    if (deserializeJson(doc, json) || !doc["slots"].is<JsonArray>()) {
-        if (_flash->exists(META_PATH)) { _metadataReadable = false; return; }
-        json = _flash->readString((String(META_PATH) + ".bak").c_str());
-        if (json.isEmpty() || deserializeJson(doc, json) || !doc["slots"].is<JsonArray>()) {
-            _metadataReadable = false; return;
+    _metadataReadable = false;
+    if (!_flash) return;
+    try {
+        using handheld::config::Memory;
+        handheld::config::JsonAllocator allocator(MetadataJsonBytes);
+        JsonDocument doc(&allocator);
+        {
+            String json;
+            const auto source = _flash->readRecord(META_PATH, json, MetadataBytes, Memory::reserveString);
+            if (source == FlashStore::RecordSource::Absent) {
+                _slots.clear(); _activeIdx = -1; _metadataReadable = true; return;
+            }
+            if (source != FlashStore::RecordSource::Primary && source != FlashStore::RecordSource::Backup) return;
+            if (deserializeJson(doc, json.c_str(), json.length(), SlotMetadataFilter{}) ||
+                !doc["slots"].is<JsonArray>()) return;
+        } // SDK-owned DOM strings outlive this complete input; free it before copies.
+        JsonArray arr = doc["slots"];
+        if (arr.size() > MAX_IDENTITIES) return;
+        for (JsonVariant value : arr) {
+            const char* path = value["path"] | "";
+            if (!value.is<JsonObject>() || strncmp(path, "/identity/", 10) || strstr(path, "..")) return;
         }
-    }
-
-    JsonArray arr = doc["slots"];
-    if (!arr) { _metadataReadable = false; return; }
-    if (arr.size() > MAX_IDENTITIES) { _metadataReadable = false; return; }
-    for (JsonVariant value : arr) {
-        const String path = value["path"] | "";
-        if (!value.is<JsonObject>() || !path.startsWith("/identity/") || path.indexOf("..") >= 0) {
-            _metadataReadable = false; return;
+        std::vector<IdentitySlot> prepared;
+        if (!Memory::admits(Memory::charge(arr.size() * sizeof(IdentitySlot)))) return;
+        prepared.reserve(arr.size());
+        if (!Memory::admits(0)) return;
+        int active = -1;
+        for (JsonObject obj : arr) {
+            prepared.emplace_back();
+            auto& slot = prepared.back();
+            const char* name = obj["name"] | "";
+            const char* path = obj["path"] | "";
+            if (!stageSlotHash(slot.hash, obj["hash"] | "") ||
+                !UserConfig::trySetString(slot.displayName, name, strlen(name)) ||
+                !UserConfig::trySetString(slot.keyPath, path, strlen(path))) return;
+            slot.nameComplete = obj["name_complete"] | !slot.displayName.isEmpty();
+            slot.active = obj["active"] | false;
+            if (slot.active && active < 0) active = int(prepared.size()) - 1;
         }
-    }
-    _slots.clear();
-
-    for (JsonObject obj : arr) {
-        IdentitySlot slot;
-        slot.hash = obj["hash"] | "";
-        slot.displayName = obj["name"] | "";
-        slot.keyPath = obj["path"] | "";
-        slot.active = obj["active"] | false;
-        if (!slot.keyPath.isEmpty()) {
-            _slots.push_back(slot);
-        }
+        _slots.swap(prepared);
+        _activeIdx = active;
+        _metadataReadable = true;
+    } catch (const std::bad_alloc&) {
+        // Retain the complete old catalogue and block metadata writes until retry.
     }
 }
 
@@ -451,23 +561,37 @@ bool IdentityManager::flushPending() {
     return metadata && mirror;
 }
 
-bool IdentityManager::saveSlotMeta() {
+bool IdentityManager::saveSlotMeta(int nameIndex, const String* name, bool complete) {
     handheld::assertDeviceOwner();
-    JsonDocument doc;
-    JsonArray arr = doc["slots"].to<JsonArray>();
-
-    for (auto& slot : _slots) {
-        JsonObject obj = arr.add<JsonObject>();
-        obj["hash"] = slot.hash;
-        obj["name"] = slot.displayName;
-        obj["path"] = slot.keyPath;
-        obj["active"] = slot.active;
+    _metadataDirty = true;
+    if (!_metadataReadable || !_flash || _slots.size() > MAX_IDENTITIES) return false;
+    try {
+        // Character data can approach the complete 32 KiB legacy record;
+        // the same bounded/admitted allocator used by settings covers it.
+        handheld::config::JsonAllocator allocator(2 * MetadataBytes);
+        JsonDocument doc(&allocator);
+        JsonArray arr = doc["slots"].to<JsonArray>();
+        for (size_t i = 0; i < _slots.size(); ++i) {
+            const auto& slot = _slots[i];
+            JsonObject obj = arr.add<JsonObject>();
+            obj["hash"] = slot.hash;
+            obj["name"] = name && int(i) == nameIndex ? *name : slot.displayName;
+            obj["name_complete"] = name && int(i) == nameIndex ? complete : slot.nameComplete;
+            obj["path"] = slot.keyPath;
+            obj["active"] = slot.active;
+        }
+        if (doc.overflowed()) return false;
+        const size_t length = measureJson(doc);
+        String json;
+        if (!length || length > MetadataBytes ||
+            !handheld::config::Memory::reserveString(json, length) ||
+            serializeJson(doc, json) != length || json.length() != length ||
+            !handheld::config::Memory::admits(0)) return false;
+        _metadataDirty = !_flash->writeString(META_PATH, json);
+        return !_metadataDirty;
+    } catch (const std::bad_alloc&) {
+        return false;
     }
-
-    String json;
-    if (doc.overflowed() || serializeJson(doc, json) != measureJson(doc)) { _metadataDirty = true; return false; }
-    _metadataDirty = !_flash || !_flash->writeString(META_PATH, json);
-    return !_metadataDirty;
 }
 
 bool IdentityManager::readActiveIdentityKey(uint8_t out[64]) const {

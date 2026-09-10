@@ -44,10 +44,12 @@ public:
     // Persist the peer table if dirty. Throttled unless `force` (shutdown / persistData).
     bool flushPeers(rs_handheld_rns_t* ctx, uint32_t nowMs, bool force);
 
-    bool ringReady() const { return _havePub; }
+    bool ringReady() const { return (_flags & HAVE_PUB) != 0; }
 
 private:
-    enum class PreparedKind : uint8_t { Ring, AnnounceState };
+    static constexpr uint8_t HAVE_PUB = 1;
+    static constexpr uint8_t PEERS_DIRTY = 2;
+    enum class PreparedKind : uint8_t { Ring = 4, AnnounceState = 8, Peers = 16 };
 
     bool restoreRing(rs_handheld_rns_t* ctx);
     bool restoreAnnounceState(rs_handheld_rns_t* ctx);
@@ -55,7 +57,7 @@ private:
     bool writePreparedAndCommit(rs_handheld_rns_t* ctx, const char* path, size_t len,
                                 PreparedKind kind, uint64_t& outWireValue,
                                 uint8_t outPub[32]);
-    bool quarantine(const char* path, const char* label);
+    bool quarantine(const char* path, const char* label, PreparedKind kind);
     static void secureZero(uint8_t* data, size_t len);
     static uint64_t fingerprint(const uint8_t* data, size_t len);
 
@@ -68,8 +70,9 @@ private:
     // One reusable BSS-resident buffer for every opaque blob. The Cardputer loop task has an
     // 8 KiB stack; putting the 2.7 KiB ring or 1.8 KiB peer table there is not acceptable.
     uint8_t _blob[RS_HANDHELD_RATCHET_RING_BLOB_MAX] = {};
-    bool _havePub = false;
-    bool _peersDirty = false;
+    // A rejected file must be preserved before another write may replace it.
+    // Retry preservation at begin(), including after an identity change/restart.
+    uint8_t _flags = 0;
     uint32_t _lastPeerSaveMs = 0;
     // Peer-table writes are cheap but flash is not; one write per minute at most.
     static constexpr uint32_t PEER_SAVE_INTERVAL_MS = 60000;

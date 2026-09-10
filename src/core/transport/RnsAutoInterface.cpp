@@ -83,6 +83,8 @@ bool RnsAutoInterface::computeSelf(const uint8_t llRaw[16]) {
 bool RnsAutoInterface::start(const char* groupId, uint8_t maxPeers,
                              const uint8_t llRaw[16], uint32_t scopeId) {
     if (_online) return true;
+    if (_generation == UINT32_MAX) return false;
+    ++_generation;
     _groupId = (groupId && groupId[0]) ? groupId : "reticulum";
     _maxPeers = maxPeers == 0 ? 1
               : (maxPeers > MAX_PEERS_CAP ? (uint8_t)MAX_PEERS_CAP : maxPeers);
@@ -192,6 +194,8 @@ void RnsAutoInterface::stop() {
 void RnsAutoInterface::notifyLinkChange(const uint8_t llRaw[16], uint32_t scopeId) {
     if (!_online) return;
     if (memcmp(llRaw, _selfLl, 16) == 0 && scopeId == _scopeId) return;  // idempotent
+    if (_generation == UINT32_MAX) { stop(); return; }
+    ++_generation;
 
     // Keep the old LL self-classified: late echoes of our prior beacons must not
     // re-add our former address as a peer.

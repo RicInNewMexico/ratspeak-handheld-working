@@ -18,7 +18,6 @@ public:
 
     void setBackend(handheld::ProtocolView* backend) { _backend = backend; }
     void setUserConfig(UserConfig* cfg) { _cfg = cfg; }
-    void setLXMFManager(handheld::MessageViewModel* lxmf) { _lxmf = lxmf; }
     void setAnnounceManager(handheld::NodeView* am) { _am = am; }
     void setAnnounceCallback(std::function<void()> cb) { _announceCb = cb; }
     void setAudioToggleCallback(std::function<void()> cb) { _audioToggleCb = cb; }
@@ -34,7 +33,6 @@ private:
     handheld::ServiceClient* _service = nullptr;
     handheld::ProtocolView* _backend = nullptr;
     UserConfig* _cfg = nullptr;
-    handheld::MessageViewModel* _lxmf = nullptr;
     handheld::NodeView* _am = nullptr;
     std::function<void()> _announceCb;
     std::function<void()> _audioToggleCb;

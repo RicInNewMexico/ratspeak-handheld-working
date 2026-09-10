@@ -3,10 +3,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <cstring>
+#include <new>
+#include <utility>
 #include "storage/FlashStore.h"
 #include "storage/SDStore.h"
 #include "config/Config.h"
 #include "config/BoardConfig.h"
+#include "config/ConfigMemory.h"
 
 enum RatWiFiMode : uint8_t { RAT_WIFI_OFF = 0, RAT_WIFI_AP = 1, RAT_WIFI_STA = 2 };
 
@@ -77,7 +81,7 @@ struct UserSettings {
     uint16_t screenDimTimeout = 30;   // seconds
     uint16_t screenOffTimeout = 60;   // seconds
     uint8_t brightness = BOARD_DEFAULT_BRIGHTNESS;  // Percentage 1-100, per-board default
-    bool denseFontMode = false;       // T-Deck Plus: adaptive font toggle
+    bool denseFontMode = false;       // Persisted compatibility field; no active renderer control.
     bool themeLight = false;          // false = dark (original palette)
 
     // Battery
@@ -95,7 +99,7 @@ struct UserSettings {
     uint8_t trackballSpeed = 3;       // 1-5 sensitivity
 
     // Touch
-    uint8_t touchSensitivity = 3;     // 1-5
+    uint8_t touchSensitivity = 3;     // Legacy 1-5 field; current touch HAL uses fixed calibration.
 
     // BLE
     bool bleEnabled = false;
@@ -113,6 +117,7 @@ struct UserSettings {
 
     // Identity
     String displayName;
+    bool nameComplete = false; // Mirrored from the bound identity slot; empty is a choice.
 
     // Storage. Removable SD stores plaintext unless explicitly enabled; boards
     // whose legacy installs always used SD default it on (BOARD_DEFAULT_SD_STORAGE).
@@ -127,6 +132,27 @@ struct UserSettings {
 
 class UserConfig {
 public:
+    UserConfig() = default;
+    UserConfig(const UserConfig&) = delete;
+    UserConfig& operator=(const UserConfig&) = delete;
+    UserConfig(UserConfig&&) noexcept = default;
+    UserConfig& operator=(UserConfig&&) noexcept = default;
+    // Arduino String copies can silently become empty on allocation refusal.
+    // Prepare and verify every owned value before publishing any replacement.
+    bool tryAssign(const UserConfig& source);
+    void swap(UserConfig& other) noexcept;
+    static bool trySetString(String& target, const char* bytes, size_t length) {
+        if ((!bytes && length) || length > StoredLimit) return false;
+        try {
+            String prepared;
+            if (length && (!handheld::config::Memory::reserveString(prepared, length) ||
+                           !prepared.concat(bytes, length))) return false;
+            if (prepared.length() != length || (length && std::memcmp(prepared.c_str(), bytes, length)) ||
+                !handheld::config::Memory::admits(0)) return false;
+            std::swap(target, prepared);
+            return true;
+        } catch (const std::bad_alloc&) { return false; }
+    }
     // Flash-only (original API, kept for compatibility)
     bool load(FlashStore& flash);
     bool save(FlashStore& flash);
@@ -135,22 +161,40 @@ public:
     bool load(SDStore& sd, FlashStore& flash);
     bool save(SDStore& sd, FlashStore& flash);
     bool flushPending(SDStore& sd, FlashStore& flash);
-    bool mirrorPending() const { return _mirrorPending; }
+    bool mirrorPending() const { return _mirrorPending || _nvsMirrorPending; }
     bool recoveryRequired() const { return _recoveryRequired; }
+    bool settingsPending() const { return _namePending; }
+    enum class Source : uint8_t { Absent, Flash, FlashBackup, Nvs, Sd, Unavailable, Invalid };
+    Source source() const { return _source; }
 
     UserSettings& settings() { return _settings; }
     const UserSettings& settings() const { return _settings; }
 
     // Value snapshots for the UI/service boundary; no storage access.
-    String encode() { return serializeToJson(); }
-    bool decode(const String& json) { return parseJson(json); }
+    String encode() { return serializeToJson(false, SnapshotLimit); }
+    bool decode(const String& json) { return parseJson(json, false); }
+    bool decode(const char* json, size_t length) { return parseJson(json, length, false); }
+    static constexpr size_t StoredLimit = 32768;
+    static constexpr size_t NvsStringLimit = 4000; // pinned SDK maximum, including NUL
+    static constexpr size_t SnapshotLimit = 4096;
+    static constexpr size_t JsonAllocationLimit = 2 * StoredLimit;
 
 private:
-    bool parseJson(const String& json);
-    String serializeToJson();
-    void sanitizeSettings();
+    friend class SettingsTransaction;
+    bool parseJson(const String& json, bool persisted = true, bool* unavailable = nullptr);
+    bool parseJson(const char* json, size_t length, bool persisted = true, bool* unavailable = nullptr);
+    String serializeToJson(bool persisted = true, size_t limit = StoredLimit, bool* unavailable = nullptr);
+    bool saveRequired(FlashStore& flash);
+    bool saveRequired(FlashStore& flash, const String& encoded);
+    void copyStateFrom(const UserConfig& source) noexcept;
+    uint8_t _nameIdentity[16]{};
+    bool _nameBound = false;
+    bool _namePending = false;
+    Source _source = Source::Absent;
+    static void sanitizeSettings(UserSettings& settings);
 
     UserSettings _settings;
     bool _mirrorPending = false;
+    bool _nvsMirrorPending = false;
     bool _recoveryRequired = false;
 };

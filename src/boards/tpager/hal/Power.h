@@ -22,7 +22,7 @@ public:
 
     // True power off — callers flush state first. Enters BQ25896 ship mode
     // (BATFET open, ~26uA; wake = hold PWR ~1s or plug USB). On USB power SYS
-    // never drops, so this parks in deep sleep with BOOT wake and the off
+    // never drops, so this parks in deep sleep with wheel-click wake and the off
     // completes on unplug. Does not return.
     void powerOff();
     // One-shot: BOOT was short-pressed while the screen was on (sleep screen).

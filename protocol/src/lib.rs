@@ -174,10 +174,14 @@ pub struct RsHandheldRns {
     /// Active inbound resource transfer. `None` until `resource_advertise_accept`. One per
     /// context; a new accept replaces it. Boxed: ~3.8 KiB buffer.
     resource_in: Option<Box<InboundResource>>,
+    /// Invalidate queued non-terminal Resource packets on close or replacement.
+    resource_generations: [u32; 2],
     /// Registered live link ids: inbound frames whose destination is one of these route to the
     /// C++ link manager as LocalFrame. Bounded fixed set; the C++ side registers/unregisters as
     /// links open/close. Endpoint scope keeps this small.
     link_ids: [Option<[u8; DESTINATION_LENGTH]>; LOCAL_LINK_SLOTS],
+    /// Non-reused local session generations carried with driver-retained frames.
+    link_generations: [u32; LOCAL_LINK_SLOTS],
     /// Own announce-ratchet ring. Rotation candidates stay outside live state
     /// until the host has persisted and committed their signed bytes.
     ratchet_ring: RatchetRing,
@@ -329,6 +333,8 @@ pub unsafe extern "C" fn rs_handheld_rns_init(out: *mut *mut RsHandheldRns) -> R
             resource_out: None,
             resource_in: None,
             link_ids: [None; LOCAL_LINK_SLOTS],
+            link_generations: [0; LOCAL_LINK_SLOTS],
+            resource_generations: [0; 2],
             ratchet_ring: RatchetRing::new(),
             peer_ratchets: PeerRatchets::new(),
             announce_wire: AnnounceWireState::new(),

@@ -37,7 +37,15 @@ public:
 
     // Configuration (set from outside before or after begin())
     void setPosixTZ(const char* tz);
-    void setLocationEnabled(bool enable) { _parser.setParseLocation(enable); }
+    void setTimeEnabled(bool enable) {
+        if (enable && !_timeEnabled) _lastTimeSyncMs = millis() - TIME_SYNC_INTERVAL_MS;
+        _timeEnabled = enable;
+        if (!enable) _timeValid = false;
+    }
+    void setLocationEnabled(bool enable) {
+        _parser.setParseLocation(enable);
+        if (!enable) { _locationValid = false; _parser.data().locationValid = false; }
+    }
 
 private:
     void syncSystemTime();
@@ -48,6 +56,7 @@ private:
     NMEAParser _parser;
     HardwareSerial _serial{2};   // UART2 on ESP32-S3
     bool _running = false;
+    bool _timeEnabled = true;
     bool _timeValid = false;
     bool _locationValid = false;
     unsigned long _lastTimeSyncMs = 0;
@@ -59,6 +68,8 @@ private:
 
     // Baud auto-detect state
     bool _baudDetected = false;
+    // A fix at millis()==0 is valid; pack this flag in existing padding.
+    bool _hadLocationFix = false;
     int _baudAttemptIdx = 0;
     unsigned long _baudAttemptStart = 0;
     static constexpr uint32_t BAUD_RATES[] = {38400, 115200, 9600};

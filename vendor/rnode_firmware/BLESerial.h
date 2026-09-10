@@ -13,12 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#pragma once
+
 #include "Boards.h"
 
 #if PLATFORM != PLATFORM_NRF52
 #if HAS_BLE
 
 #include <Arduino.h>
+#include <atomic>
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -81,7 +84,7 @@ public:
   void disconnect();
   void startAdvertising();
   void stopAdvertising();
-  void onWrite(BLECharacteristic *characteristic);
+  void onWrite(BLECharacteristic *characteristic, esp_ble_gatts_cb_param_t *param) override;
   int available();
   int peek();
   int read();
@@ -90,8 +93,17 @@ public:
   size_t write(const uint8_t *buffer, size_t bufferSize);
   size_t print(const char *value);
   void flush();
-  void onConnect(BLEServer *server);
-  void onDisconnect(BLEServer *server);
+  void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override;
+  void onDisconnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override;
+
+  // Only the sketch owner polls, flushes, begins or ends the SDK. Callbacks
+  // close admission immediately; polling retires downstream KISS/radio work
+  // before advertising another session. No SDK call holds the buffer spinlock.
+  void pollSession();
+  bool authenticated();
+  void setPairingPolicy(bool allowed, uint32_t passkey, uint32_t beganAt, uint32_t timeout);
+  void disconnectAfter(uint32_t delayMs);
+  bool flushDue(uint32_t now, uint32_t interval);
 
   uint32_t onPassKeyRequest();
   void onPassKeyNotify(uint32_t passkey);
@@ -106,24 +118,36 @@ public:
   BLEService *SerialService;
   BLECharacteristic *TxCharacteristic;
   BLECharacteristic *RxCharacteristic;
-  size_t transmitBufferLength;
-  unsigned long long lastFlushTime;
 
 private:
   BLESerial(BLESerial const &other) = delete;
   void operator=(BLESerial const &other) = delete;
 
   BLEFIFO<RX_BUFFER_SIZE> rx_buffer;
-  size_t numAvailableLines;
   uint8_t transmitBuffer[BLE_BUFFER_SIZE];
 
-  int ConnectedDeviceCount;
   void SetupSerialService();
 
-  uint16_t peerMTU;
-  uint16_t maxTransferSize = BLE_BUFFER_SIZE;
-
-  bool checkMTU();
+  portMUX_TYPE sessionMux = portMUX_INITIALIZER_UNLOCKED;
+  size_t transmitBufferLength = 0;
+  uint32_t lastFlushTime = 0;
+  uint32_t session = 0;
+  uint32_t passkey = 0, pendingPasskey = 0, disconnectAt = 0;
+  uint32_t pairingBegan = 0, pairingTimeout = 0, pendingPasskeyAt = 0;
+  uint16_t connection = UINT16_MAX;
+  esp_gatt_if_t gattsInterface = ESP_GATT_IF_NONE;
+  static std::atomic<BLESerial *> instance;
+  static void onGattsEvent(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
+                           esp_ble_gatts_cb_param_t *param);
+  uint8_t peerAddress[6] = {};
+  BLE2902 *subscription = nullptr;
+  bool live = false, authorized = false, subscribed = false, closing = false;
+  bool retiring = false, detached = false, connectPending = false;
+  bool passkeyPending = false, authPending = false, authSuccess = false;
+  bool pairingAllowed = false, flushing = false, disconnectTimer = false;
+  bool advertising = false;
+  void clearBuffersLocked();
+  bool sameSession(uint32_t expected);
 
   const char *BLE_SERIAL_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
   const char *BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";

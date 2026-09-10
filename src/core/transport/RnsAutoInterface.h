@@ -44,6 +44,7 @@ public:
     void notifyLinkChange(const uint8_t llRaw[16], uint32_t scopeId);
 
     bool isOnline() const { return _online; }
+    uint32_t generation() const { return _generation; }
     size_t peerCount() const;
     const std::string& multicastAddress() const { return _mcastAddrStr; }
 
@@ -77,6 +78,7 @@ private:
     int _unicastSock = -1;
     int _dataSock = -1;
     bool _online = false;
+    uint32_t _generation = 0;
     bool _rxEnabled = false;  // discovery/data RX gated until our first beacon TX
     bool _mcastLoopOk = false;
     bool _oversizeLogged = false;

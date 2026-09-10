@@ -16,10 +16,11 @@ concurrency:
 
 env:
   ARDUINO_CLI_VERSION: 1.4.1
-  RNS_LITE_COMMIT: 25842ef187e2e29819c73121b90e57f5e367b419
-  LXMF_LITE_COMMIT: f4c16b87b595f4f484fa33fe3984cbafbdce714b
-  RNS_FULL_COMMIT: 3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c
-  LXMF_FULL_COMMIT: e210e0c244c76532faae99696f83c94d44c27dc6
+  # Generated source mirrors: tools/release_identity.py sync
+  RNS_LITE_COMMIT: afddf8a54ee15db979d3eebdb60b0fb70a428c60
+  LXMF_LITE_COMMIT: 4ba7a6ac42e3af1ba27fe9b9d9086427dd1e749e
+  RNS_FULL_COMMIT: 25c69c6f378a745d5a3ae93558ebdf8f0de901b7
+  LXMF_FULL_COMMIT: d7da7f34aaf14761566cc2fb446b503093fd1612
 
 jobs:
   protocol-quality:
@@ -77,6 +78,9 @@ jobs:
             source/rsLXMFLite
             source/ratspeak-handheld/protocol
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Verify selected developer source graph
+        working-directory: source/ratspeak-handheld
+        run: python3 tools/release_identity.py check-workspace
       - name: Test rsReticulumLite
         working-directory: source/rsReticulumLite
         run: ./scripts/test-matrix.sh
@@ -101,14 +105,31 @@ jobs:
         working-directory: source/ratspeak-handheld
         run: python3 tools/check_prebuilt.py
 
+  release-config:
+    name: Resolve release board catalog
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.catalog.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - id: catalog
+        run: |
+          python3 tools/release_catalog.py check
+          echo "matrix=$(python3 tools/release_catalog.py matrix)" >> "$GITHUB_OUTPUT"
+
   package:
     name: Package ${{ matrix.device }}
+    needs: release-config
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        device: [tdeck, tpager]
+      matrix: ${{ fromJSON(needs.release-config.outputs.matrix) }}
     steps:
       - name: Check out handheld firmware
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -137,20 +158,6 @@ jobs:
           name: ${{ matrix.device }}-dist
           path: source/ratspeak-handheld/dist/*
           if-no-files-found: error
-
-  experimental-cardputer:
-    name: Compile experimental Cardputer
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - run: python -m pip install -r requirements-build.txt
-      - run: make build-standalone build-launcher DEVICE=cardputer
 
   prepare-release:
     name: Verify complete release candidate
@@ -190,15 +197,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - name: Download validated T-Deck artifacts
+      - name: Download board artifacts for exact catalog inventory validation
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: tdeck-dist
-          path: source/ratspeak-handheld/dist
-      - name: Download validated T-Pager artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: tpager-dist
+          pattern: '*-dist'
+          merge-multiple: true
           path: source/ratspeak-handheld/dist
       - name: Check image correspondence, notices and source provenance
         working-directory: source/ratspeak-handheld

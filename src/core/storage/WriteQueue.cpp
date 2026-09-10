@@ -1,140 +1,257 @@
-#include "config/Config.h"
-
-// Deferred SD/flash writes off the main loop (0.5-4s LittleFS writes on the
-// no-PSRAM board). Compiled only where a BoardConfig opts in.
-#if STORAGE_ASYNC_WRITES
-
 #include "WriteQueue.h"
-#include "storage/SDStore.h"
-#include "storage/FlashStore.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <algorithm>
+#include <cstring>
+#include <new>
 
-bool WriteQueue::begin(SDStore* sd, FlashStore* flash) {
-    _sd = sd;
-    _flash = flash;
+using namespace handheld::storage;
 
-    _queue = xQueueCreate(QUEUE_DEPTH, sizeof(WriteJob*));
-    if (!_queue) {
-        Serial.println("[WRITEQ] Failed to create queue");
-        return false;
+void WriteQueue::assertOwner() const {
+    configASSERT(!_owner || _owner == xTaskGetCurrentTaskHandle());
+}
+
+WriteQueue::~WriteQueue() {
+    // Shutdown is explicit and cooperative. Never kill another task or spin
+    // here while its File/slot ownership may still be live.
+    configASSERT(stopped() && _outstanding == 0);
+    if (_queue) vQueueDelete(static_cast<QueueHandle_t>(_queue));
+}
+
+bool WriteQueue::begin(Executor& executor, Execution execution) {
+    assertOwner();
+    if (execution > Execution::Deferred) return false;
+    if (!finishStop()) return false;
+    _owner = xTaskGetCurrentTaskHandle();
+    _executor = &executor;
+    _execution = execution;
+    _workerStackFree.store(UINT32_MAX, std::memory_order_relaxed);
+    _stopRequested = false;
+    if (execution == Execution::Deferred) {
+        // Independent sentinel credit: shutdown does not wait for the owner to
+        // release completed slots, even when all request slots are occupied.
+        _queue = xQueueCreate(Budget::SlotCount + 1, sizeof(uint8_t));
+        if (!_queue) return false;
+        _workerStopped.store(false, std::memory_order_release);
+        TaskHandle_t task = nullptr;
+        if (xTaskCreatePinnedToCore(taskFunc, "WriteQ", Budget::WorkerStack, this,
+                                   1, &task, 1) != pdPASS) {
+            _workerStopped.store(true, std::memory_order_release);
+            vQueueDelete(static_cast<QueueHandle_t>(_queue)); _queue = nullptr; _task = nullptr;
+            return false;
+        }
+        _task = task;
     }
-
-    // Pin to Core 1 (same as main loop) — LittleFS is NOT thread-safe across cores
-    xTaskCreatePinnedToCore(taskFunc, "WriteQ", TASK_STACK, this, TASK_PRIORITY, &_task, 1);
-    if (!_task) {
-        Serial.println("[WRITEQ] Failed to create task");
-        return false;
-    }
-
-    Serial.println("[WRITEQ] Async write queue started on Core 1");
+    _accepting = true;
     return true;
 }
 
-bool WriteQueue::enqueue(const char* sdPath, const char* flashPath, const String& data, WriteBackend backend) {
-    if (!_queue) return false;
-
-    WriteJob* job = new (std::nothrow) WriteJob();
-    if (!job) return false;
-
-    job->sdPath[0] = '\0';
-    job->flashPath[0] = '\0';
-    if (sdPath) {
-        strncpy(job->sdPath, sdPath, sizeof(job->sdPath) - 1);
-        job->sdPath[sizeof(job->sdPath) - 1] = '\0';
-    }
-    if (flashPath) {
-        strncpy(job->flashPath, flashPath, sizeof(job->flashPath) - 1);
-        job->flashPath[sizeof(job->flashPath) - 1] = '\0';
-    }
-    job->data = data;
-    job->backend = backend;
-
-    if (xQueueSend(_queue, &job, 0) != pdTRUE) {
-        delete job;
-        Serial.println("[WRITEQ] Queue full, dropping write");
-        return false;
-    }
-
-    _pending++;
+bool WriteQueue::adoptOwner() {
+    if (_outstanding || (_stopRequested && !stopped())) return false;
+    _owner = xTaskGetCurrentTaskHandle();
     return true;
 }
 
-bool WriteQueue::enqueue(const char* path, const String& data, WriteBackend backend) {
-    if (backend == WriteBackend::SD_ONLY) {
-        return enqueue(path, nullptr, data, backend);
-    } else if (backend == WriteBackend::FLASH_ONLY) {
-        return enqueue(nullptr, path, data, backend);
-    }
-    // BOTH requires dual-path overload
-    return enqueue(path, path, data, backend);
+uint8_t* WriteQueue::payload(uint8_t slot) {
+    if (slot >= Budget::NormalSlots) return nullptr;
+    const size_t offset = CompactProfile ? slot * Budget::SmallPayload : slot * Budget::LargePayload;
+    return _payload + offset;
+}
+const uint8_t* WriteQueue::payload(uint8_t slot) const {
+    return const_cast<WriteQueue*>(this)->payload(slot);
 }
 
-void WriteQueue::waitForFlush(unsigned long timeoutMs) {
-    unsigned long start = millis();
-    while (_pending > 0 && (millis() - start) < timeoutMs) {
-        delay(5);  // Yield to let WriteQueue task process
+WriteQueue::Submission WriteQueue::submit(const Request& request, const PayloadPart* parts,
+                                         size_t partCount, size_t resultCapacity) {
+    assertOwner();
+    auto reject = [](Rejection reason) { return Submission{{}, reason}; };
+    if (!_accepting) return reject(Rejection::Unavailable);
+    if (_nextSequence == UINT64_MAX) return reject(Rejection::Exhausted);
+    if (request.operation > Operation::Trim || partCount > 3 || (partCount && !parts))
+        return reject(Rejection::Invalid);
+    size_t length = 0;
+    for (size_t i = 0; i < partCount; ++i) {
+        if (parts[i].length && !parts[i].data) return reject(Rejection::Invalid);
+        if (parts[i].length > Budget::LargePayload - length) return reject(Rejection::TooLarge);
+        length += parts[i].length;
     }
-    if (_pending > 0) {
-        Serial.printf("[WRITEQ] Flush timeout (%d pending)\n", (int)_pending);
+    if (resultCapacity > Budget::LargePayload) return reject(Rejection::TooLarge);
+    if (request.operation == Operation::CreateIncoming || request.operation == Operation::CreateOutgoing) {
+        if (!Budget::validBody(request.titleLength, request.contentLength)) return reject(Rejection::TooLarge);
+        if (length != size_t(request.titleLength) + request.contentLength) return reject(Rejection::Invalid);
     }
+    size_t first = 0, end = Budget::NormalSlots;
+    if (request.operation == Operation::DeleteConversation) {
+        first = Budget::NormalSlots; end = first + 1;
+    } else if (request.operation == Operation::UpdateStatus || request.operation == Operation::MarkRead) {
+        first = Budget::NormalSlots + 1; end = first + 1;
+    }
+    if (first >= Budget::NormalSlots && (length || resultCapacity)) return reject(Rejection::Invalid);
+    const size_t needed = std::max(length, resultCapacity);
+    uint8_t index = first;
+    while (index < end && (_slots[index].state.load(std::memory_order_acquire) != State::Free ||
+                          capacity(index) < needed)) ++index;
+    if (index == end) return reject(Rejection::Busy);
+    auto& slot = _slots[index];
+    slot.request = request;
+    slot.request.readCapacity = static_cast<uint16_t>(resultCapacity);
+    slot.result = {};
+    slot.sequence = ++_nextSequence;
+    _lengths[index] = static_cast<uint16_t>(length);
+    _resultCapacities[index] = static_cast<uint16_t>(resultCapacity);
+    uint8_t* destination = payload(index);
+    if (capacity(index)) std::memset(destination, 0, capacity(index));
+    for (size_t i = 0; i < partCount; ++i) {
+        if (parts[i].length) {
+            std::memcpy(destination, parts[i].data, parts[i].length);
+            destination += parts[i].length;
+        }
+    }
+    ++_outstanding; // reserve before worker publication/preemption
+    slot.state.store(State::Queued, std::memory_order_release);
+    if (_execution == Execution::Deferred) {
+        if (xQueueSend(static_cast<QueueHandle_t>(_queue), &index, 0) != pdTRUE) {
+            if (capacity(index)) std::memset(payload(index), 0, capacity(index));
+            _lengths[index] = 0; _resultCapacities[index] = 0;
+            slot.state.store(State::Free, std::memory_order_release);
+            --_outstanding;
+            return reject(Rejection::Busy);
+        }
+    } else executeSlot(index);
+    return Submission{{slot.sequence, index}, Rejection::None};
 }
 
-bool WriteQueue::isFull() const {
-    if (!_queue) return true;
-    return uxQueueSpacesAvailable(_queue) == 0;
+void WriteQueue::executeSlot(uint8_t index) {
+    if (index >= Budget::SlotCount) return;
+    auto& slot = _slots[index];
+    State expected = State::Queued;
+    if (!slot.state.compare_exchange_strong(expected, State::Running, std::memory_order_acq_rel)) {
+        if (expected != State::CancelQueued) return;
+        slot.result = {};
+        slot.result.key = slot.request.key;
+        slot.result.outcome = Outcome::Cancelled;
+        slot.result.error = Error::Cancelled;
+    } else {
+        Result result;
+        result.key = slot.request.key;
+        try {
+            _executor->execute(slot.request, payload(index), _lengths[index], capacity(index), result);
+        } catch (const std::bad_alloc&) {
+            // A cleanup/mirror allocation failure cannot erase an already
+            // committed transaction or its owner-visible deltas.
+            result.error = Error::Allocation;
+        } catch (...) {
+            result.error = Error::Internal;
+        }
+        if (result.length > _resultCapacities[index]) {
+            const auto key = result.key;
+            result = {}; result.key = key; result.error = Error::InvalidRecord;
+        }
+        _lengths[index] = std::max(_lengths[index], result.length);
+        slot.result = result;
+    }
+    slot.state.store(State::Ready, std::memory_order_release);
 }
 
-void WriteQueue::taskFunc(void* param) {
-    WriteQueue* self = static_cast<WriteQueue*>(param);
-    WriteJob* job = nullptr;
-
+void WriteQueue::taskFunc(void* argument) {
+    auto* self = static_cast<WriteQueue*>(argument);
     for (;;) {
-        if (xQueueReceive(self->_queue, &job, portMAX_DELAY) == pdTRUE) {
-            self->processJob(*job);
-            delete job;
-            if (self->_pending > 0) self->_pending--;
+        self->_workerStackFree.store(uxTaskGetStackHighWaterMark(nullptr), std::memory_order_release);
+        uint8_t index;
+        if (xQueueReceive(static_cast<QueueHandle_t>(self->_queue), &index, portMAX_DELAY) != pdTRUE) continue;
+        if (index == StopSlot) {
+            self->_task = nullptr;
+            self->_workerStopped.store(true, std::memory_order_release);
+            vTaskDelete(nullptr); // this task only; no access to self afterward
+            return;
         }
+        self->executeSlot(index);
     }
 }
 
-void WriteQueue::processJob(const WriteJob& job) {
-    // SD write
-    if (job.backend == WriteBackend::SD_ONLY || job.backend == WriteBackend::BOTH) {
-        bool backendOk = false;
-        if (_sd && _sd->isReady() && job.sdPath[0] != '\0') {
-            // Ensure parent directory exists on SD
-            String sdDir = String(job.sdPath);
-            int lastSlash = sdDir.lastIndexOf('/');
-            if (lastSlash > 0) {
-                sdDir = sdDir.substring(0, lastSlash);
-                _sd->ensureDir(sdDir.c_str());
-            }
-            backendOk = _sd->writeDirect(job.sdPath, (const uint8_t*)job.data.c_str(), job.data.length());
-        }
-        if (!backendOk) {
-            Serial.printf("[WRITEQ] SD write FAILED: %s\n", job.sdPath);
-        }
+bool WriteQueue::matches(Ticket ticket) const {
+    return ticket.valid() && ticket.slot < Budget::SlotCount &&
+           _slots[ticket.slot].sequence == ticket.sequence;
+}
+bool WriteQueue::peekResult(Ticket ticket, Result& result, Request* request) const {
+    assertOwner();
+    if (!matches(ticket) || _slots[ticket.slot].state.load(std::memory_order_acquire) != State::Ready)
+        return false;
+    result = _slots[ticket.slot].result;
+    if (request) *request = _slots[ticket.slot].request;
+    return true;
+}
+bool WriteQueue::readPayload(Ticket ticket, void* destination, size_t length, size_t offset) const {
+    assertOwner();
+    if (!matches(ticket) || _slots[ticket.slot].state.load(std::memory_order_acquire) != State::Ready ||
+        offset > _lengths[ticket.slot] || length > _lengths[ticket.slot] - offset ||
+        (length && !destination)) return false;
+    if (length) std::memcpy(destination, payload(ticket.slot) + offset, length);
+    return true;
+}
+bool WriteQueue::releaseResult(Ticket ticket) {
+    assertOwner();
+    if (!matches(ticket) || _slots[ticket.slot].state.load(std::memory_order_acquire) != State::Ready)
+        return false;
+    if (capacity(ticket.slot)) std::memset(payload(ticket.slot), 0, capacity(ticket.slot));
+    _lengths[ticket.slot] = 0; _resultCapacities[ticket.slot] = 0;
+    _slots[ticket.slot].state.store(State::Free, std::memory_order_release);
+    --_outstanding;
+    return true;
+}
+bool WriteQueue::cancel(Ticket ticket) {
+    assertOwner();
+    if (!matches(ticket)) return false;
+    State queued = State::Queued;
+    return _slots[ticket.slot].state.compare_exchange_strong(queued, State::CancelQueued,
+                                                            std::memory_order_acq_rel);
+}
+WriteQueue::Ticket WriteQueue::nextReady(uint64_t afterSequence) const {
+    assertOwner();
+    Ticket first;
+    for (uint8_t index = 0; index < Budget::SlotCount; ++index) {
+        const auto& slot = _slots[index];
+        // Select the oldest outstanding ticket before checking readiness. A
+        // concurrent worker can complete an earlier slot after we scanned it;
+        // scanning only Ready slots could expose a later completion first.
+        const State state = slot.state.load(std::memory_order_acquire);
+        if (state != State::Free && state != State::Retired && slot.sequence > afterSequence &&
+            (!first.valid() || slot.sequence < first.sequence)) first = {slot.sequence, index};
     }
-
-    // Flash write
-    if (job.backend == WriteBackend::FLASH_ONLY || job.backend == WriteBackend::BOTH) {
-        bool backendOk = false;
-        if (_flash && _flash->isReady() && job.flashPath[0] != '\0') {
-            // Ensure parent directory exists on flash
-            String flashDir = String(job.flashPath);
-            int lastSlash = flashDir.lastIndexOf('/');
-            if (lastSlash > 0) {
-                flashDir = flashDir.substring(0, lastSlash);
-                _flash->ensureDir(flashDir.c_str());
-            }
-            backendOk = _flash->writeDirect(job.flashPath, (const uint8_t*)job.data.c_str(), job.data.length());
-        }
-        if (!backendOk) {
-            Serial.printf("[WRITEQ] Flash write FAILED: %s\n", job.flashPath);
-        }
+    if (first.valid() && _slots[first.slot].state.load(std::memory_order_acquire) != State::Ready)
+        return {};
+    return first;
+}
+void WriteQueue::requestStop() {
+    assertOwner();
+    _accepting = false;
+    if (_stopRequested) return;
+    _stopRequested = true;
+    if (_execution == Execution::Deferred && _queue && !stopped()) {
+        uint8_t stop = StopSlot;
+        const bool sent = xQueueSend(static_cast<QueueHandle_t>(_queue), &stop, 0) == pdTRUE;
+        configASSERT(sent); // queue reserves an independent sentinel credit
     }
 }
-
-// Counter persistence moved to MessageStore::saveMessage (crash-safe reservation
-// ceiling, main task): the 30s batch here left a reuse window after a crash.
-
-#endif  // STORAGE_ASYNC_WRITES
+bool WriteQueue::finishStop() {
+    assertOwner();
+    if (_accepting || !stopped() || _outstanding) return false;
+    if (_queue) { vQueueDelete(static_cast<QueueHandle_t>(_queue)); _queue = nullptr; }
+    _executor = nullptr; _task = nullptr;
+    return true;
+}
+bool WriteQueue::isFull() const {
+    assertOwner();
+    if (!_accepting) return true;
+    for (uint8_t i = 0; i < Budget::NormalSlots; ++i)
+        if (_slots[i].state.load(std::memory_order_acquire) == State::Free) return false;
+    return true;
+}
+size_t WriteQueue::retainedBytes() const {
+    assertOwner();
+    size_t retained = 0;
+    for (uint8_t i = 0; i < Budget::SlotCount; ++i)
+        if (_slots[i].state.load(std::memory_order_acquire) != State::Free) retained += capacity(i);
+    return retained;
+}

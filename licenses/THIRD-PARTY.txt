@@ -3657,6 +3657,54 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ========================================================================
+ESP-IDF DHCP bounds backport 38eeba213aa695aabfd6d89aa9f5078dbe5a94c3
+https://github.com/espressif/esp-idf/blob/38eeba213aa695aabfd6d89aa9f5078dbe5a94c3/components/lwip/apps/dhcpserver/dhcpserver.c
+Boards: tdeck, tpager, cardputer
+Modes: standalone, rnode
+
+--- vendor/esp_idf_compat/dhcpserver.c (header) ---
+// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//#include "esp_common.h"
+// Ratspeak compatibility backport: see README.md in vendor/esp_idf_compat.
+// Replaces the pinned SDK archive member; it does not add another DHCP server.
+
+
+========================================================================
+ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport 38eeba213aa695aabfd6d89aa9f5078dbe5a94c3
+https://github.com/espressif/esp-idf/blob/38eeba213aa695aabfd6d89aa9f5078dbe5a94c3/components/esp_hw_support/port/esp32s3/rtc_init.c
+Boards: tdeck, tpager, cardputer
+Modes: standalone, launcher, rnode
+
+--- vendor/esp_idf_compat/rtc_init.c (header) ---
+/*
+ * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+
+========================================================================
+ESP-IDF ESP32-S3 rtc_sleep.c deep-sleep backport 38eeba213aa695aabfd6d89aa9f5078dbe5a94c3
+https://github.com/espressif/esp-idf/blob/38eeba213aa695aabfd6d89aa9f5078dbe5a94c3/components/esp_hw_support/port/esp32s3/rtc_sleep.c
+Boards: tdeck, tpager, cardputer
+Modes: standalone, launcher, rnode
+
+--- vendor/esp_idf_compat/rtc_sleep.c (header) ---
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
+
+========================================================================
 ESP-IDF SDK v4.4.7 (Arduino build)
 https://github.com/espressif/esp-idf/tree/38eeba213aa695aabfd6d89aa9f5078dbe5a94c3
 Boards: tdeck, tpager, cardputer
@@ -6221,12 +6269,7 @@ The same license text is reproduced above under ESP-IDF SDK / asio/port/include/
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_sysview_trace.h (notice 1).
 
 --- bootloader_support/include/esp_app_format.h (notice 1) ---
-/*
- * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- bootloader_support/include/esp_flash_data_types.h (notice 1) ---
 /*
@@ -6237,16 +6280,16 @@ The same license text is reproduced above under ESP-IDF SDK / app_trace/include/
 
 
 --- bootloader_support/include/esp_flash_encrypt.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- bootloader_support/include/esp_flash_partitions.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- bootloader_support/include/esp_image_format.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- bootloader_support/include/esp_secure_boot.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- bt/common/osi/include/osi/alarm.h (notice 1) ---
 /******************************************************************************
@@ -7703,61 +7746,61 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 
 
 --- driver/include/driver/adc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/adc2_wifi_private.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/adc_common.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- driver/include/driver/adc_deprecated.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/adc_types_deprecated.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/can.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/dac_common.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/dedic_gpio.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- driver/include/driver/gpio.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/i2c.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/i2s.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/ledc.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / app_update/include/esp_ota_ops.h (notice 1).
 
 --- driver/include/driver/mcpwm.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/pcnt.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/periph_ctrl.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/rmt.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/rtc_cntl.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / console/esp_console.h (notice 1).
 
 --- driver/include/driver/rtc_io.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/sdio_slave.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/sdmmc_defs.h (notice 1) ---
 /*
@@ -7788,7 +7831,7 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 
 
 --- driver/include/driver/sdmmc_host.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/sdmmc_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / driver/include/driver/sdmmc_defs.h (notice 1).
@@ -7797,10 +7840,10 @@ The same license text is reproduced above under ESP-IDF SDK / driver/include/dri
 The same license text is reproduced above under ESP-IDF SDK / driver/include/driver/sdmmc_defs.h (notice 2).
 
 --- driver/include/driver/sdspi_host.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/sigmadelta.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/spi_common.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
@@ -7821,13 +7864,13 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- driver/include/driver/touch_pad.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/touch_sensor_common.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/twai.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/driver/uart.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / app_update/include/esp_ota_ops.h (notice 1).
@@ -7842,10 +7885,10 @@ The same license text is reproduced above under ESP-IDF SDK / asio/port/include/
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- driver/include/esp_private/gpio.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- driver/include/esp_private/i2s_platform.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- efuse/esp32s3/include/esp_efuse.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
@@ -7905,10 +7948,10 @@ The same license text is reproduced above under ESP-IDF SDK / driver/esp32s3/inc
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- esp_common/include/esp_err.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_http_client/include/esp_http_client.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_http_server/include/esp_http_server.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_sysview_trace.h (notice 1).
@@ -7929,19 +7972,19 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/esp_crc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_fault.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/esp_interface.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_intr.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/esp_intr_alloc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_mac.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -7961,7 +8004,7 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- esp_hw_support/include/esp_private/esp_clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_private/esp_memprot_internal.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -7981,13 +8024,13 @@ The same license text is reproduced above under ESP-IDF SDK / bt/common/osi/incl
 The same license text is reproduced above under ESP-IDF SDK / app_update/include/esp_ota_ops.h (notice 1).
 
 --- esp_hw_support/include/esp_private/sleep_gpio.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_private/sleep_mac_bb.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_private/sleep_retention.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/esp_random.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -8007,13 +8050,13 @@ The same license text is reproduced above under ESP-IDF SDK / app_update/include
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/compare_set.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/cpu.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32/clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32/dport_access.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
@@ -8022,124 +8065,124 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_sysview_trace.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32/spiram.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32c3/clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32c3/dport_access.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32c3/esp_crypto_lock.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32c3/esp_ds.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32c3/esp_hmac.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32c3/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32c3/soc_memprot_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32h2/clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32h2/dport_access.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32h2/esp_crypto_lock.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32h2/esp_ds.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32h2/esp_hmac.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32h2/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32h2/soc_memprot_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s2/clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s2/dport_access.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s2/esp_crypto_lock.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s2/esp_ds.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s2/esp_hmac.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s2/memprot.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s2/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s2/soc_memprot_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s2/spiram.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s3/clk.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s3/dport_access.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/bootloader_random.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s3/esp_crypto_lock.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s3/esp_ds.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s3/esp_hmac.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s3/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/esp32s3/soc_memprot_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- esp_hw_support/include/soc/esp32s3/spiram.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc/rtc_wdt.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_sysview_trace.h (notice 1).
 
 --- esp_hw_support/include/soc/spinlock.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/include/soc_log.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / console/esp_console.h (notice 1).
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_bbpll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_brownout.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_dig_reg.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_lp_bias.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_saradc.h (notice 1) ---
 /*
@@ -8150,16 +8193,16 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 
 
 --- esp_hw_support/port/esp32s3/private_include/regi2c_ulp.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/port/esp32s3/regi2c_ctrl.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- esp_hw_support/port/esp32s3/rtc_clk_common.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_hw_support/port/esp32s3/spiram_psram.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_ipc/include/esp_ipc_isr.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
@@ -8199,13 +8242,13 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / esp_lcd/include/esp_lcd_panel_ops.h (notice 1).
 
 --- esp_netif/include/esp_netif_defaults.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_netif/include/esp_netif_ip_addr.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_netif/include/esp_netif_types.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_phy/esp32s3/include/phy_init_data.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / console/esp_console.h (notice 1).
@@ -8480,7 +8523,7 @@ The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/es
 
 
 --- esp_rom/include/esp_rom_tjpgd.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_rom/include/esp_rom_tjpgd.h (notice 2) ---
 /*-----------------------------------------------------------------------------/
@@ -8510,7 +8553,7 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_app_trace.h (notice 1).
 
 --- esp_wifi/include/esp_coexist.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- esp_wifi/include/esp_coexist_internal.h (notice 1) ---
 /*
@@ -9367,13 +9410,13 @@ and the Xtensa core configuration need not have a timer.
 
 
 --- hal/esp32s3/include/hal/adc_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/cache_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_hw_support/include/esp_private/sar_periph_ctrl.h (notice 1).
 
 --- hal/esp32s3/include/hal/clk_gate_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/ds_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
@@ -9388,13 +9431,13 @@ The same license text is reproduced above under ESP-IDF SDK / esp_lcd/include/es
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- hal/esp32s3/include/hal/gpio_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/hmac_hal.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/hmac_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/i2c_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/esp32/rom/rsa_pss.h (notice 1).
@@ -9409,7 +9452,7 @@ The same license text is reproduced above under ESP-IDF SDK / esp_lcd/include/es
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
 
 --- hal/esp32s3/include/hal/mcpwm_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/rmt_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -9418,7 +9461,7 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/esp32/rom/rsa_pss.h (notice 1).
 
 --- hal/esp32s3/include/hal/rtc_io_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/rwdt_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
@@ -9430,10 +9473,10 @@ The same license text is reproduced above under ESP-IDF SDK / esp_hw_support/inc
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- hal/esp32s3/include/hal/touch_sensor_hal.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/touch_sensor_ll.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/esp32s3/include/hal/trace_ll.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / asio/port/include/openssl/conf.h (notice 1).
@@ -9492,10 +9535,10 @@ The same license text is reproduced above under ESP-IDF SDK / esp_lcd/include/es
 The same license text is reproduced above under ESP-IDF SDK / driver/esp32s3/include/driver/touch_sensor.h (notice 1).
 
 --- hal/include/hal/memprot_types.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/include/hal/touch_sensor_types.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/include/hal/twai_types.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
@@ -9507,10 +9550,10 @@ The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/es
 The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/esp32/rom/rsa_pss.h (notice 1).
 
 --- hal/include/hal/usb_phy_hal.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/include/hal/usb_phy_types.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- hal/include/hal/xt_wdt_hal.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -9629,10 +9672,10 @@ The same license text is reproduced above under ESP-IDF SDK / json_generator/ups
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- log/include/esp_log.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- log/include/esp_log_internal.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- lwip/include/apps/ping/ping.h (notice 1) ---
 /*
@@ -13061,7 +13104,7 @@ The same license text is reproduced above under ESP-IDF SDK / mbedtls/mbedtls/in
 
 
 --- mbedtls/port/include/mbedtls/bignum.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- mbedtls/port/include/mbedtls/esp_config.h (notice 2) ---
 /*
@@ -13307,7 +13350,7 @@ The same license text is reproduced above under ESP-IDF SDK / app_trace/include/
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- openssl/include/openssl/ssl.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- protobuf-c/protobuf-c/protobuf-c/protobuf-c.h (notice 1) ---
 /*
@@ -13518,7 +13561,7 @@ The same license text is reproduced above under ESP-IDF SDK / bt/common/osi/incl
 The same license text is reproduced above under ESP-IDF SDK / bt/common/osi/include/osi/fixed_pkt_queue.h (notice 1).
 
 --- sdmmc/include/sdmmc_cmd.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/apb_saradc_struct.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / app_trace/include/esp_app_trace.h (notice 1).
@@ -13596,7 +13639,7 @@ The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/includ
 The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/include/soc/i2c_reg.h (notice 1).
 
 --- soc/esp32s3/include/soc/periph_defs.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/rmt_reg.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/include/soc/i2c_reg.h (notice 1).
@@ -13605,13 +13648,13 @@ The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/includ
 The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/include/soc/i2c_reg.h (notice 1).
 
 --- soc/esp32s3/include/soc/rtc.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/rtc_cntl_reg.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/rtc_cntl_struct.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/rtc_i2c_reg.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/include/soc/i2c_reg.h (notice 1).
@@ -13623,7 +13666,7 @@ The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/includ
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- soc/esp32s3/include/soc/sens_struct.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/soc_caps.h (notice 1) ---
 /*
@@ -13634,7 +13677,7 @@ The same license text is reproduced above under ESP-IDF SDK / bootloader_support
 
 
 --- soc/esp32s3/include/soc/soc_pins.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/syscon_reg.h (notice 1) ---
 /**
@@ -13657,10 +13700,10 @@ The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/includ
 The same license text is reproduced above under ESP-IDF SDK / soc/esp32s3/include/soc/i2c_reg.h (notice 1).
 
 --- soc/esp32s3/include/soc/touch_sensor_channel.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/touch_sensor_pins.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- soc/esp32s3/include/soc/tracemem_config.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
@@ -13701,7 +13744,7 @@ The same license text is reproduced above under ESP-IDF SDK / esp_lcd/include/es
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- soc/include/soc/usb_phy_periph.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- spi_flash/include/esp_private/spi_flash_os.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / driver/esp32s3/include/driver/touch_sensor.h (notice 1).
@@ -13710,7 +13753,7 @@ The same license text is reproduced above under ESP-IDF SDK / driver/esp32s3/inc
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- spi_flash/include/spi_flash_chip_th.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- spi_flash/include/spi_flash_override.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_rom/include/esp32/rom/rsa_pss.h (notice 1).
@@ -13757,16 +13800,16 @@ The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/includ
 The same license text is reproduced above under ESP-IDF SDK / esp_adc_cal/include/esp_adc_cal.h (notice 1).
 
 --- vfs/include/esp_vfs.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- vfs/include/esp_vfs_cdcacm.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- vfs/include/esp_vfs_console.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_flash_data_types.h (notice 1).
 
 --- vfs/include/esp_vfs_dev.h (notice 1) ---
-The same license text is reproduced above under ESP-IDF SDK / bootloader_support/include/esp_app_format.h (notice 1).
+The same license text is reproduced above under ESP-IDF ESP32-S3 rtc_init.c deep-sleep backport / vendor/esp_idf_compat/rtc_init.c (header).
 
 --- vfs/include/esp_vfs_semihost.h (notice 1) ---
 The same license text is reproduced above under ESP-IDF SDK / esp_hw_support/port/esp32s3/private_include/regi2c_saradc.h (notice 1).
@@ -16596,6 +16639,65 @@ Modes: standalone, launcher, rnode
 The same license text is reproduced above under Arduino: M5Unified / LICENSE.
 
 ========================================================================
+Mbed TLS Finished backport: common.h 2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9
+https://github.com/espressif/mbedtls/blob/2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9/library/common.h
+Boards: tdeck, tpager
+Modes: standalone
+
+--- vendor/esp_idf_compat/mbedtls/common.h (header) ---
+/**
+ * \file common.h
+ *
+ * \brief Utility macros for internal use in the library
+ */
+/*
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+
+========================================================================
+Mbed TLS Finished backport: ssl_internal.h 2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9
+https://github.com/espressif/mbedtls/blob/2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9/include/mbedtls/ssl_internal.h
+Boards: tdeck, tpager
+Modes: standalone
+
+--- vendor/esp_idf_compat/mbedtls/ssl_internal.h (header) ---
+/**
+ * \file ssl_internal.h
+ *
+ * \brief Internal functions shared by the SSL modules
+ */
+/*
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+
+========================================================================
+Mbed TLS Finished backport: ssl_tls.c 2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9
+https://github.com/espressif/mbedtls/blob/2b8e772fc1cb0732cda3bae7d1e9d6f4cfaf63d9/library/ssl_tls.c
+Boards: tdeck, tpager
+Modes: standalone
+
+--- vendor/esp_idf_compat/mbedtls/ssl_tls.c (header) ---
+/*
+ *  SSLv3/TLSv1 shared functions
+ *
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+/*
+ *  The SSL 3.0 specification was drafted by Netscape in 1996,
+ *  and became an IETF standard in 1999.
+ *
+ *  http://wp.netscape.com/eng/ssl3/
+ *  http://www.ietf.org/rfc/rfc2246.txt
+ *  http://www.ietf.org/rfc/rfc4346.txt
+ */
+
+
+========================================================================
 Montserrat 711e8ae6b4fa9d33d8482c9ec4871d906a345344
 https://github.com/JulietaUla/Montserrat/tree/711e8ae6b4fa9d33d8482c9ec4871d906a345344
 Boards: tdeck, tpager
@@ -17008,8 +17110,8 @@ Licensed under the MIT license.
 The same license text is reproduced above under Arduino: Adafruit ST7735 and ST7789 Library / MIT permission and disclaimer.
 
 ========================================================================
-rsLXMFLite f4c16b87b595f4f484fa33fe3984cbafbdce714b
-https://github.com/ratspeak/rsLXMFLite/tree/f4c16b87b595f4f484fa33fe3984cbafbdce714b
+rsLXMFLite 4ba7a6ac42e3af1ba27fe9b9d9086427dd1e749e
+https://github.com/ratspeak/rsLXMFLite/tree/4ba7a6ac42e3af1ba27fe9b9d9086427dd1e749e
 Boards: tdeck, tpager, cardputer
 Modes: standalone
 
@@ -17678,8 +17780,8 @@ For more information on this, and how to apply and follow the GNU AGPL, see
 
 
 ========================================================================
-rsReticulumLite 25842ef187e2e29819c73121b90e57f5e367b419
-https://github.com/ratspeak/rsReticulumLite/tree/25842ef187e2e29819c73121b90e57f5e367b419
+rsReticulumLite afddf8a54ee15db979d3eebdb60b0fb70a428c60
+https://github.com/ratspeak/rsReticulumLite/tree/afddf8a54ee15db979d3eebdb60b0fb70a428c60
 Boards: tdeck, tpager, cardputer
 Modes: standalone
 
@@ -26273,6 +26375,48 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+
+========================================================================
+Semtech SX126x timing adaptation a10c5dfdf89788c6ac805e9fe98889de44175aa2
+https://github.com/Lora-net/sx126x_driver/blob/a10c5dfdf89788c6ac805e9fe98889de44175aa2/src/sx126x.c
+Boards: tdeck, tpager, cardputer
+Modes: standalone
+
+--- src/core/radio/SX1262Timing.h (header) ---
+/**
+ * @file      sx126x.c
+ *
+ * @brief     SX126x radio driver implementation
+ *
+ * The Clear BSD License
+ * Copyright Semtech Corporation 2021. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted (subject to the limitations in the disclaimer
+ * below) provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of the Semtech corporation nor the
+ *       names of its contributors may be used to endorse or promote products
+ *       derived from this software without specific prior written permission.
+ *
+ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+ * THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+ * NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL SEMTECH CORPORATION BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
 
 ========================================================================

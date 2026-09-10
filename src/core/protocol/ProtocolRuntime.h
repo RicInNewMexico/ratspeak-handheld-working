@@ -34,6 +34,20 @@ public:
     bool begin(FlashStore* flash, SDStore* sd, IdentityManager* idMgr, MessageStore* store,
                AnnounceManager* announceMgr, int32_t profile, uint32_t nodeHeapCaps);
     void end();
+    // Nonblocking message barrier. Lifecycle consumers keep pollReceive running
+    // and consume their initial-send results while storage settles. end()
+    // requires both incoming and outgoing ownership drained.
+    void stopReceive();
+    void pollReceive();
+    bool receiveDrained() const { return _lxmf.incoming().drained() && _lxmf.drained(); }
+
+    // Retains the context and the caller-owned radio until both message owners
+    // and the already-started radio burst settle. No RX, scheduler or metadata
+    // retries run here. The caller still polls MessageStore and result consumers.
+    void beginMaintenance(LoRaInterface& radio);
+    void pollMaintenance();
+    bool maintenanceDrained() const;
+    bool maintenanceFailed() const;
 
     RustInterfacePump& pump() { return _pump; }
     bool lifecycleReady() const { return _identityLoaded && _nodeOpen; }
@@ -71,9 +85,21 @@ public:
     unsigned long lastAnnounceTime() const override { return _lastAnnounceMs; }
     uint32_t announceFilterCount() const override;
 
-    bool lxmfSendMessage(const uint8_t dest[16], const char* content,
-                         const char* title, bool preferLink) override;
-    void lxmfDropPeer(const std::string& peerHex) override;
+    handheld::outgoing::Submission lxmfSubmit(const uint8_t dest[16],
+        const uint8_t* title, size_t titleLength, const uint8_t* content,
+        size_t contentLength, bool preferLink = false) override;
+    handheld::outgoing::Poll lxmfPoll(handheld::outgoing::Ticket,
+        handheld::outgoing::InitialResult&) const override;
+    bool lxmfAcknowledge(handheld::outgoing::Ticket) override;
+    bool lxmfCancel(handheld::outgoing::Ticket) override;
+    bool lxmfStatus(const handheld::storage::RecordKey&,
+        handheld::outgoing::StatusView&) const override;
+    uint32_t lxmfStatusRevision() const override;
+    void lxmfStopAdmissions() override;
+    bool lxmfDrained() const override;
+    handheld::storage::Error lxmfDrainError() const override;
+    bool lxmfBeginPeerDelete(const uint8_t peer[16]) override;
+    void lxmfFinishPeerDelete(const uint8_t peer[16], const handheld::storage::Result&) override;
     int lxmfQueuedCount() const override { return _enginesUp ? _lxmf.queuedCount() : 0; }
     void setMessageCallback(LXMFManager::MessageCallback cb) override { _onMessage = cb; }
     void setStatusCallback(LXMFManager::StatusCallback cb) override { _statusCb = cb; }
@@ -116,6 +142,9 @@ private:
     bool _identityLoaded = false;
     bool _nodeOpen = false;
     bool _enginesUp = false;
+    enum AnnounceTiming : uint8_t { PathPending = 1, NormalPending = 2, HasPathResponseTime = 4 };
+    uint8_t _announceTiming = 0; // Uses the existing alignment gap after lifecycle flags.
+    LoRaInterface* _maintenanceRadio = nullptr;
 
     uint8_t _identityHash[16] = {};
     uint8_t _destHash[16] = {};
@@ -130,17 +159,19 @@ private:
     // Path-request self-response throttle (fix map §4). Layer 2: coalesce a burst of distinct-tag
     // retries into ONE answer after a grace window. Layer 3: cap the answer rate regardless of tag.
     // (Layer 1 — same-tag dedup — is handled inside the Rust node before the signal reaches us.)
-    static constexpr unsigned long PATH_REQUEST_GRACE_MS = 400;   // Python PATH_REQUEST_GRACE (burst coalesce)
-    static constexpr unsigned long PATH_RESP_DEDUP_MS = 5000;     // min interval between answers
-    unsigned long _pathRespPendingUntil = 0;  // 0 = nothing scheduled; else due-time (millis)
-    unsigned long _lastPathRespMs = 0;         // last path-response TX (millis; 0 = never)
-    unsigned long _normalAnnouncePendingUntil = 0;
+    static constexpr uint32_t PATH_REQUEST_GRACE_MS = 400;   // Python PATH_REQUEST_GRACE (burst coalesce)
+    static constexpr uint32_t PATH_RESP_DEDUP_MS = 5000;     // min interval between answers
+    // Explicit flags distinguish an inactive timer from a valid wrapped time0.
+    uint32_t _pathRespPendingUntil = 0;
+    uint32_t _lastPathRespMs = 0;
+    uint32_t _normalAnnouncePendingUntil = 0;
     size_t _normalAnnouncePendingLen = 0;
     uint8_t _pendingPathResponseTag[16] = {};
     size_t _pendingPathResponseTagLen = 0;
     uint8_t _pendingPathResponseIface = RustInterfacePump::LORA_IFACE_ID;
-    // Last app_data (display name) from a normal announce, reused for a path response so the
-    // answer carries the same contact info. Empty until the first announce (name is cosmetic).
+    // Current name/capability bytes, seeded before ingress and refreshed after
+    // committed settings changes. Shared by new path responses and nonempty
+    // deferred normal announces; already admitted signed packets are immutable.
     static constexpr size_t APP_DATA_MAX = 256;
     uint8_t _lastAppData[APP_DATA_MAX] = {};
     size_t _lastAppDataLen = 0;

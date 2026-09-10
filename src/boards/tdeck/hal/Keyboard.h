@@ -4,40 +4,14 @@
 #include <Wire.h>
 #include "config/BoardConfig.h"
 
-// Input modes
-enum class InputMode {
-    Navigation,  // Arrow-like movement, hotkeys active
-    TextInput    // Character entry, Esc exits to Navigation
-};
-
-// Simplified key event for consumers
-struct KeyEvent {
-    char character;
-    bool ctrl;
-    bool shift;
-    bool fn;
-    bool alt;
-    bool opt;
-    bool enter;
-    bool del;
-    bool tab;
-    bool space;
-    // Directional arrows (from trackball)
-    bool up;
-    bool down;
-    bool left;
-    bool right;
-    // Shared-UI contract fields (pager KeyEvent): never set on T-Deck.
-    // encoder = event came from a scroll wheel; repeat = synthesized auto-repeat
-    // while a key is held (handlers using backspace as back/dismiss ignore those).
-    bool encoder;
-    bool repeat;
-};
+#include "input/KeyEvent.h"
 
 class Keyboard {
 public:
     bool begin();
     void update();
+    // Consume the wake burst and cancel synthesis until a fresh press.
+    void discardPending();
 
     // Mode control
     InputMode getMode() const { return _mode; }
@@ -69,9 +43,6 @@ private:
     InputMode _mode = InputMode::Navigation;
     KeyEvent _event = {};
     bool _hasEvent = false;
-    uint8_t _lastKey = 0;
-    bool _altHeld = false;           // Software Alt tracking
-    unsigned long _altPressTime = 0; // When Alt was detected
     uint8_t _backlightBrightness = 255; // [31, 255]
     bool _backlightLit = false;         // last host-commanded state; C3 <Alt>+<B> toggles are invisible
 

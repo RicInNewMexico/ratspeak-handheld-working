@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "incoming_view_tests.rs"]
+mod incoming_view_tests;
+
 /// Inline caps for the decoded message event. Sized to the FULL single-frame payload budget so the
 /// `> cap` check can never wrongly reject a message that already fit one frame + passed validation
 /// (title + content together are <= MAX_LXMF_PAYLOAD; either alone is <= it).
@@ -499,6 +503,59 @@ pub unsafe extern "C" fn rs_handheld_rns_lxmf_peek_source_hint(
 /// resource plaintext bound; a message larger than this cannot be delivered and is refused upstream.
 pub(super) const LXMF_PACKED_MAX: usize = rns_resource::DATA_MAX;
 
+/// Exact packed LXMF length from the construction encoder, without reading
+/// bodies, allocating, or requiring an identity. Capacity is a caller policy.
+///
+/// # Safety
+/// `out_size` is writable and aligned. It is unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_lxmf_packed_size(
+    title_len: usize,
+    content_len: usize,
+    out_size: *mut usize,
+) -> RsHandheldStatus {
+    if out_size.is_null() {
+        return RsHandheldStatus::ErrInvalidArg;
+    }
+    match lxmf_codec::packed_len(title_len, content_len) {
+        Ok(size) => {
+            unsafe { *out_size = size };
+            RsHandheldStatus::Ok
+        }
+        Err(_) => RsHandheldStatus::ErrCapacity,
+    }
+}
+
+#[cfg(test)]
+mod packed_size_tests {
+    use super::*;
+    #[test]
+    fn exact_size_ffi_validates_output_and_checked_lengths() {
+        let mut size = 7;
+        unsafe {
+            assert_eq!(
+                rs_handheld_lxmf_packed_size(0, 3547, &mut size),
+                RsHandheldStatus::Ok
+            );
+            assert_eq!(size, LXMF_PACKED_MAX);
+            assert_eq!(
+                rs_handheld_lxmf_packed_size(256, 3290, &mut size),
+                RsHandheldStatus::Ok
+            );
+            assert_eq!(size, LXMF_PACKED_MAX);
+            assert_eq!(
+                rs_handheld_lxmf_packed_size(0, usize::MAX, &mut size),
+                RsHandheldStatus::ErrCapacity
+            );
+            assert_eq!(size, LXMF_PACKED_MAX);
+            assert_eq!(
+                rs_handheld_lxmf_packed_size(0, 0, core::ptr::null_mut()),
+                RsHandheldStatus::ErrInvalidArg
+            );
+        }
+    }
+}
+
 /// Build a FULL packed LXMF message for LINK/RESOURCE (DIRECT) delivery: `dest(16) ||
 /// source(16) || signature(64) || msgpack payload` — no ECIES wrap (the link session crypto
 /// replaces it). Byte-identical to Python `LXMessage.pack()`. Transmit this either as a single
@@ -637,35 +694,19 @@ pub unsafe extern "C" fn rs_handheld_rns_lxmf_parse_link(
         {
             return RsHandheldStatus::ErrInvalidArg;
         }
-        // SAFETY: `ctx` valid per the contract.
-        let id = match &unsafe { &*ctx }.identity {
-            Some(id) => id,
-            None => return RsHandheldStatus::ErrNotReady,
-        };
         let data = unsafe { core::slice::from_raw_parts(data, data_len) };
-        // Scratch (64 + payload) off the task stack. box_zeroed: Box::new would
-        // materialise the array on the stack.
         let mut scratch: Box<[u8; LXMF_PACKED_MAX]> = match box_zeroed() {
             Some(b) => b,
             None => return RsHandheldStatus::ErrInternal,
         };
-        let view = match lxmf_codec::parse_link(
-            id,
+        let view = match validated_direct_view(
+            unsafe { &*ctx },
             data,
             unsafe { &*source_public_key },
             scratch.as_mut_slice(),
         ) {
-            Ok(v) => v,
-            Err(
-                LxmfError::Crypto
-                | LxmfError::SignatureInvalid
-                | LxmfError::SourceHashMismatch
-                | LxmfError::DestinationMismatch,
-            ) => return RsHandheldStatus::ErrCrypto,
-            Err(LxmfError::MalformedPayload | LxmfError::OutputTooSmall) => {
-                return RsHandheldStatus::ErrInvalidArg;
-            }
-            Err(_) => return RsHandheldStatus::ErrInternal,
+            Ok(view) => view,
+            Err(error) => return error,
         };
         let tn = view.title.len().min(title_cap);
         let cn = view.content.len().min(content_cap);
@@ -683,6 +724,101 @@ pub unsafe extern "C" fn rs_handheld_rns_lxmf_parse_link(
             *out_title_len = view.title.len();
             *out_content_len = view.content.len();
             *out_is_reaction = lxmf_is_reaction(view.fields) as i32;
+        }
+        RsHandheldStatus::Ok
+    })
+}
+
+fn validated_direct_view<'a>(
+    ctx: &RsHandheldRns,
+    data: &'a [u8],
+    source_public_key: &[u8; PUBLIC_KEY_LENGTH],
+    scratch: &mut [u8],
+) -> Result<LxmfView<'a>, RsHandheldStatus> {
+    let id = ctx.identity.as_ref().ok_or(RsHandheldStatus::ErrNotReady)?;
+    lxmf_codec::parse_link(id, data, source_public_key, scratch).map_err(|error| match error {
+        LxmfError::Crypto
+        | LxmfError::SignatureInvalid
+        | LxmfError::SourceHashMismatch
+        | LxmfError::DestinationMismatch => RsHandheldStatus::ErrCrypto,
+        LxmfError::MalformedPayload | LxmfError::OutputTooSmall => RsHandheldStatus::ErrInvalidArg,
+        _ => RsHandheldStatus::ErrInternal,
+    })
+}
+
+/// Validated direct payload spans borrowing the immutable input. No body copy is retained.
+#[repr(C)]
+#[derive(Default)]
+pub struct RsHandheldLxmfView {
+    pub message_id: [u8; 32],
+    pub source_hash: [u8; DESTINATION_LENGTH],
+    pub timestamp: f64,
+    pub title_offset: u32,
+    pub title_len: u32,
+    pub content_offset: u32,
+    pub content_len: u32,
+    pub is_reaction: i32,
+}
+
+/// Validate with the same codec as the copying direct API and return input-relative spans.
+///
+/// # Safety
+/// `ctx` must be live; `data` must contain `data_len` immutable readable bytes;
+/// `source_public_key` must contain 64 readable bytes and `out` be writable.
+/// Output spans are valid only while that exact input remains alive and unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rs_handheld_rns_lxmf_parse_link_view(
+    ctx: *const RsHandheldRns,
+    data: *const u8,
+    data_len: usize,
+    source_public_key: *const [u8; PUBLIC_KEY_LENGTH],
+    out: *mut RsHandheldLxmfView,
+) -> RsHandheldStatus {
+    guard(|| {
+        if ctx.is_null()
+            || data.is_null()
+            || source_public_key.is_null()
+            || out.is_null()
+            || data_len > u32::MAX as usize
+        {
+            return RsHandheldStatus::ErrInvalidArg;
+        }
+        let data = unsafe { core::slice::from_raw_parts(data, data_len) };
+        let mut scratch: Box<[u8; LXMF_PACKED_MAX]> = match box_zeroed() {
+            Some(b) => b,
+            None => return RsHandheldStatus::ErrInternal,
+        };
+        let view = match validated_direct_view(
+            unsafe { &*ctx },
+            data,
+            unsafe { &*source_public_key },
+            scratch.as_mut_slice(),
+        ) {
+            Ok(view) => view,
+            Err(error) => return error,
+        };
+        let offset = |bytes: &[u8]| -> Option<u32> {
+            let at = (bytes.as_ptr() as usize).checked_sub(data.as_ptr() as usize)?;
+            if at > data.len() || bytes.len() > data.len() - at {
+                return None;
+            }
+            u32::try_from(at).ok()
+        };
+        let (Some(title_offset), Some(content_offset)) = (offset(view.title), offset(view.content))
+        else {
+            return RsHandheldStatus::ErrInternal;
+        };
+        unsafe {
+            *out = RsHandheldLxmfView {
+                message_id: view.message_id,
+                source_hash: view.source_hash,
+                timestamp: view.timestamp,
+                title_offset,
+                title_len: view.title.len() as u32,
+                content_offset,
+                content_len: view.content.len() as u32,
+                is_reaction: lxmf_is_reaction(view.fields) as i32,
+            };
         }
         RsHandheldStatus::Ok
     })

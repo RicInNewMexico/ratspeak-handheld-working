@@ -33,7 +33,8 @@ void HelpOverlay::render(M5Canvas& canvas) {
 
 bool HelpOverlay::handleKey(const KeyEvent& event) {
     if (_visible) {
-        // Any key closes the overlay
+        if (event.repeat) return true;
+        // Any fresh key closes the overlay
         _visible = false;
         return true;
     }

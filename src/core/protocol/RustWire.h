@@ -33,12 +33,13 @@ inline int32_t headerTypeOf(const uint8_t* raw) {
 // Path-request self-response throttle (fix map §4), as a pure function so it is host-testable.
 // On an inbound path request for our own dest, schedule a re-announce after a grace window that
 // coalesces a burst (layer 2), unless one is already scheduled or we answered within the dedup
-// window (layer 3). `pendingUntil`/`lastRespMs` are the caller's timers (0 = unset); `now` is
-// millis(). Returns true and advances `pendingUntil` iff a NEW answer was scheduled.
-inline bool schedulePathResponse(unsigned long now, unsigned long graceMs, unsigned long dedupMs,
-                                 unsigned long& pendingUntil, unsigned long lastRespMs) {
-    if (pendingUntil != 0) return false;                                    // already coalescing
-    if (lastRespMs != 0 && now - lastRespMs < dedupMs) return false;        // answered recently
+// window (layer 3). Explicit presence facts allow every uint32 millis value,
+// including0. Returns true and advances the deadline iff a NEW answer was scheduled.
+inline bool schedulePathResponse(uint32_t now, uint32_t graceMs, uint32_t dedupMs,
+                                 uint32_t& pendingUntil, uint32_t lastRespMs,
+                                 bool pending, bool hasLastResponse) {
+    if (pending) return false;
+    if (hasLastResponse && uint32_t(now - lastRespMs) < dedupMs) return false;
     pendingUntil = now + graceMs;
     return true;
 }

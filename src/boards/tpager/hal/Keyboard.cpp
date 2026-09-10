@@ -125,6 +125,7 @@ void Keyboard::flushEvents() const {
 char Keyboard::decodeKey(uint8_t matrixIndex, bool pressed) {
     if (matrixIndex == KEY_ALT) {
         _altHeld = pressed;
+        if (pressed) _backspaceHeld = false; // Escape layer never repeats deletion.
         return 0;
     }
     if (matrixIndex == KEY_CAPS) {
@@ -133,9 +134,11 @@ char Keyboard::decodeKey(uint8_t matrixIndex, bool pressed) {
     }
     if (matrixIndex == KEY_BACKSPACE) {
         // FIFO reports press and release; track real held state for auto-repeat.
-        _backspaceHeld = pressed;
+        _backspaceHeld = pressed && !_altHeld;
         if (pressed) _backspaceNextRepeatMs = millis() + INITIAL_DELAY_MS;
-        return pressed ? '\b' : 0;
+        // The matrix has no dedicated Escape key. Keep cancellation distinct
+        // from text deletion and never synthesize repeated Escape events.
+        return pressed ? (_altHeld ? '\x1b' : '\b') : 0;
     }
     if (!pressed) return 0;
     if (matrixIndex == KEY_SPACE) return ' ';
@@ -188,7 +191,13 @@ void Keyboard::update() {
         uint8_t keyCode = raw & 0x7F;
         if (keyCode == 0) continue;
         char decoded = decodeKey(keyCode - 1, rawPressed);
-        if (decoded != 0 && key == 0) key = decoded;
+        if (decoded != 0) {
+            key = decoded;
+            // Leave later presses/releases in the hardware FIFO for the next
+            // poll. Draining it here lost fast typing and changed the selected
+            // key's modifier state to that of later events.
+            break;
+        }
     }
     writeRegister(REG_INT_STAT, 0x1F);
 
@@ -281,4 +290,17 @@ void Keyboard::setSpareRowGate(bool lit) const {
         writeRegister(REG_GPIO_DAT_OUT_1, dat & ~SPARE_ROWS);
         writeRegister(REG_GPIO_DIR_1, dir | SPARE_ROWS);
     }
+}
+
+void Keyboard::discardPending() {
+    // TCA8418 holds at most ten edges. Decode discarded modifiers/releases so
+    // the following real press still observes the physical modifier state.
+    const uint8_t count = keyCount();
+    for (uint8_t i = 0; i < count; ++i) {
+        const uint8_t raw = readRegister(REG_KEY_EVENT_A);
+        if (raw & 0x7f) decodeKey((raw & 0x7f) - 1, raw & 0x80);
+    }
+    _backspaceHeld = false;
+    _hasEvent = false;
+    writeRegister(REG_INT_STAT, 0x1f);
 }

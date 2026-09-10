@@ -37,10 +37,20 @@ void TabBar::render(M5Canvas& canvas) {
         int labelLen = canvas.textWidth(TAB_LABELS[i]);
         int labelX = tx + (Theme::TAB_W - labelLen) / 2;
         int labelY = y + (Theme::TAB_BAR_H - Theme::CHAR_H) / 2;
+        // Match the compact LVGL badge. Keep the exact count in the model;
+        // center the visible Msgs label and badge together so neither is hidden.
+        char badge[3] = {};
+        int badgeW = 0;
+        if (_unreadCounts[i] > 0) {
+            if (_unreadCounts[i] > 9) memcpy(badge, "9+", sizeof(badge));
+            else snprintf(badge, sizeof(badge), "%d", _unreadCounts[i]);
+            badgeW = strlen(badge) * Theme::CHAR_W + 6;
+            labelX = tx + (Theme::TAB_W - labelLen - badgeW - 4) / 2;
+        }
 
         if (active) {
             int pillW = labelLen + 8;
-            int pillX = tx + (Theme::TAB_W - pillW) / 2;
+            int pillX = labelX - 4;
             int pillY = y + 2;
             int pillH = Theme::TAB_BAR_H - 4;
             canvas.fillRoundRect(pillX, pillY, pillW, pillH, 3, Theme::SELECTION_BG);
@@ -62,10 +72,7 @@ void TabBar::render(M5Canvas& canvas) {
         canvas.print(TAB_LABELS[i]);
 
         if (_unreadCounts[i] > 0) {
-            char badge[8];
-            snprintf(badge, sizeof(badge), "%d", _unreadCounts[i]);
-            int badgeW = strlen(badge) * Theme::CHAR_W + 6;
-            int badgeX = tx + Theme::TAB_W - badgeW - 3;
+            int badgeX = labelX + labelLen + 4;
             int badgeY = y + 3;
             canvas.fillRoundRect(badgeX, badgeY, badgeW, Theme::CHAR_H + 3, 3, Theme::BADGE_BG);
             canvas.setTextColor(Theme::BADGE_TEXT);

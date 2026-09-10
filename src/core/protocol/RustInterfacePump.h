@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "ratspeak_protocol.h"
 #include "protocol/RustClock.h"
+#include "transport/TxLease.h"
 
 class LoRaInterface;
 class TCPClientInterface;
@@ -69,6 +70,7 @@ public:
     // Authoritative first-hop bitrate for a registered interface, or zero when unavailable.
     uint32_t interfaceBitrate(uint8_t ifaceId) const;
     uint32_t interfaceTxWaitMs(uint8_t ifaceId, uint32_t packets) const;
+    uint32_t interfaceGeneration(uint8_t ifaceId);
     int lastLoraRssi() const;    // last RX RSSI from the LoRa driver (0 if no LoRa)
     float lastLoraSnr() const;
 
@@ -79,15 +81,42 @@ public:
     // announces and genuinely pathless endpoint traffic use sendAll().
     bool sendTo(uint8_t ifaceId, const uint8_t* data, size_t len);
     bool sendAll(const uint8_t* data, size_t len);
+    // Retaining producers capture once, then use the same lease for every retry.
+    bool captureLease(uint8_t ifaceId, const uint8_t* data, size_t len,
+                      handheld::TxLease& lease);
+    bool captureLeaseAt(uint8_t ifaceId, const uint8_t* data, size_t len,
+                        uint64_t bornMs, uint32_t maxWaitMs, handheld::TxLease& lease);
+    bool leaseLive(const handheld::TxLease& lease);
+    bool sendLeased(const uint8_t* data, size_t len, const handheld::TxLease& lease);
+    void setReceiptHook(handheld::TxReceiptHook hook, void* context);
+    // Blocked retains caller ownership. Queued transfers ownership to LoRa;
+    // Started/Dropped may call the hook inline, retiring the caller's receipt.
+    handheld::TxOffer offerReceipt(const uint8_t* data, size_t len,
+                                  const handheld::TxLease& lease);
+    // Cached local announcements may replay on another request interface. Keep
+    // their original Rust lifetime while binding this new output session.
+    bool sendRetainedTo(uint8_t ifaceId, const uint8_t* data, size_t len,
+                        const handheld::TxLease& retained);
 
     const Counters& counters() const { return _counters; }
 
 private:
     void ingest(const uint8_t* data, size_t len, uint8_t ifaceId);
     void drainOutbound();
-    void transmit(const uint8_t* data, size_t len, uint8_t originIface, int32_t reason);
     bool sendAllExcept(const uint8_t* data, size_t len, uint8_t excludedIface);
     int32_t interfaceMode(uint8_t ifaceId) const;
+    bool writeLeased(const uint8_t* data, size_t len, const handheld::TxLease& lease);
+    uint8_t liveTargets() const;
+    uint32_t syncGeneration(uint8_t ifaceId);
+    bool syncInterfaceFacts();
+    void invalidateInterface(uint8_t ifaceId);
+    static bool receiptHook(void*, handheld::TxReceipt, handheld::TxReceiptEvent);
+    void* _receiptContext = nullptr;
+    handheld::TxReceiptHook _receiptHook = nullptr;
+    bool _changingReceiptHook = false;
+    bool _stopping = false;
+    uint32_t _generations[7] = {1, 1, 1, 1, 1, 1, 1};
+    uint32_t _driverGenerations[7] = {};
 
     rs_handheld_rns_t* _ctx = nullptr;
     RustClock* _clock = nullptr;
@@ -103,8 +132,17 @@ private:
     rs_handheld_announce_event_t _event;
     rs_handheld_local_frame_t _local;
     uint8_t _pathRequestTag[16] = {};
-    uint8_t _txBuf[500];
-    size_t _pendingLen = 0;
-    uint8_t _pendingTargets = 0;
-    unsigned long _pendingSince = 0;
+    struct PendingFrame {
+        uint8_t data[500] = {};
+        uint8_t token[handheld::TxLease::TokenBytes] = {};
+        uint32_t generations[7] = {};
+        uint16_t length = 0;
+        uint8_t targets = 0;
+    } _pending;
+    // Copy workspace only: queued rows retain their bytes and refused targets.
+    PendingFrame _peek;
+    uint64_t _peekIdentity = 0;
+    uint32_t _drainEpoch = 1;
+    bool _draining = false;
+    static_assert(sizeof(PendingFrame) <= 640, "Review pending-frame retention budget");
 };

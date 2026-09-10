@@ -66,7 +66,7 @@ void LvNameInputScreen::createUI(lv_obj_t* parent) {
     lv_obj_set_style_bg_color(parent, lv_color_hex(Theme::BG), 0);
     lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
 
-    lv_obj_t* title = makeLabel(parent, "DISPLAY NAME", &lv_font_montserrat_16,
+    lv_obj_t* title = _saveTitle = makeLabel(parent, "DISPLAY NAME", &lv_font_montserrat_16,
                                 Theme::ACCENT, 260, LV_TEXT_ALIGN_CENTER,
                                 LV_LABEL_LONG_DOT);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
@@ -103,9 +103,29 @@ void LvNameInputScreen::createUI(lv_obj_t* parent) {
     snprintf(verBuf, sizeof(verBuf), "v%s", RSDECK_VERSION_STRING);
     lv_label_set_text(ver, verBuf);
     lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -10);
+    setSaving(_saving);
+}
+
+void LvNameInputScreen::setSaving(bool saving) {
+    _saving = saving;
+    if (!_screen) return; // Terminal completion may arrive after UIManager destroyed the widgets.
+    if (_saveTitle) lv_label_set_text(_saveTitle, saving ? "SAVING NAME" : "DISPLAY NAME");
+    if (_textarea) {
+        if (saving) lv_obj_add_state(_textarea, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_textarea, LV_STATE_DISABLED);
+    }
+    if (_doneButton) {
+        if (saving) lv_obj_add_state(_doneButton, LV_STATE_DISABLED);
+        else lv_obj_clear_state(_doneButton, LV_STATE_DISABLED);
+    }
+    if (_doneButton) {
+        lv_obj_t* label = lv_obj_get_child(_doneButton, 0);
+        if (label) lv_label_set_text(label, saving ? "SAVING" : "DONE");
+    }
 }
 
 void LvNameInputScreen::submit(bool enforceEnterGuard) {
+    if (_saving) return;
     if (!_textarea) return;
     if (enforceEnterGuard && millis() - _enterTime < ENTER_GUARD_MS) return;
 
@@ -116,6 +136,7 @@ void LvNameInputScreen::submit(bool enforceEnterGuard) {
 }
 
 bool LvNameInputScreen::handleKey(const KeyEvent& event) {
+    if (_saving) return true;
     if (!_textarea) return false;
 
     if (event.enter || event.character == '\n' || event.character == '\r') {

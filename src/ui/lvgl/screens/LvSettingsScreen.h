@@ -39,8 +39,8 @@ struct SettingItem {
     int step = 1;
     std::vector<const char*> enumLabels;
     std::function<void()> action;
-    std::function<String()> textGetter;
-    std::function<void(const String&)> textSetter;
+    std::function<const String&()> textGetter;
+    std::function<bool(const String&)> textSetter;
     int maxTextLen = 16;
 };
 
@@ -60,7 +60,12 @@ public:
     bool handleKey(const KeyEvent& event) override;
     bool handleLongPress() override;
 
-    void setUserConfig(UserConfig* cfg) { _cfg = cfg; }
+    void setUserConfig(UserConfig* cfg) {
+        _cfg = cfg;
+        // Bind once at boot, before Home or Settings can change reboot-only values.
+        snapshotRebootSettings();
+        snapshotTCPSettings();
+    }
     void setAudio(AudioNotify* audio) { _audio = audio; }
     void setPower(Power* power) { _power = power; }
     void setBackend(handheld::ProtocolView* backend) { _backend = backend; }
@@ -68,9 +73,11 @@ public:
     void setIdentityHash(const String& hash) { _identityHash = hash; }
     void setDestinationHash(const String& hash) { _destinationHash = hash; }
     void setShowQrCallback(std::function<void()> cb) { _showQrCb = cb; }
+    void setShowHelpCallback(std::function<void()> cb) { _showHelpCb = cb; }
 
     const char* title() const override { return "Settings"; }
-    bool firmwareCheckRunning() const { return _fwCheckState.load() == FirmwareCheckState::RUNNING; }
+    bool firmwareCheckRunning() const { return _fwCheckActive.load(std::memory_order_acquire); }
+    void pollFirmwareCheck(); // UI owner: reclaim the completed task before reuse.
 
 private:
     handheld::ServiceClient* _service = nullptr;
@@ -91,6 +98,7 @@ private:
 
     void enterCategory(int catIdx);
     void exitToCategories();
+    bool cancelEditing();
     void updateCategorySelection(int oldIdx, int newIdx);
     void updateItemSelection(int oldIdx, int newIdx);
     void updateWifiSelection(int oldIdx, int newIdx);
@@ -118,7 +126,7 @@ private:
     String _identityHash;
     String _destinationHash;
     std::function<void()> _showQrCb;
-    bool _gpsSnapEnabled = true;
+    std::function<void()> _showHelpCb;
 
     SettingsView _view = SettingsView::CATEGORY_LIST;
     std::vector<SettingsCategory> _categories;
@@ -148,6 +156,7 @@ private:
     };
     std::atomic<FirmwareCheckState> _fwCheckState{FirmwareCheckState::IDLE};
     TaskHandle_t _fwCheckTask = nullptr;
+    std::atomic<bool> _fwCheckActive{false};
     char _fwCheckVersion[24] = {};
 
     // Frequency digit-cursor editor (radio-style)
@@ -164,6 +173,7 @@ private:
     int _wifiPickerIdx = 0;
     size_t _wifiTargetSlot = 0;
     bool _wifiScanActive = false;
+    handheld::Outcome _wifiScanOutcome = handheld::Outcome::Ok;
 
     // Reboot-required tracking
     bool _rebootNeeded = false;
@@ -175,7 +185,7 @@ private:
         bool sdStorageEnabled;
         bool loraEnabled;
     };
-    RebootSnapshot _rebootSnap;
+    RebootSnapshot _rebootSnap{};
     void snapshotRebootSettings();
     bool loraSettingsChanged() const;
     bool interfaceSettingsChanged() const;
@@ -183,9 +193,7 @@ private:
     bool rebootSettingsChanged() const;
 
     // TCP change detection
-    String _tcpSnapHost;
-    uint16_t _tcpSnapPort = 0;
-    bool _tcpSnapAuto = false;
+    std::vector<TCPEndpoint> _tcpSnap;
     void snapshotTCPSettings();
     bool tcpSettingsChanged() const;
 

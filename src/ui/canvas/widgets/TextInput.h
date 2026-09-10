@@ -2,6 +2,7 @@
 
 #include <M5GFX.h>
 #include <string>
+#include <cstdint>
 #include "hal/Keyboard.h"
 #include "Theme.h"
 
@@ -14,8 +15,13 @@ public:
 
     // Content access
     const std::string& getText() const { return _text; }
-    void setText(const std::string& text);
+    uint64_t revision() const { return _revision; }
+    bool setText(const std::string& text);
     void clear();
+    // Reserve before an owner admits work that requires retaining this text.
+    // Existing field editors keep their ordinary length policy.
+    bool reserveTextCapacity(size_t capacity);
+    size_t textCapacity() const { return _text.capacity(); }
 
     // State
     bool isActive() const { return _active; }
@@ -29,6 +35,8 @@ public:
 
 private:
     std::string _text;
+    size_t _capacityLimit = 0; // Zero leaves ordinary settings editors unchanged.
+    uint64_t _revision = 1;
     int _cursorPos = 0;
     bool _active = false;
     bool _cursorVisible = true;

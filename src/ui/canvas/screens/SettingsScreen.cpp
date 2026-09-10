@@ -1,11 +1,78 @@
 #include "SettingsScreen.h"
 #include "Theme.h"
 #include "config/Config.h"
+#include "config/SettingsInput.h"
 #include "radio/RadioFrequency.h"
+#include "radio/RadioPresets.h"
+#include "radio/RadioSettings.h"
+#include "util/DisplayText.h"
 #include <algorithm>
-#include <Preferences.h>
+#include <new>
 #include <WiFi.h>
-#include <WiFiClient.h>
+
+namespace {
+// Three bounded rows keep the full current settings details inside the content
+// area. Scan/draw twice instead of retaining another message or line cache.
+template <typename Visitor>
+void visitSettingsNotice(const char* text, Visitor visit) {
+    constexpr size_t columns = (Theme::CONTENT_W - 20) / Theme::CHAR_W;
+    const char* at = text;
+    for (size_t row = 0; row < 3; ++row) {
+        char line[columns + 1];
+        size_t used = 0, wordBreak = 0;
+        const char* nextWord = nullptr;
+        while (*at && *at != '\n') {
+            size_t available = 0;
+            while (available < 4 && at[available]) ++available;
+            bool escape = false;
+            const size_t scalar = handheld::display::codepoint(
+                reinterpret_cast<const uint8_t*>(at), available, true, escape);
+            const size_t width = escape || *at == '\t' ? 1 : scalar;
+            if (used + width > columns) break;
+            if (*at == ' ' || *at == '\t') {
+                wordBreak = used;
+                nextWord = at + scalar;
+            }
+            if (escape) line[used++] = '?';
+            else if (*at == '\t') line[used++] = ' ';
+            else { memcpy(line + used, at, scalar); used += scalar; }
+            at += scalar;
+        }
+        if (*at && *at != '\n' && nextWord) { used = wordBreak; at = nextWord; }
+        while (used && line[used - 1] == ' ') --used;
+        if (*at == '\n') ++at;
+        while (*at == ' ' || *at == '\t') ++at;
+        if (row == 2 && *at) {
+            while (used > columns - 3) {
+                --used;
+                while (used && handheld::display::continuation(uint8_t(line[used]))) --used;
+            }
+            memcpy(line + used, "...", 3); used += 3;
+        }
+        line[used] = 0;
+        visit(row, line, used);
+        if (!*at) break;
+    }
+}
+
+void drawSettingsNotice(M5Canvas& canvas, const char* text) {
+    size_t rows = 0, widest = 0;
+    visitSettingsNotice(text, [&](size_t row, const char*, size_t length) {
+        rows = row + 1; widest = std::max(widest, length);
+    });
+    const int tw = widest * Theme::CHAR_W + 12;
+    const int th = rows * Theme::CHAR_H + 8;
+    const int tx = (Theme::CONTENT_W - tw) / 2;
+    const int ty = Theme::CONTENT_Y + Theme::CONTENT_H - th - 4;
+    canvas.fillRoundRect(tx, ty, tw, th, 3, Theme::SELECTION_BG);
+    canvas.drawRoundRect(tx, ty, tw, th, 3, Theme::PRIMARY);
+    canvas.setTextColor(Theme::PRIMARY);
+    visitSettingsNotice(text, [&](size_t row, const char* line, size_t) {
+        canvas.setCursor(tx + 6, ty + 4 + row * Theme::CHAR_H);
+        canvas.print(line);
+    });
+}
+} // namespace
 
 // Lite UI edits a single STA network: the selected slot of the core
 // multi-network model (::WiFiNetwork from UserConfig.h — distinct from the
@@ -24,6 +91,8 @@ static const ::WiFiNetwork& staNetworkRO(const UserSettings& s) {
 }
 
 void SettingsScreen::onEnter() {
+    _candidateReady = _config && _candidate.tryAssign(*_config);
+    if (_candidateReady) _candidateDirty = false;
     _subMenu = MENU_MAIN;
     _editing = false;
     _editField = -1;
@@ -41,56 +110,26 @@ void SettingsScreen::buildMainMenu() {
     _list.addItem("Factory Reset", Theme::ERROR);
 }
 
-struct RadioPreset {
-    const char* name;
-    uint8_t sf; uint32_t bw; uint8_t cr; int8_t txPower;
-};
-static const RadioPreset PRESETS[] = {
-    {"Short Turbo",   7,  500000, 5,  14},
-    {"Short Fast",    7,  250000, 5,  14},
-    {"Short Slow",    8,  250000, 5,  14},
-    {"Medium Fast",   9,  250000, 5,  17},
-    {"Medium Slow",   10, 250000, 5,  17},
-    {"Long Turbo",    11, 500000, 8,  LORA_MAX_TX_POWER},
-    {"Long Fast",     11, 250000, 5,  LORA_MAX_TX_POWER},
-    {"Long Moderate", 11, 125000, 8,  LORA_MAX_TX_POWER},
-};
-static constexpr int NUM_PRESETS = 8;
-
-static int detectPresetIndex(const UserSettings& s) {
-    for (int i = 0; i < NUM_PRESETS; i++) {
-        if (s.loraSF == PRESETS[i].sf && s.loraBW == PRESETS[i].bw
-            && s.loraCR == PRESETS[i].cr && s.loraTxPower == PRESETS[i].txPower)
-            return i;
-    }
-    return -1;
-}
-
-static const char* detectPresetName(const UserSettings& s) {
-    int idx = detectPresetIndex(s);
-    return idx >= 0 ? PRESETS[idx].name : "Custom";
-}
-
 void SettingsScreen::buildRadioMenu() {
     _list.clear();
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     char buf[40];
 
     // Active preset indicator
-    snprintf(buf, sizeof(buf), "Active: %s", detectPresetName(s));
+    snprintf(buf, sizeof(buf), "%s: %s", (_radioApplyPending || _config->settingsPending()) ? "Pending" : _candidateDirty ? "Unsaved" : "Saved", RadioPresets::name(s));
     _list.addItem(buf);
 
-    // Presets (items 1..NUM_PRESETS)
-    int activeIdx = detectPresetIndex(s);
-    for (int i = 0; i < NUM_PRESETS; i++) {
+    // Presets (items 1..RadioPresets::count)
+    int activeIdx = RadioPresets::detect(s);
+    for (int i = 0; i < RadioPresets::count; i++) {
         char label[40];
         snprintf(label, sizeof(label), "%s[%s]",
-                 (i == activeIdx) ? ">" : " ", PRESETS[i].name);
+                 (i == activeIdx) ? ">" : " ", RadioPresets::values[i].name);
         _list.addItem(label, (i == activeIdx) ? Theme::PRIMARY : 0);
     }
 
-    // Editable fields (items NUM_PRESETS+1 .. NUM_PRESETS+5)
+    // Editable fields (items RadioPresets::count+1 .. RadioPresets::count+6)
     snprintf(buf, sizeof(buf), "Frequency: %lu Hz", (unsigned long)s.loraFrequency);
     _list.addItem(buf);
     snprintf(buf, sizeof(buf), "SF: %d", s.loraSF);
@@ -101,6 +140,8 @@ void SettingsScreen::buildRadioMenu() {
     _list.addItem(buf);
     snprintf(buf, sizeof(buf), "TX Power: %d dBm", s.loraTxPower);
     _list.addItem(buf);
+    snprintf(buf, sizeof(buf), "Preamble: %ld symbols", s.loraPreamble);
+    _list.addItem(buf);
 
     _list.addItem("< Back");
 }
@@ -108,7 +149,7 @@ void SettingsScreen::buildRadioMenu() {
 void SettingsScreen::buildWiFiMenu() {
     _list.clear();
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
 
     // Item 0: Mode selector
     const char* modeNames[] = {"OFF", "AP", "STA"};
@@ -120,7 +161,7 @@ void SettingsScreen::buildWiFiMenu() {
         // Items 1-2: AP fields
         String apSSID = s.wifiAPSSID.isEmpty() ? "(auto)" : s.wifiAPSSID;
         _list.addItem(("AP SSID: " + std::string(apSSID.c_str())));
-        _list.addItem(("AP Pass: " + std::string(s.wifiAPPassword.c_str())));
+        _list.addItem(s.wifiAPPassword.isEmpty() ? "AP Pass: (open)" : "AP Pass: ********");
     } else if (s.wifiMode == RAT_WIFI_STA) {
         // Item 1: Connection status
         if (WiFi.status() == WL_CONNECTED) {
@@ -153,7 +194,7 @@ void SettingsScreen::buildWiFiMenu() {
 void SettingsScreen::buildTCPMenu() {
     _list.clear();
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
 
     _list.addItem("+ Add Connection");
 
@@ -171,40 +212,30 @@ void SettingsScreen::buildTCPMenu() {
 
 void SettingsScreen::addTCPConnection(const std::string& host, uint16_t port) {
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     if (s.tcpConnections.size() >= MAX_TCP_CONNECTIONS) {
         showToast("Max 4 connections");
         return;
     }
 
     TCPEndpoint ep;
-    ep.host = host.c_str();
+    if (!UserConfig::trySetString(ep.host, host.data(), host.size())) {
+        showToast("Settings memory unavailable; retry", 2500); return;
+    }
     ep.port = port;
     if (ep.host.isEmpty()) return;
 
-    // Test connection before adding (only if WiFi is connected)
-    if (WiFi.status() == WL_CONNECTED) {
-        showToast("Testing connection...");
-        WiFiClient testClient;
-        if (!testClient.connect(ep.host.c_str(), ep.port, 3000)) {
-            testClient.stop();
-            showToast("Connection failed!", 2500);
-            Serial.printf("[TCP] Test failed: %s:%d\n", ep.host.c_str(), ep.port);
-            buildTCPMenu();
-            return;
-        }
-        testClient.stop();
-    }
-
-    s.tcpConnections.push_back(ep);
-    applyAndSave();
-    showToast("Added! Reboot to connect");
+    // Reachability is transient. The transport owner attempts saved endpoints;
+    // saving one must not block this UI or depend on the peer being online now.
+    try { s.tcpConnections.push_back(std::move(ep)); }
+    catch (const std::bad_alloc&) { showToast("Settings memory unavailable; retry", 2500); return; }
+    if (applyAndSave()) showToast("Added! Reboot to connect");
     buildTCPMenu();
 }
 
 void SettingsScreen::toggleTCPConnection(int index) {
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     if (index < 0 || index >= (int)s.tcpConnections.size()) return;
 
     s.tcpConnections[index].autoConnect = !s.tcpConnections[index].autoConnect;
@@ -214,12 +245,11 @@ void SettingsScreen::toggleTCPConnection(int index) {
 
 void SettingsScreen::removeTCPConnection(int index) {
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     if (index < 0 || index >= (int)s.tcpConnections.size()) return;
 
     s.tcpConnections.erase(s.tcpConnections.begin() + index);
-    applyAndSave();
-    showToast("Removed");
+    if (applyAndSave()) showToast("Removed");
     buildTCPMenu();
 }
 
@@ -245,8 +275,8 @@ void SettingsScreen::buildSDCardMenu() {
         snprintf(buf, sizeof(buf), "Free: %llu MB", free / (1024 * 1024));
         _list.addItem(buf);
 
-        _list.addItem("Initialize Standalone");
-        _list.addItem("Wipe All Data", Theme::ERROR);
+        _list.addItem("Initialize & Restart");
+        _list.addItem("Wipe Data & Restart", Theme::ERROR);
     } else {
         _list.addItem("Status: NOT INSERTED");
     }
@@ -260,12 +290,7 @@ void SettingsScreen::sdCardFormat() {
         return;
     }
 
-    if (_sdStore->formatForRsDeck()) {
-        showToast("SD initialized!");
-    } else {
-        showToast("Init failed");
-    }
-    buildSDCardMenu();
+    requestMaintenance(handheld::Operation::FormatSD);
 }
 
 // =============================================================================
@@ -273,51 +298,58 @@ void SettingsScreen::sdCardFormat() {
 // =============================================================================
 
 void SettingsScreen::startWiFiScan() {
-    _list.clear();
-    _list.addItem("Scanning...");
-
-    Serial.println("[WIFI] Starting network scan...");
-
-    // Disconnect from current network to free the radio for scanning
-    WiFi.disconnect(false);  // disconnect but don't erase credentials
-    delay(100);
-
-    // Ensure WiFi is on in STA mode for scanning
-    if (WiFi.getMode() == WIFI_OFF) {
-        WiFi.mode(WIFI_STA);
+    _subMenu = MENU_WIFI_SCAN;
+    if (!_scanPending) {
+        _scanResults.clear();
+        _scanPending = _network.startScan && _network.finishScan && _network.startScan();
+        _scanOutcome = _scanPending ? handheld::ScanResult::Pending : handheld::ScanResult::Failed;
     }
+    buildScanResultsMenu();
+}
 
-    int n = WiFi.scanNetworks(false, false);
-    _scanResults.clear();
-
-    if (n > 0) {
-        for (int i = 0; i < n; i++) {
-            WiFiNetwork net;
-            net.ssid = WiFi.SSID(i);
-            net.rssi = WiFi.RSSI(i);
-            net.encType = WiFi.encryptionType(i);
-            if (!net.ssid.isEmpty()) {
-                _scanResults.push_back(net);
+bool SettingsScreen::pollNetworkResults() {
+    if (!_scanPending || !_network.finishScan) return false;
+    String json;
+    const auto result = _network.finishScan(json);
+    if (result == handheld::ScanResult::Pending) return false;
+    _scanPending = false; _scanOutcome = result; _scanResults.clear();
+    if (result == handheld::ScanResult::Ready) {
+        JsonDocument doc;
+        if (deserializeJson(doc, json) || !doc.is<JsonArray>() || doc.size() > 15) {
+            _scanOutcome = handheld::ScanResult::Failed;
+        } else {
+            for (const auto row : doc.as<JsonArray>()) {
+                if (!row["ssid"].is<const char*>() || !row["rssi"].is<int>() || !row["encrypted"].is<bool>()) {
+                    _scanResults.clear(); _scanOutcome = handheld::ScanResult::Failed; break;
+                }
+                WiFiNetwork network;
+                const char* ssid = row["ssid"].as<const char*>();
+                if (!UserConfig::trySetString(network.ssid, ssid, strlen(ssid))) {
+                    _scanResults.clear(); _scanOutcome = handheld::ScanResult::Failed; break;
+                }
+                network.rssi = row["rssi"].as<int>();
+                network.encType = row["encrypted"].as<bool>() ? 1 : WIFI_AUTH_OPEN;
+                try { _scanResults.push_back(std::move(network)); }
+                catch (const std::bad_alloc&) {
+                    _scanResults.clear(); _scanOutcome = handheld::ScanResult::Failed; break;
+                }
             }
         }
-        // Sort by signal strength (strongest first)
-        std::sort(_scanResults.begin(), _scanResults.end(),
-            [](const WiFiNetwork& a, const WiFiNetwork& b) {
-                return a.rssi > b.rssi;
-            });
     }
-
-    WiFi.scanDelete();
-    Serial.printf("[WIFI] Found %d networks\n", (int)_scanResults.size());
-
-    _subMenu = MENU_WIFI_SCAN;
-    buildScanResultsMenu();
+    if (_subMenu == MENU_WIFI_SCAN) buildScanResultsMenu();
+    return true;
 }
 
 void SettingsScreen::buildScanResultsMenu() {
     _list.clear();
 
-    if (_scanResults.empty()) {
+    if (_scanPending) {
+        _list.addItem("Scanning...");
+    } else if (_scanOutcome == handheld::ScanResult::Failed) {
+        _list.addItem("Scan failed; retry");
+    } else if (_scanOutcome == handheld::ScanResult::Cancelled) {
+        _list.addItem("Scan cancelled");
+    } else if (_scanResults.empty()) {
         _list.addItem("No networks found");
     } else {
         for (auto& net : _scanResults) {
@@ -334,23 +366,20 @@ void SettingsScreen::buildScanResultsMenu() {
 }
 
 void SettingsScreen::disconnectWiFi() {
-    WiFi.disconnect(false);
+    if (!_network.disconnect) { showToast("Network unavailable"); return; }
+    _network.disconnect();
     showToast("Disconnected");
     buildWiFiMenu();
 }
 
 void SettingsScreen::connectWiFi() {
+    if (!_config) return;
     auto& s = _config->settings();
     if (staNetworkRO(s).ssid.isEmpty()) {
         showToast("No SSID set");
         return;
     }
-    WiFi.disconnect(false);
-    delay(100);
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(false);
-    WiFi.begin(staNetworkRO(s).ssid.c_str(), staNetworkRO(s).password.c_str());
-    showToast("Connecting...");
+    showToast(_network.connect && _network.connect() ? "Connecting..." : "Connection unavailable");
     buildWiFiMenu();
 }
 
@@ -358,7 +387,7 @@ void SettingsScreen::selectNetwork(int index) {
     if (index < 0 || index >= (int)_scanResults.size()) return;
     if (!_config) return;
 
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     staNetwork(s).ssid = _scanResults[index].ssid;
     Serial.printf("[WIFI] Selected: %s\n", staNetwork(s).ssid.c_str());
 
@@ -366,6 +395,24 @@ void SettingsScreen::selectNetwork(int index) {
     _subMenu = MENU_WIFI;
     // field 1 = STA password in WiFi STA mode
     startEditing(1, staNetworkRO(s).password.c_str());
+    // A failed transaction restores canonical settings. Keep the selected
+    // network bound to retries through the existing, stable scan-result row.
+    _editInput.setSubmitCallback([this, index](const std::string& value) {
+        if (!_editing || _subMenu != MENU_WIFI || _editField != 1 ||
+            !_config || _candidate.settings().wifiMode != RAT_WIFI_STA ||
+            index < 0 || size_t(index) >= _scanResults.size()) {
+            showToast("Network selection expired");
+            return;
+        }
+        const auto& selectedSSID = _scanResults[index].ssid;
+        try {
+            if (!UserConfig::trySetString(staNetwork(_candidate.settings()).ssid,
+                    selectedSSID.c_str(), selectedSSID.length())) {
+                showToast("Settings memory unavailable; retry", 2500); return;
+            }
+        } catch (const std::bad_alloc&) { showToast("Settings memory unavailable; retry", 2500); return; }
+        commitEdit(value);
+    });
 }
 
 // =============================================================================
@@ -375,7 +422,7 @@ void SettingsScreen::selectNetwork(int index) {
 void SettingsScreen::buildDisplayMenu() {
     _list.clear();
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     char buf[40];
 
     snprintf(buf, sizeof(buf), "Brightness: %d%%", s.brightness);
@@ -393,7 +440,7 @@ void SettingsScreen::buildDisplayMenu() {
 void SettingsScreen::buildAudioMenu() {
     _list.clear();
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     char buf[40];
 
     _list.addItem(s.audioEnabled ? "Audio: ON" : "Audio: OFF");
@@ -409,7 +456,7 @@ void SettingsScreen::startEditing(int field, const std::string& currentValue) {
     _editInput.clear();
     _editInput.setText(currentValue);
     _editInput.setActive(true);
-    _editInput.setMaxLength(64);
+    _editInput.setMaxLength(_subMenu == MENU_WIFI && field == 0 ? 32 : 64);
     _editInput.setSubmitCallback([this](const std::string& value) {
         commitEdit(value);
     });
@@ -417,11 +464,21 @@ void SettingsScreen::startEditing(int field, const std::string& currentValue) {
 
 // Apply edited value to settings
 void SettingsScreen::commitEdit(const std::string& value) {
+    if (_config && (_config->settingsPending() || _radioApplyPending)) { showToast("Settings apply pending"); return; }
     if (!_config) return;
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
+    const auto assign = [this, &value](String& target) {
+        if (UserConfig::trySetString(target, value.data(), value.size())) return true;
+        showToast("Settings memory unavailable; retry", 2500); return false;
+    };
+    try {
 
     if (_subMenu == MENU_RADIO) {
-        long v = atol(value.c_str());
+        int32_t v;
+        if (!handheld::settings::parseInteger(value, -9, LORA_MAX_FREQUENCY, v)) {
+            showToast("Enter a valid whole number");
+            return;
+        }
         switch (_editField) {
             case 0:  // Frequency in Hz, independent of region presets.
                 if (v < 0 || v > (long)LORA_MAX_FREQUENCY || !loRaFrequencyBand((uint32_t)v)) {
@@ -431,19 +488,28 @@ void SettingsScreen::commitEdit(const std::string& value) {
                 s.loraFrequency = (uint32_t)v;
                 break;
             case 1:  // SF: 5-12
-                if (v >= 5 && v <= 12) s.loraSF = (uint8_t)v;
+                if (v < 5 || v > 12) { showToast("SF: 5-12"); return; }
+                s.loraSF = (uint8_t)v;
                 break;
             case 2:  // BW: 7800-500000
-                if (v >= 7800 && v <= 500000) s.loraBW = (uint32_t)v;
+                if (v < 7800 || v > 500000) { showToast("BW: 7800-500000 Hz"); return; }
+                s.loraBW = (uint32_t)v;
                 break;
             case 3:  // CR: 5-8
-                if (v >= 5 && v <= 8) s.loraCR = (uint8_t)v;
+                if (v < 5 || v > 8) { showToast("CR: 5-8"); return; }
+                s.loraCR = (uint8_t)v;
                 break;
             case 4:  // TX Power
-                if (v >= -9 && v <= LORA_MAX_TX_POWER) s.loraTxPower = (int8_t)v;
+                if (v < -9 || v > LORA_MAX_TX_POWER) { showToast("TX power: -9 to 22 dBm"); return; }
+                s.loraTxPower = (int8_t)v;
                 break;
+            case 5:
+                if (v < 6 || v > 65) { showToast("Preamble: 6-65 symbols"); return; }
+                s.loraPreamble = v;
+                break;
+            default: return;
         }
-        applyAndSave();
+        if (!applyAndSave()) return;
         buildRadioMenu();
     } else if (_subMenu == MENU_TCP) {
         if (_editField == 99 && !value.empty()) {
@@ -451,7 +517,7 @@ void SettingsScreen::commitEdit(const std::string& value) {
             _tcpPendingHost = value;
             _editField = 100;
             _editing = true;
-            _editLabel = "Port (1-9999):";
+            _editLabel = "Port (1-65535):";
             _editInput.clear();
             _editInput.setText("4242");
             _editInput.setActive(true);
@@ -465,8 +531,8 @@ void SettingsScreen::commitEdit(const std::string& value) {
         if (_editField == 100 && !value.empty()) {
             // Port submitted — validate and add
             int port = atoi(value.c_str());
-            if (port < 1 || port > 9999) {
-                showToast("Port 1-9999");
+            if (port < 1 || port > 65535) {
+                showToast("Port 1-65535");
                 buildTCPMenu();
             } else {
                 addTCPConnection(_tcpPendingHost, (uint16_t)port);
@@ -476,61 +542,61 @@ void SettingsScreen::commitEdit(const std::string& value) {
         buildTCPMenu();
     } else if (_subMenu == MENU_WIFI) {
         // Fields: 0=SSID, 1=Password (AP or STA depending on mode)
-        if (_config->settings().wifiMode == RAT_WIFI_AP) {
+        if (_candidate.settings().wifiMode == RAT_WIFI_AP) {
             switch (_editField) {
-                case 0: s.wifiAPSSID = value.c_str(); break;
-                case 1: s.wifiAPPassword = value.c_str(); break;
+                case 0: if (!assign(s.wifiAPSSID)) return; break;
+                case 1: if (!assign(s.wifiAPPassword)) return; break;
             }
-        } else if (_config->settings().wifiMode == RAT_WIFI_STA) {
+        } else if (_candidate.settings().wifiMode == RAT_WIFI_STA) {
             switch (_editField) {
-                case 0: staNetwork(s).ssid = value.c_str(); break;
-                case 1: staNetwork(s).password = value.c_str(); break;
+                case 0: if (!assign(staNetwork(s).ssid)) return; break;
+                case 1: if (!assign(staNetwork(s).password)) return; break;
             }
         }
-        applyAndSave();
-        if (_config->settings().wifiMode == RAT_WIFI_STA && _editField == 1) {
+        if (!applyAndSave()) return; // Keep the editor and its input for retry.
+        if (_candidate.settings().wifiMode == RAT_WIFI_STA && _editField == 1) {
             connectWiFi();  // Live reconnect with new credentials
-        } else {
-            showToast("Saved!");
         }
         buildWiFiMenu();
     } else if (_subMenu == MENU_DISPLAY) {
-        switch (_editField) {
-            case 0: {
-                // Core stores brightness as percent 1-100 (PowerManager maps to 0-255)
-                int v = atoi(value.c_str());
-                if (v < 1) v = 1;
-                if (v > 100) v = 100;
-                s.brightness = (uint8_t)v;
-                if (_power) _power->setBrightness(s.brightness);
-                break;
-            }
-            case 1: s.screenDimTimeout = (uint16_t)atoi(value.c_str()); break;
-            case 2: s.screenOffTimeout = (uint16_t)atoi(value.c_str()); break;
-            case 3: s.displayName = value.c_str(); break;
+        int32_t v = 0;
+        if (_editField != 3 && !handheld::settings::parseInteger(value,
+                _editField == 0 ? 1 : _editField == 1 ? 5 : 10,
+                _editField == 0 ? 100 : _editField == 1 ? 3600 : 7200, v)) {
+            showToast(_editField == 0 ? "Brightness: 1-100%" :
+                _editField == 1 ? "Dim timeout: 5-3600s" : "Off timeout: 10-7200s");
+            return;
         }
-        applyAndSave();
+        switch (_editField) {
+            case 0: s.brightness = (uint8_t)v; break;
+            case 1: s.screenDimTimeout = (uint16_t)v; break;
+            case 2: s.screenOffTimeout = (uint16_t)v; break;
+            case 3: if (!assign(s.displayName)) return; break;
+            default: return;
+        }
+        if (!applyAndSave()) return;
         buildDisplayMenu();
     } else if (_subMenu == MENU_AUDIO) {
         if (_editField == 1) {
-            int v = atoi(value.c_str());
-            if (v < 0) v = 0;
-            if (v > 100) v = 100;
+            int32_t v;
+            if (!handheld::settings::parseInteger(value, 0, 100, v)) {
+                showToast("Volume: 0-100%"); return;
+            }
             s.audioVolume = (uint8_t)v;
-            if (_audio) _audio->setVolume(s.audioVolume);
         }
-        applyAndSave();
+        if (!applyAndSave()) return;
         buildAudioMenu();
     }
 
     _editing = false;
     _editField = -1;
+    } catch (const std::bad_alloc&) { showToast("Settings memory unavailable; retry", 2500); }
 }
 
 // Get current value of a field as string for editing
 std::string SettingsScreen::getCurrentValue(SubMenu menu, int field) {
     if (!_config) return "";
-    auto& s = _config->settings();
+    auto& s = _candidate.settings();
     char buf[32];
 
     if (menu == MENU_RADIO) {
@@ -540,6 +606,7 @@ std::string SettingsScreen::getCurrentValue(SubMenu menu, int field) {
             case 2: snprintf(buf, sizeof(buf), "%lu", (unsigned long)s.loraBW); return buf;
             case 3: snprintf(buf, sizeof(buf), "%d", s.loraCR); return buf;
             case 4: snprintf(buf, sizeof(buf), "%d", s.loraTxPower); return buf;
+            case 5: snprintf(buf, sizeof(buf), "%ld", s.loraPreamble); return buf;
         }
     } else if (menu == MENU_WIFI) {
         if (s.wifiMode == RAT_WIFI_AP) {
@@ -567,6 +634,12 @@ std::string SettingsScreen::getCurrentValue(SubMenu menu, int field) {
 }
 
 void SettingsScreen::render(M5Canvas& canvas) {
+    if (!_candidateReady) {
+        Theme::useSmallFont(canvas); canvas.setTextColor(Theme::MUTED);
+        canvas.drawString("Settings memory unavailable", 4, Theme::CONTENT_Y + 8);
+        canvas.drawString("Enter=retry  Fn+`=back", 4, Theme::CONTENT_Y + 22);
+        return;
+    }
     if (_subMenu == MENU_ABOUT) {
         renderAbout(canvas);
         return;
@@ -620,15 +693,7 @@ void SettingsScreen::render(M5Canvas& canvas) {
 
     // Toast overlay (drawn on top of everything)
     if (_toastMessage && millis() < _toastUntil) {
-        int tw = strlen(_toastMessage) * Theme::CHAR_W + 12;
-        int th = Theme::CHAR_H + 8;
-        int tx = (Theme::CONTENT_W - tw) / 2;
-        int ty = Theme::CONTENT_Y + Theme::CONTENT_H - th - 4;
-        canvas.fillRoundRect(tx, ty, tw, th, 3, Theme::SELECTION_BG);
-        canvas.drawRoundRect(tx, ty, tw, th, 3, Theme::PRIMARY);
-        canvas.setTextColor(Theme::PRIMARY);
-        canvas.setCursor(tx + 6, ty + 4);
-        canvas.print(_toastMessage);
+        drawSettingsNotice(canvas, _toastMessage);
     } else {
         _toastMessage = nullptr;
     }
@@ -673,6 +738,13 @@ void SettingsScreen::renderAbout(M5Canvas& canvas) {
 }
 
 bool SettingsScreen::handleKey(const KeyEvent& event) {
+    if (!_candidateReady) {
+        if (event.enter) onEnter();
+        else if ((event.escape || event.backspace) && _backCb) _backCb();
+        return true;
+    }
+    if (_config && (_config->settingsPending() || _radioApplyPending)) { showToast("Settings apply pending"); return true; }
+    if (event.repeat && (event.forwardDelete || (event.backspace && !_editing))) return true;
     // Handle confirmation dialog
     if (_confirmPending) {
         if (event.character == 'y' || event.character == 'Y') {
@@ -681,12 +753,7 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
                 factoryReset();
             } else {
                 if (_sdStore && _sdStore->isReady()) {
-                    if (_sdStore->wipeRsDeck()) {
-                        showToast("SD wiped!");
-                    } else {
-                        showToast("Wipe failed");
-                    }
-                    buildSDCardMenu();
+                    requestMaintenance(handheld::Operation::WipeSD);
                 }
             }
         } else if (event.character == 'n' || event.character == 'N' ||
@@ -700,6 +767,10 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
     // Escape goes back from anywhere; Backspace goes back outside an editor.
     if (event.escape || (event.backspace && !_editing)) {
         if (_editing) {
+            if (!_config || !_candidate.tryAssign(*_config)) {
+                showToast("Settings memory unavailable; retry", 2500); return true;
+            }
+            _candidateDirty = false;
             _editing = false;
             _editField = -1;
             _tcpPendingHost.clear();
@@ -733,7 +804,7 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
     if (event.forwardDelete && _subMenu == MENU_TCP) {
         int sel = _list.getSelectedIndex();
         int tcpIdx = sel - 1;  // item 0 is "Add", items 1..N are connections
-        if (tcpIdx >= 0 && tcpIdx < (int)_config->settings().tcpConnections.size()) {
+        if (tcpIdx >= 0 && tcpIdx < (int)_candidate.settings().tcpConnections.size()) {
             removeTCPConnection(tcpIdx);
             return true;
         }
@@ -795,8 +866,8 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
             return true;
         }
 
-        // Handle radio presets (items 1..NUM_PRESETS; item 0 is the "Active:" label)
-        if (_subMenu == MENU_RADIO && sel >= 1 && sel <= NUM_PRESETS) {
+        // Handle radio presets (items 1..RadioPresets::count; item 0 is the "Active:" label)
+        if (_subMenu == MENU_RADIO && sel >= 1 && sel <= RadioPresets::count) {
             applyRadioPreset(sel - 1);
             return true;
         }
@@ -807,9 +878,8 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
 
         // Toggle audio on/off (item 0 in Audio menu)
         if (_subMenu == MENU_AUDIO && sel == 0) {
-            auto& s = _config->settings();
+            auto& s = _candidate.settings();
             s.audioEnabled = !s.audioEnabled;
-            if (_audio) _audio->setEnabled(s.audioEnabled);
             applyAndSave();
             buildAudioMenu();
             return true;
@@ -817,16 +887,15 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
 
         // Cycle WiFi mode (item 0 in WiFi menu)
         if (_subMenu == MENU_WIFI && sel == 0) {
-            auto& s = _config->settings();
+            auto& s = _candidate.settings();
             s.wifiMode = (RatWiFiMode)(((int)s.wifiMode + 1) % 3);
-            applyAndSave();
-            showToast("Reboot to apply");
+            if (applyAndSave()) showToast("Reboot to apply");
             buildWiFiMenu();
             return true;
         }
 
         // STA mode WiFi menu actions
-        if (_subMenu == MENU_WIFI && _config->settings().wifiMode == RAT_WIFI_STA) {
+        if (_subMenu == MENU_WIFI && _candidate.settings().wifiMode == RAT_WIFI_STA) {
             if (sel == 1) {
                 // Status line (non-interactive)
                 return true;
@@ -855,10 +924,9 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
                 // Toggle Auto-discover LAN (AutoInterface).  IPv6 enable
                 // is one-shot per WiFi init, so changes take effect on
                 // next reboot.
-                auto& s = _config->settings();
+                auto& s = _candidate.settings();
                 s.autoIfaceEnabled = !s.autoIfaceEnabled;
-                applyAndSave();
-                showToast("Reboot to apply");
+                if (applyAndSave()) showToast("Reboot to apply");
                 buildWiFiMenu();
                 return true;
             }
@@ -899,16 +967,16 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
                 return true;
             }
             int tcpIdx = sel - 1;
-            if (tcpIdx >= 0 && tcpIdx < (int)_config->settings().tcpConnections.size()) {
+            if (tcpIdx >= 0 && tcpIdx < (int)_candidate.settings().tcpConnections.size()) {
                 toggleTCPConnection(tcpIdx);
                 return true;
             }
             return true;  // Back handled above
         }
 
-        // Edit the selected field (offset by 1+NUM_PRESETS for radio header+presets, 1 for WiFi mode)
+        // Edit the selected field (offset by 1+RadioPresets::count for radio header+presets, 1 for WiFi mode)
         int fieldIdx = sel;
-        if (_subMenu == MENU_RADIO) fieldIdx -= (1 + NUM_PRESETS);
+        if (_subMenu == MENU_RADIO) fieldIdx -= (1 + RadioPresets::count);
         if (_subMenu == MENU_WIFI) fieldIdx -= 1;
         std::string currentVal = getCurrentValue(_subMenu, fieldIdx);
         startEditing(fieldIdx, currentVal);
@@ -923,27 +991,30 @@ void SettingsScreen::showToast(const char* msg, unsigned long durationMs) {
     _toastUntil = millis() + durationMs;
 }
 
-void SettingsScreen::applyAndSave() {
-    if (!_config || !_flash) return;
-
-    // Save to both SD + flash when SD is available
-    if (_sdStore && _sdStore->isReady()) {
-        _config->save(*_sdStore, *_flash);
-    } else {
-        _config->save(*_flash);
+bool SettingsScreen::applyAndSave() {
+    if (!_config || !_flash || !_candidateReady) { showToast("Settings unavailable"); return false; }
+    if (_radioApplyPending) { showToast("Waiting for radio", 2500); return false; }
+    if (_config->settingsPending()) { showToast("Settings recovery pending", 2500); return false; }
+    if (!_saveCb) { showToast("Settings unavailable"); return false; }
+    _candidateDirty = true;
+    const auto saved = _saveCb(_candidate);
+    if (!saved.complete()) {
+        showToast(saved.detail ? saved.detail : "Save failed; retry changes", 2500);
+        return false;
     }
+    _candidateDirty = false;
+    applyCommitted(false); // This candidate already owns the committed values.
+    return !_radioApplyPending;
+}
 
+void SettingsScreen::applyCommitted(bool refreshCandidate) {
+    if (!_config || _config->settingsPending()) return;
+    if (refreshCandidate) {
+        _candidateReady = _candidate.tryAssign(*_config);
+        if (_candidateReady) _candidateDirty = false;
+    }
     auto& s = _config->settings();
-
-    // Apply radio settings to hardware
-    if (_radio) {
-        _radio->setFrequency(s.loraFrequency);
-        _radio->setSpreadingFactor(s.loraSF);
-        _radio->setSignalBandwidth(s.loraBW);
-        _radio->setCodingRate4(s.loraCR);
-        _radio->setTxPower(s.loraTxPower);
-        _radio->receive();  // Re-enter RX after reconfiguration
-    }
+    const auto radio = _radioApply ? _radioApply(s, true) : RadioApply::Unavailable;
 
     // Apply power settings
     if (_power) {
@@ -958,82 +1029,58 @@ void SettingsScreen::applyAndSave() {
         _audio->setVolume(s.audioVolume);
     }
 
-    Serial.println("[SETTINGS] Saved and applied");
-    if (!_toastMessage) showToast("Saved!");
+    finishRadioApply(radio);
+    if (!_candidateReady) showToast("Saved; settings view unavailable", 2500);
+}
+
+void SettingsScreen::finishRadioApply(RadioApply result) {
+    _radioApplyPending = result == RadioApply::Pending;
+    if (_subMenu == MENU_RADIO) {
+        const int selected = _list.getSelectedIndex();
+        buildRadioMenu(); _list.setSelected(selected);
+    }
+    if (_radioApplyPending) { showToast("Saved; waiting for radio", 2500); return; }
+    const bool announce = _presetAnnouncePending && result == RadioApply::Applied;
+    _presetAnnouncePending = false; // Retire before any backend callback.
+    if (result == RadioApply::RebootRequired) { showToast("Saved; radio needs reboot", 2500); return; }
+    if (result == RadioApply::Unavailable) { showToast("Saved; radio unavailable", 2500); return; }
+    if (!announce) { showToast(_config->mirrorPending() ? "Saved; backup pending" : "Saved!"); return; }
+    if (!_backend || !_backend->protocolReady()) { showToast("Preset applied (no announce)"); return; }
+    const auto appData = encodeAnnounceName(_config->settings().displayName);
+    const auto sent = _backend->announce(appData.data(), appData.size());
+    showToast(sent == ProtocolBackend::AnnounceResult::Sent ? "Preset applied + announced" :
+        sent == ProtocolBackend::AnnounceResult::Deferred ? "Preset applied; announce queued" :
+        "Preset applied (announce failed)");
+}
+
+bool SettingsScreen::pollRadioApply(bool accepting) {
+    if (!accepting) {
+        const bool pending = _radioApplyPending;
+        _radioApplyPending = _presetAnnouncePending = false;
+        if (pending && _radioApply) _radioApply(_config->settings(), false);
+        return pending;
+    }
+    if (!_radioApplyPending) return false;
+    const auto result = _radioApply ? _radioApply(_config->settings(), true) : RadioApply::Unavailable;
+    if (result == RadioApply::Pending) return false;
+    finishRadioApply(result);
+    return true;
 }
 
 void SettingsScreen::applyRadioPreset(int preset) {
-    if (!_config || preset < 0 || preset >= NUM_PRESETS) return;
-    auto& s = _config->settings();
-
-    const auto& p = PRESETS[preset];
-    s.loraSF = p.sf;
-    s.loraBW = p.bw;
-    s.loraCR = p.cr;
-    s.loraTxPower = p.txPower;
-
-    applyAndSave();
+    if (_config && (_config->settingsPending() || _radioApplyPending)) { showToast("Settings apply pending"); return; }
+    if (!_config || preset < 0 || preset >= RadioPresets::count) return;
+    _presetAnnouncePending = true;
+    RadioPresets::apply(_candidate.settings(), preset);
+    const bool saved = applyAndSave();
+    if (!saved && !_config->settingsPending() && !_radioApplyPending) _presetAnnouncePending = false;
     buildRadioMenu();
-    // Honest gate: flips with backend->protocolReady(), not backend kind.
-    if (!_backend || !_backend->protocolReady()) {
-        showToast("Preset applied (no announce)");
-        Serial.printf("[SETTINGS] Radio preset %d applied (backend not ready: announce skipped)\n", preset);
-        return;
-    }
-    {
-        // Encode display name + capability advertisement as msgpack app_data.
-        // Format: [display_name(bin), stamp_cost(nil|uint), supported_functionality(array)].
-        // stamp_cost=nil means no inbound stamp is required. Empty
-        // supported_functionality list signals no SF_COMPRESSION (bz2) support
-        // so Python LXMF disables auto_compress for us.
-        const String& name = _config ? _config->settings().displayName : String();
-        size_t nameLen = name.length();
-        if (nameLen > 31) nameLen = 31;
-        uint8_t buf[5 + 31];
-        size_t i = 0;
-        buf[i++] = 0x93;                   // fixarray(3)
-        buf[i++] = 0xC4;                   // bin 8
-        buf[i++] = (uint8_t)nameLen;
-        if (nameLen) { memcpy(buf + i, name.c_str(), nameLen); i += nameLen; }
-        buf[i++] = 0xC0;                   // stamp_cost = nil (no stamp required)
-        buf[i++] = 0x90;                   // empty fixarray (no SF_* supported)
-        const auto result = _backend->announce(buf, i);
-        if (result == ProtocolBackend::AnnounceResult::Sent) {
-            showToast("Preset applied + announced");
-        } else if (result == ProtocolBackend::AnnounceResult::Deferred) {
-            showToast("Preset applied; announce queued");
-        } else {
-            showToast("Preset applied (announce failed)");
-        }
-    }
-    Serial.printf("[SETTINGS] Radio preset %d applied\n", preset);
 }
 
 void SettingsScreen::factoryReset() {
-    Serial.println("[SETTINGS] Factory reset — wiping ALL data");
+    requestMaintenance(handheld::Operation::FactoryReset);
+}
 
-    // 1. Clear ALL NVS namespaces (config, identity, boot counter)
-    {
-        Preferences prefs;
-        if (prefs.begin(NVS_NS_MSG, false)) { prefs.clear(); prefs.end(); }
-        if (prefs.begin(NVS_NS_CFG, false)) { prefs.clear(); prefs.end(); }
-        if (prefs.begin(NVS_NS_IDENTITY, false)) { prefs.clear(); prefs.end(); }
-        Serial.println("[RESET] NVS cleared");
-    }
-
-    // 2. Wipe legacy /ratcom SD card directory
-    if (_sdStore && _sdStore->isReady()) {
-        _sdStore->wipeRsDeck();
-        Serial.println("[RESET] SD wiped");
-    }
-
-    // 3. Format LittleFS (destroys all flash files)
-    if (_flash) {
-        _flash->format();
-        Serial.println("[RESET] Flash formatted");
-    }
-
-    Serial.println("[RESET] Factory reset complete — rebooting");
-    delay(500);
-    ESP.restart();
+void SettingsScreen::requestMaintenance(handheld::Operation operation) {
+    if (!_maintenanceCb || !_maintenanceCb(operation)) showToast("Maintenance unavailable");
 }

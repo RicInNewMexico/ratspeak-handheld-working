@@ -1,3 +1,7 @@
+#include "runtime/FactoryResetRecovery.h"
+#include "runtime/DiscoveryStartup.h"
+#include "radio/RadioSettings.h"
+#include "diagnostics/DeviceDiagnostics.h"
 // =============================================================================
 // rsCardputer Standalone — Main Entry Point
 // C1-C7: Radio, Keyboard, Display, Reticulum, Nodes, WiFi, LXMF
@@ -21,21 +25,25 @@
 #include "transport/LoRaInterface.h"
 #include "storage/SDStore.h"
 #include "storage/MessageStore.h"
+#include "storage/LegacyMessageArena.h"
 #include "reticulum/AnnounceManager.h"
 #include "reticulum/LXMFManager.h"
 #include "reticulum/IdentityManager.h"
 #include "protocol/ProtocolRuntime.h"
 #include "transport/WiFiInterface.h"
-#include "transport/TCPClientInterface.h"
+#include "transport/TcpClientSet.h"
+#include "runtime/NetworkCoordinator.h"
+#include "runtime/AnnounceScheduler.h"
 #include "transport/RnsAutoInterface.h"
 #include "config/UserConfig.h"
-#include <esp_netif.h>
+#include "config/SettingsTransaction.h"
 #include "screens/NodesScreen.h"
 #include "screens/MessagesScreen.h"
 #include "screens/MessageView.h"
 #include "screens/SettingsScreen.h"
 #include "screens/NameInputScreen.h"
-#include "screens/DataCleanScreen.h"
+#include "screens/MaintenanceScreen.h"
+#include "runtime/MaintenanceOperation.h"
 #include "screens/HelpOverlay.h"
 #include "screens/TimezoneScreen.h"
 #include "power/PowerManager.h"
@@ -48,7 +56,6 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <list>
 #include <string>
 #include <esp_system.h>
 #include <freertos/task.h>
@@ -72,20 +79,17 @@ FlashStore flash;
 SDStore sdStore;
 MessageStore messageStore;
 LXMFManager lxmf;
-// Single Protocol runtime (micro retired 2026-08-13): ProtocolRuntime runs over the FFI
-// staticlib (announce/LXMF/link/resource live; surfaces gate on protocolReady).
+// ProtocolRuntime owns the shared Rust FFI backend over the Lite crates.
+// Announce, LXMF, Link and Resource operations require protocol readiness.
 ProtocolRuntime protocolRuntime;
 ProtocolBackend* backend = &protocolRuntime;
 LoRaInterface rustLoraIface(&radio);  // pump-owned raw driver (id 0)
 IdentityManager identityMgr;
 AnnounceManager* announceManager = nullptr;
-WiFiInterface* wifiImpl = nullptr;
-std::vector<TCPClientInterface*> tcpClients;
-std::list<TCPClientInterface*> retiredTcpClients;
-RnsAutoInterface autoIface;  // device-owned driver on the rust pump (iface id 5)
-bool autoIfaceDeferredStart = false;
-unsigned long autoIfaceDeferredAt = 0;
-unsigned long lastAutoIfaceLinkCheck = 0;
+TcpClientSet tcpClients;
+RnsAutoInterface autoIface;  // coordinator-borrowed driver
+handheld::WiFiConnection wifiConnection;
+handheld::NetworkCoordinator network(wifiConnection, protocolRuntime.pump(), tcpClients, autoIface);
 UserConfig userConfig;
 PowerManager power;
 AudioNotify audio;
@@ -101,7 +105,14 @@ NodesScreen nodesScreen;
 MessagesScreen messagesScreen;
 MessageView messageView;
 NameInputScreen nameInputScreen;
-DataCleanScreen dataCleanScreen;
+MaintenanceScreen maintenanceScreen;
+handheld::MaintenanceBarrier maintenance;
+handheld::Request maintenanceRequest;
+uint32_t maintenanceNextId = 0;
+bool maintenanceRestart = false;
+enum class CardSettingsStep : uint8_t { Settings, Name, Timezone };
+CardSettingsStep pendingSettingsStep = CardSettingsStep::Settings;
+uint32_t lastSettingsRetry = 0;
 SettingsScreen settingsScreen;
 TimezoneScreen timezoneScreen;
 HelpOverlay helpOverlay;
@@ -114,84 +125,24 @@ bool radioOnline = false;
 bool bootComplete = false;
 volatile bool pendingMessageSound = false;  // Deferred audio from packet callback
 bool bootLoopRecovery = false;
-bool wifiSTAStarted = false;
-bool wifiSTAConnected = false;
-
-// STA reconnects are scheduled from WiFi events and fired from loop().
-std::atomic<bool> wifiNeedsReconnect{false};
-std::atomic<unsigned long> wifiReconnectAt{0};
-std::atomic<uint8_t> wifiReconnectAttempt{0};
-constexpr unsigned long WIFI_BACKOFF_MS[4] = {5000, 15000, 60000, 300000};
-constexpr unsigned long WIFI_NETIF_SETTLE_MS = 1500;
 
 // --- Timing state (millis-based throttling) ---
 unsigned long lastRNS = 0;
 unsigned long lastRender = 0;
-unsigned long lastAutoAnnounce = 0;
+handheld::AnnounceScheduler announceScheduler;
 unsigned long lastHeartbeat = 0;
 unsigned long lastStatusUpdate = 0;
 unsigned long loopCycleStart = 0;
 unsigned long maxLoopTime = 0;
 
 // --- Intervals ---
-constexpr unsigned long RNS_INTERVAL_MS = 10;         // 100 Hz (matches rsDeck)
+constexpr unsigned long RNS_INTERVAL_MS = 10;         // 10 ms minimum protocol poll interval
 constexpr unsigned long RENDER_INTERVAL_MS = 50;       // 20 FPS
 constexpr unsigned long STATUS_UPDATE_MS = 1000;       // 1 Hz status bar
-constexpr unsigned long ANNOUNCE_INTERVAL_MS = 120000; // 2 minutes
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000;
-constexpr unsigned long TCP_GLOBAL_BUDGET_MS = 12;      // Max cumulative TCP time per loop
 
 // Power-aware RNS interval
 unsigned long rnsInterval = RNS_INTERVAL_MS;
-
-static void scheduleWiFiReconnect() {
-    uint8_t attempt = wifiReconnectAttempt.load();
-    uint8_t idx = attempt < 4 ? attempt : 3;
-    unsigned long backoff = WIFI_BACKOFF_MS[idx];
-    if (backoff < WIFI_NETIF_SETTLE_MS) backoff = WIFI_NETIF_SETTLE_MS;
-    wifiReconnectAt.store(millis() + backoff);
-    wifiNeedsReconnect.store(true);
-    if (attempt < 4) wifiReconnectAttempt.store(attempt + 1);
-}
-
-static void onWiFiEvent(WiFiEvent_t event) {
-    switch (event) {
-        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            if (wifiNeedsReconnect.load()) break;
-            scheduleWiFiReconnect();
-            WiFi.disconnect(false, true);
-            break;
-        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
-            wifiNeedsReconnect.store(false);
-            wifiReconnectAttempt.store(0);
-            break;
-        default:
-            break;
-    }
-}
-
-// Cardputer connects to a single STA network: the selected slot of the core
-// multi-network model (created by the lite Settings UI).
-static const WiFiNetwork& staNetworkRO() {
-    static const WiFiNetwork kEmpty;
-    const auto& s = userConfig.settings();
-    if (s.wifiSTANetworks.empty()) return kEmpty;
-    size_t idx = s.wifiSTASelected < s.wifiSTANetworks.size() ? s.wifiSTASelected : 0;
-    return s.wifiSTANetworks[idx];
-}
-
-static void beginSTAConnection() {
-    auto& s = userConfig.settings();
-    const WiFiNetwork& net = staNetworkRO();
-    if (net.ssid.isEmpty()) return;
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(false);
-    if (s.autoIfaceEnabled) WiFi.enableIpV6();
-    WiFi.begin(net.ssid.c_str(), net.password.c_str());
-    wifiSTAStarted = true;
-    Serial.printf("[WIFI] STA begin (SSID: %s)\n", net.ssid.c_str());
-}
 
 static const char* currentPosixTZ() {
     if (userConfig.settings().timezoneIdx < TIMEZONE_COUNT) {
@@ -203,61 +154,6 @@ static const char* currentPosixTZ() {
 // =============================================================================
 // TCP client management — stop old clients, create new from config
 // =============================================================================
-
-static void drainRetiredTCPClients() {
-    for (auto it = retiredTcpClients.begin(); it != retiredTcpClients.end(); ) {
-        TCPClientInterface* tcp = *it;
-        if (!tcp || tcp->canDestroy()) {
-            if (tcp) delete tcp;
-            it = retiredTcpClients.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-static void retireTCPClient(TCPClientInterface* tcp) {
-    if (!tcp) return;
-    tcp->stop();
-    if (tcp->canDestroy()) {
-        delete tcp;
-    } else {
-        retiredTcpClients.push_back(tcp);
-    }
-}
-
-static void reloadTCPClients() {
-    // Stop and deregister existing clients
-    protocolRuntime.pump().detachTcpAll();
-    for (auto* tcp : tcpClients) {
-        retireTCPClient(tcp);
-    }
-    tcpClients.clear();
-    drainRetiredTCPClients();
-
-    // Create new clients from current config
-    if (WiFi.status() == WL_CONNECTED) {
-        for (auto& ep : userConfig.settings().tcpConnections) {
-            if (ep.autoConnect && !ep.host.isEmpty()) {
-                char name[32];
-                snprintf(name, sizeof(name), "TCP.%s", ep.host.c_str());
-                auto* tcp = new TCPClientInterface(ep.host.c_str(), ep.port, name);
-                if (protocolRuntime.pump().attachTcp(tcp) < 0) {
-                    Serial.printf("[TCP] Pump full; dropping %s:%d\n", ep.host.c_str(), ep.port);
-                    delete tcp;
-                    continue;
-                }
-                tcp->start();
-                tcpClients.push_back(tcp);
-                Serial.printf("[TCP] Created client: %s:%d\n", ep.host.c_str(), ep.port);
-            }
-        }
-    }
-
-    if (tcpClients.empty()) {
-        Serial.println("[TCP] No active TCP connections");
-    }
-}
 
 // =============================================================================
 // Hotkey callbacks
@@ -284,138 +180,207 @@ void onHotkeySettings() {
     ui.setScreen(&settingsScreen);
 }
 static ProtocolBackend::AnnounceResult announceWithName(bool silent = false);
+
+static void pollScheduledAnnounces() {
+    using Scheduler = handheld::AnnounceScheduler;
+    const auto event = announceScheduler.poll(uint32_t(millis()), userConfig.settings().announceInterval,
+        rustLoraIface.isOnline() && rustLoraIface.airtimeUtilization() > LoRaInterface::AIRTIME_THROTTLE,
+        [](Scheduler::Action action, uint8_t) {
+            const auto result = announceWithName(action == Scheduler::Action::Periodic && !power.isScreenOn());
+            return result == ProtocolBackend::AnnounceResult::Sent ? Scheduler::Result::Sent :
+                result == ProtocolBackend::AnnounceResult::Deferred ? Scheduler::Result::Deferred : Scheduler::Result::Failed;
+        });
+    if (event.action != Scheduler::Action::None)
+        Serial.printf("[%s] Announce %s (attempt %u)\n",
+            event.action == Scheduler::Action::Startup ? "BOOT" : "AUTO",
+            event.result == Scheduler::Result::Sent ? "sent" : event.result == Scheduler::Result::Deferred ? "queued" :
+            event.result == Scheduler::Result::Skipped ? "skipped: airtime busy" : "not sent", unsigned(event.attempt));
+}
+
+
+static void finalizeBoot() {
+    if (!maintenance.accepting() || userConfig.settingsPending() || settingsScreen.radioApplyPending()) return;
+    ui.setBootMode(false);
+    ui.setScreen(&homeScreen);
+    ui.tabBar().setActiveTab(TabBar::TAB_HOME);
+    if (announceScheduler.begin(uint32_t(millis()), handheld::AnnounceScheduler::Startup::ImmediateOnce))
+        pollScheduledAnnounces();
+}
+
+static void finishCardSettings(CardSettingsStep step) {
+    if (!maintenance.accepting()) return;
+    const auto& settings = userConfig.settings();
+#if HAS_GPS
+    gps.setTimeEnabled(settings.gpsTimeEnabled);
+    gps.setLocationEnabled(settings.gpsLocationEnabled);
+    if (settings.gpsTimeEnabled || settings.gpsLocationEnabled) {
+        gps.setPosixTZ(currentPosixTZ());
+        if (!gps.isRunning()) gps.begin();
+    } else if (gps.isRunning()) gps.stop();
+#endif
+    if (settings.timezoneIdx < TIMEZONE_COUNT) {
+        setenv("TZ", TIMEZONE_TABLE[settings.timezoneIdx].posixTZ, 1); tzset();
+#if HAS_GPS
+        if (gps.isRunning()) gps.setPosixTZ(TIMEZONE_TABLE[settings.timezoneIdx].posixTZ);
+#endif
+    }
+    const auto data = encodeAnnounceName(settings.displayName);
+    protocolRuntime.seedAnnounceAppData(data.data(), data.size());
+    nameInputScreen.setSaveStatus(nullptr, false);
+    timezoneScreen.setSaveStatus(nullptr, false);
+    if (step != CardSettingsStep::Settings && ui.isBootMode()) {
+        if (!settings.timezoneSet) {
+            timezoneScreen.setSelectedIndex(settings.timezoneIdx); ui.setScreen(&timezoneScreen);
+        } else if (!settings.nameComplete) ui.setScreen(&nameInputScreen);
+        else finalizeBoot();
+    }
+    ui.markAllDirty();
+}
+
+static SettingsTransaction::Result saveCardSettings(UserConfig& candidate, CardSettingsStep step) {
+    if (!maintenance.accepting()) return {SettingsTransaction::State::Invalid, "Shutdown in progress"};
+    if (settingsScreen.radioApplyPending()) return {SettingsTransaction::State::Invalid, "Waiting for radio"};
+    const auto result = SettingsTransaction::apply(userConfig, candidate, identityMgr, sdStore, flash);
+    const bool pending = result.state == SettingsTransaction::State::Pending;
+    if (pending) { pendingSettingsStep = step; lastSettingsRetry = millis(); }
+    const char* caption = pending ? "Save pending; please wait" : result.complete() ? nullptr : "Save failed; Enter retries";
+    if (step == CardSettingsStep::Name) nameInputScreen.setSaveStatus(caption, pending);
+    if (step == CardSettingsStep::Timezone) timezoneScreen.setSaveStatus(caption, pending);
+    if (result.complete()) {
+        if (step != CardSettingsStep::Settings) settingsScreen.applyCommitted();
+        if (settingsScreen.radioApplyPending()) pendingSettingsStep = step;
+        else finishCardSettings(step);
+    }
+    ui.markAllDirty();
+    return result;
+}
+
+static void pollCardSettings() {
+    if (!userConfig.settingsPending() || millis() - lastSettingsRetry < 1000) return;
+    lastSettingsRetry = millis();
+    const auto result = SettingsTransaction::recover(userConfig, identityMgr, sdStore, flash);
+    if (!result.complete()) return;
+    // Failed maintenance can finish cleanup, never invoke an old UI/hardware continuation.
+    if (maintenance.accepting()) {
+        settingsScreen.applyCommitted();
+        if (settingsScreen.radioApplyPending()) return;
+        finishCardSettings(pendingSettingsStep);
+    }
+    pendingSettingsStep = CardSettingsStep::Settings;
+}
+
+static void pollCardRadioSettings() {
+    if (!settingsScreen.pollRadioApply(maintenance.accepting())) return;
+    if (maintenance.accepting() && pendingSettingsStep != CardSettingsStep::Settings)
+        finishCardSettings(pendingSettingsStep);
+    pendingSettingsStep = CardSettingsStep::Settings;
+    ui.markContentDirty();
+}
+
 void onHotkeyAnnounce() {
     Serial.println("[HOTKEY] Force announce");
     announceWithName();
 }
-void onHotkeyDiag() {
-    Serial.println("=== DIAGNOSTIC DUMP ===");
-    Serial.printf("Protocol: %s\n", backend->backendName());
-    // Diagnostic state read through the backend facade (proves live delegation;
-    // identical to rns.* since MicroReticulumBackend is pure delegation).
-    Serial.printf("Identity: %s\n", backend->identityHash().c_str());
-    Serial.printf("Node: %s (endpoint, no forwarding)\n", backend->isTransportActive() ? "ONLINE" : "OFFLINE");
-    Serial.printf("Paths: %d  Links: %d\n", (int)backend->pathCount(), (int)backend->linkCount());
-    Serial.printf("Delivery: %s  Resources: %u\n", backend->deliveryBackendDetail(),
-                  (unsigned)backend->activeResourceTransfers());
-    Serial.printf("Radio: %s\n", radioOnline ? "ONLINE" : "OFFLINE");
-    if (radioOnline) {
-        Serial.printf("Freq: %lu Hz  SF: %d  BW: %lu  CR: 4/%d  TXP: %d dBm\n",
-                      (unsigned long)radio.getFrequency(),
-                      radio.getSpreadingFactor(),
-                      (unsigned long)radio.getSignalBandwidth(),
-                      radio.getCodingRate4(),
-                      radio.getTxPower());
-        Serial.printf("Regulator: %s\n", LORA_USE_DCDC_REGULATOR ? "DC-DC" : "LDO");
-        Serial.printf("Preamble: %ld symbols\n", radio.getPreambleLength());
-        Serial.printf("IQ invert: %s\n", radio.getInvertIQ() ? "ON" : "off");
-        Serial.printf("SyncWord regs: 0x%02X%02X\n",
-            radio.readRegister(REG_SYNC_WORD_MSB_6X),
-            radio.readRegister(REG_SYNC_WORD_LSB_6X));
-        uint16_t devErr = radio.getDeviceErrors();
-        uint8_t status = radio.getStatus();
-        Serial.printf("DevErrors: 0x%04X  Status: 0x%02X (mode=%d cmd=%d)\n",
-            devErr, status, (status >> 4) & 0x07, (status >> 1) & 0x07);
-        if (devErr & 0x40) Serial.println("  *** PLL LOCK FAILED ***");
-        Serial.printf("Current RSSI: %d dBm\n", radio.currentRssi());
+static handheld::DeviceDiagnostics diagnostics(radio, rustLoraIface, *backend, announceManager,
+    radioOnline, "Cardputer Adv", "RSCARDPUTER-LXMF-TEST:", "RSCARDPUTER_TEST_1234567890",
+    []() { announceWithName(false); });
+void onHotkeyDiag() { diagnostics.printDiagnostics(); }
+void onHotkeyRssiMonitor() { diagnostics.startRssiMonitor(); }
+void onHotkeyRadioTest() { diagnostics.runRadioTest(); }
 
-        Serial.println("--- SX1262 Register Dump ---");
-        Serial.printf("  0x0740 (SyncWordMSB): 0x%02X\n", radio.readRegister(0x0740));
-        Serial.printf("  0x0741 (SyncWordLSB): 0x%02X\n", radio.readRegister(0x0741));
-        Serial.printf("  0x0889 (IQ polarity): 0x%02X\n", radio.readRegister(0x0889));
-        Serial.printf("  0x0736 (IQ config):   0x%02X\n", radio.readRegister(0x0736));
-        Serial.printf("  0x08AC (LNA):         0x%02X\n", radio.readRegister(0x08AC));
-        Serial.printf("  0x08E7 (OCP):         0x%02X\n", radio.readRegister(0x08E7));
-        Serial.printf("  0x08D8 (TX clamp):    0x%02X\n", radio.readRegister(REG_TX_CLAMP_CONFIG_6X));
-        uint8_t packetType = radio.getPacketType();
-        const char* packetTypeName =
-            (packetType == 0x00) ? "GFSK" :
-            (packetType == 0x01) ? "LoRa" :
-            (packetType == 0x02) ? "LR-FHSS" : "unknown";
-        Serial.printf("  packet_type:          0x%02X (%s)%s\n",
-            packetType, packetTypeName,
-            packetType == 0x01 ? "" : " *** NOT LoRa ***");
-        Serial.println("----------------------------");
+static bool requestMaintenance(handheld::Operation operation) {
+    if (maintenanceNextId == UINT32_MAX) return false;
+    switch (operation) {
+    case handheld::Operation::Restart: case handheld::Operation::FormatSD:
+    case handheld::Operation::WipeSD: case handheld::Operation::FactoryReset:
+    case handheld::Operation::ClearOldDataAndRestart: break;
+    default: return false;
     }
-    Serial.printf("Free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
-    Serial.printf("Flash: used/total (see heartbeat for heap)\n");
-    Serial.printf("WriteQ pending: %d\n", messageStore.writeQueue().drainCount());
-    Serial.printf("Uptime: %lu s\n", millis() / 1000);
-    Serial.println("=======================");
+    if (maintenance.phase() == handheld::MaintenanceBarrier::Phase::Failed &&
+        operation == handheld::Operation::Restart && !maintenanceRestart) {
+        // A new explicit request after the on-screen data-loss warning. Never
+        // run the old wipe or free a retained writer to simulate a clean stop.
+        ++maintenanceNextId;
+        maintenanceRestart = true;
+        return true;
+    }
+    if (!maintenance.accepting()) return false;
+    handheld::Request request;
+    request.id = ++maintenanceNextId; request.generation = 1;
+    request.operation = operation; request.admittedAt = millis();
+    if (!maintenance.begin({request.id, request.generation}, request.admittedAt)) return false;
+    maintenanceRequest = request;
+    announceScheduler.stop();
+    settingsScreen.pollRadioApply(false);
+    network.closeAdmissions();
+    protocolRuntime.beginMaintenance(rustLoraIface);
+    ui.setOverlay(nullptr);
+    ui.setScreen(&maintenanceScreen); // Closes visible read-marker admission.
+    maintenanceScreen.show("Saving and closing connections");
+    ui.markAllDirty();
+    power.activity();
+    return true;
 }
 
-// Ctrl+R: Continuous RSSI sampling for 5 seconds
-volatile bool rssiMonitorActive = false;
-
-void onHotkeyRssiMonitor() {
-    if (!radioOnline) {
-        Serial.println("[RSSI] Radio offline");
-        return;
+static void pollMaintenance() {
+    if (maintenance.accepting()) return;
+    if (maintenanceScreen.takeRestart()) requestMaintenance(handheld::Operation::Restart);
+    // Before stop(), maintain may start a deferred reload. Once helpers have
+    // begun retiring, it only completes the already-owned client destruction.
+    network.pollSettlements();
+    handheld::MaintenanceBarrier::Snapshot snapshot;
+    snapshot.normalPending = wifiConnection.scanning() || userConfig.settingsPending() || settingsScreen.radioApplyPending();
+    snapshot.applicationPending = !backend->lxmfDrained() || !diagnostics.resultsDrained() ||
+        messageStore.writeQueue().drainCount() != 0;
+    snapshot.helpersPending = snapshot.normalPending || !protocolRuntime.maintenanceDrained() ||
+        !network.quiescent();
+    snapshot.storageStopped = maintenance.storageStopStarted() && messageStore.finishStop();
+    snapshot.error = backend->lxmfDrainError();
+    snapshot.unrecoverable = protocolRuntime.maintenanceFailed();
+    const auto actions = maintenance.step(millis(), snapshot);
+    if (actions & handheld::MaintenanceBarrier::ReportFailure) {
+        maintenanceScreen.show(snapshot.unrecoverable ? "Radio could not finish." :
+            userConfig.settingsPending() ? "Settings recovery is pending." :
+            snapshot.error != handheld::storage::Error::None ? "Message status needs saving." :
+            snapshot.applicationPending ? "Message work is still pending." :
+            snapshot.helpersPending ? "Connection is still closing." :
+            "Storage work is still pending.", true);
+        Serial.printf("[MAINTENANCE] failed owners=%u error=%u\n",
+            unsigned(maintenance.failedPending()), unsigned(maintenance.lastError()));
+        ui.markAllDirty();
+        power.activity();
     }
-    Serial.println("[RSSI] Sampling RSSI for 5 seconds — transmit from another device now...");
-    rssiMonitorActive = true;
-    int minRssi = 0, maxRssi = -200;
-    unsigned long start = millis();
-    int samples = 0;
-    while (millis() - start < 5000) {
-        int rssi = radio.currentRssi();
-        if (rssi < minRssi) minRssi = rssi;
-        if (rssi > maxRssi) maxRssi = rssi;
-        samples++;
-        Serial.printf("[RSSI] %d dBm\n", rssi);
-        delay(100);
+    if (actions & handheld::MaintenanceBarrier::BeginHelpers) {
+#if HAS_GPS
+        gps.stop();
+#endif
+        network.stopHelpers();
     }
-    rssiMonitorActive = false;
-    Serial.printf("[RSSI] Done: %d samples, min=%d max=%d dBm\n", samples, minRssi, maxRssi);
-    Serial.printf("[RSSI] If max stayed near %d dBm, RX front-end may not be receiving RF\n", minRssi);
-}
-
-void onHotkeyRadioTest() {
-    Serial.println("[TEST] Sending raw radio test packet...");
-    uint8_t header = 0xA0;
-    const char* testPayload = "RSCARDPUTER_TEST_1234567890";
-    size_t totalLen = 1 + strlen(testPayload);
-
-    radio.beginPacket();
-    radio.write(header);
-    radio.write((const uint8_t*)testPayload, strlen(testPayload));
-    bool ok = radio.endPacket();
-
-    Serial.printf("[TEST] TX %s (%d bytes)\n", ok ? "OK" : "FAILED", (int)totalLen);
-
-    uint8_t verify[32] = {0};
-    radio.readBuffer(verify, totalLen);
-    Serial.printf("[TEST] FIFO verify: ");
-    for (size_t i = 0; i < totalLen; i++) Serial.printf("%02X ", verify[i]);
-    Serial.println();
-
-    radio.receive();
+    if (actions & handheld::MaintenanceBarrier::StopStorage) messageStore.requestStop();
+    if (actions & handheld::MaintenanceBarrier::Perform) {
+        const auto result = handheld::performMaintenance(maintenance, maintenanceRequest,
+            *backend, userConfig, identityMgr, flash, sdStore, announceManager);
+        maintenanceScreen.show(result.ok ? "Ready to restart" : result.detail, !result.ok);
+        Serial.printf("[MAINTENANCE] %s\n", result.detail);
+        ui.markAllDirty();
+        power.activity();
+        maintenanceRestart = result.ok;
+    }
+    if (maintenanceRestart) {
+        maintenanceRestart = false;
+        ui.render(); ui.flush();
+        ESP.restart();
+    }
 }
 
 // =============================================================================
 // Announce with display name
 // =============================================================================
 
-// LXMF announce app_data:
-//   [display_name(bin), stamp_cost(nil|uint), supported_functionality(array)]
-// Always emit fixarray(3) so Python LXMF doesn't default auto_compress=True for
-// our destinations. stamp_cost=nil means no inbound stamp is required. Empty
-// supported_functionality list = we do NOT support SF_COMPRESSION (bz2).
-rs::Bytes encodeAnnounceName(const String& name) {
-    size_t nameLen = name.length();
-    if (nameLen > 31) nameLen = 31;
-    uint8_t buf[5 + 31];
-    size_t i = 0;
-    buf[i++] = 0x93;                   // fixarray(3)
-    buf[i++] = 0xC4;                   // bin 8
-    buf[i++] = (uint8_t)nameLen;
-    if (nameLen) { memcpy(buf + i, name.c_str(), nameLen); i += nameLen; }
-    buf[i++] = 0xC0;                   // stamp_cost = nil (no stamp required)
-    buf[i++] = 0x90;                   // empty fixarray (no SF_* supported)
-    return rs::Bytes(buf, i);
-}
 
 static ProtocolBackend::AnnounceResult announceWithName(bool silent) {
+    if (userConfig.settingsPending() || settingsScreen.radioApplyPending()) return ProtocolBackend::AnnounceResult::Failed;
+    if (!maintenance.accepting()) return ProtocolBackend::AnnounceResult::Failed;
     // Honest runtime gate: real announce once the backend is up (protocolReady).
     if (!backend->protocolReady()) {
         (void)silent;
@@ -460,311 +425,21 @@ static bool enableCapLoRaRfSwitch() {
     return true;
 }
 
-static void cycleDiagnosticTxPower() {
-    static constexpr int8_t kPowers[] = {-9, -3, 0, 2, 6, 10, 14, 17, LORA_MAX_TX_POWER};
-    int current = radio.getTxPower();
-    size_t next = 0;
-    for (size_t i = 0; i < sizeof(kPowers) / sizeof(kPowers[0]); i++) {
-        if (current == kPowers[i]) {
-            next = (i + 1) % (sizeof(kPowers) / sizeof(kPowers[0]));
-            break;
-        }
-    }
-
-    radio.setTxPower(kPowers[next]);
-    radio.receive();
-    Serial.printf("[SERIAL] transient TX power set to %d dBm\n", (int)kPowers[next]);
-}
-
-static void setDiagnosticMinTxPower() {
-    radio.setTxPower(-9);
-    radio.receive();
-    Serial.println("[SERIAL] transient TX power set to -9 dBm");
-}
-
-static bool setDiagnosticTxPower(int powerDbm) {
-    if (powerDbm < -9 || powerDbm > LORA_MAX_TX_POWER) {
-        Serial.printf("[SERIAL] TX power out of range: %d dBm (allowed -9..%d)\n",
-                      powerDbm, (int)LORA_MAX_TX_POWER);
-        return false;
-    }
-    radio.setTxPower((int8_t)powerDbm);
-    radio.receive();
-    Serial.printf("[SERIAL] transient TX power set to %d dBm\n", powerDbm);
-    return true;
-}
-
-static void toggleDiagnosticInvertIQ() {
-    radio.setInvertIQ(!radio.getInvertIQ());
-    radio.receive();
-    Serial.printf("[SERIAL] IQ inversion %s\n", radio.getInvertIQ() ? "ON" : "off");
-}
-
-static bool setDiagnosticFrequency(uint32_t frequencyHz) {
-    if (frequencyHz < 150000000UL || frequencyHz > 960000000UL) {
-        Serial.printf("[SERIAL] frequency out of range: %lu Hz (allowed 150000000..960000000)\n",
-                      (unsigned long)frequencyHz);
-        return false;
-    }
-    radio.setFrequency(frequencyHz);
-    radio.receive();
-    Serial.printf("[SERIAL] transient frequency set to %lu Hz\n", (unsigned long)frequencyHz);
-    return true;
-}
-
-static void nudgeDiagnosticFrequency(int32_t deltaHz) {
-    uint32_t next = radio.getFrequency() + deltaHz;
-    radio.setFrequency(next);
-    radio.receive();
-    Serial.printf("[SERIAL] transient frequency set to %lu Hz\n", (unsigned long)next);
-}
-
-static const char* skipSerialSeparators(const char* p) {
-    while (p && (*p == ' ' || *p == '\t' || *p == ':' || *p == '=' || *p == ',')) {
-        ++p;
-    }
-    return p;
-}
-
-static bool hasSerialArgument(const char* p) {
-    p = skipSerialSeparators(p);
-    return p && *p != '\0';
-}
-
-static bool parseSerialLong(const char* p, long& value, const char** rest = nullptr) {
-    p = skipSerialSeparators(p);
-    if (!p || *p == '\0') return false;
-    char* end = nullptr;
-    value = std::strtol(p, &end, 10);
-    if (end == p) return false;
-    if (rest) *rest = end;
-    return true;
-}
-
-static bool parseSerialDestinationHash(const char* p, rs::Bytes& hash) {
-    p = skipSerialSeparators(p);
-    if (!p || *p == '\0') return false;
-
-    char hex[33] = {0};
-    size_t len = 0;
-    while (*p && len < 32) {
-        unsigned char ch = (unsigned char)*p;
-        if (std::isxdigit(ch)) {
-            hex[len++] = (char)*p;
-        } else if (*p != ' ' && *p != '\t' && *p != ':' && *p != '=' && *p != ',' && *p != '-') {
-            return false;
-        }
-        ++p;
-    }
-
-    if (len != 32) return false;
-    hash.assignHex(hex);
-    return hash.size() == 16;
-}
-
-static bool selectDiagnosticPeer(const char* explicitArg, rs::Bytes& destHash, std::string& label) {
-    if (hasSerialArgument(explicitArg)) {
-        if (!parseSerialDestinationHash(explicitArg, destHash)) {
-            Serial.println("[SERIAL] invalid LXMF destination hash; expected 32 hex characters");
-            return false;
-        }
-        label = destHash.toHex();
-        return true;
-    }
-
-    if (!announceManager) {
-        Serial.println("[SERIAL] LXMF test failed: announce manager is not ready");
-        return false;
-    }
-
-    const std::string localHex = backend->destinationHashHex().c_str();
-    for (const auto& node : announceManager->nodes()) {
-        if (node.hash.size() != 16) continue;
-        const std::string nodeHex = node.hash.toHex();
-        if (nodeHex == localHex) continue;
-        destHash = node.hash;
-        label = node.name.empty() ? nodeHex : (node.name + " " + nodeHex);
-        return true;
-    }
-
-    Serial.println("[SERIAL] LXMF test failed: no peer known; send/receive announces first or pass a hash");
-    return false;
-}
-
-static std::string makeDiagnosticLxmfPayload(size_t length) {
-    static constexpr char kPrefix[] = "RSCARDPUTER-LXMF-TEST:";
-    static constexpr char kPattern[] =
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-    std::string out;
-    out.reserve(length);
-    for (size_t i = 0; kPrefix[i] && out.size() < length; ++i) {
-        out.push_back(kPrefix[i]);
-    }
-    for (size_t i = 0; out.size() < length; ++i) {
-        out.push_back(kPattern[i % (sizeof(kPattern) - 1)]);
-    }
-    return out;
-}
-
-static bool sendDiagnosticLxmf(size_t length, const char* explicitDest) {
-    if (!backend->protocolReady()) {
-        (void)length; (void)explicitDest;
-        Serial.println("[SERIAL] LXMF test failed: rust backend protocol not ready");
-        return false;
-    }
-    static constexpr size_t kMaxDiagnosticLxmfChars = 512;
-    if (length == 0 || length > kMaxDiagnosticLxmfChars) {
-        Serial.printf("[SERIAL] LXMF test length out of range: %u (allowed 1..%u)\n",
-                      (unsigned)length, (unsigned)kMaxDiagnosticLxmfChars);
-        return false;
-    }
-
-    rs::Bytes destHash;
-    std::string peerLabel;
-    if (!selectDiagnosticPeer(explicitDest, destHash, peerLabel)) return false;
-
-    std::string payload = makeDiagnosticLxmfPayload(length);
-    bool ok = backend->lxmfSendMessage(destHash.data(), payload.c_str(), "", false);
-    Serial.printf("[SERIAL] LXMF test %s: len=%u dest=%s queue=%d\n",
-                  ok ? "queued" : "rejected",
-                  (unsigned)payload.size(),
-                  peerLabel.c_str(),
-                  backend->lxmfQueuedCount());
-    return ok;
-}
-
-static void handleSerialLineCommand(const char* line) {
-    if (!line || !*line) return;
-
-    switch (line[0]) {
-        case 'F': {
-            long value = 0;
-            if (!parseSerialLong(line + 1, value) || value < 0) {
-                Serial.println("[SERIAL] usage: F<frequency_hz>, for example F915000000");
-                return;
-            }
-            setDiagnosticFrequency((uint32_t)value);
-            break;
-        }
-        case 'P': {
-            long value = 0;
-            if (!parseSerialLong(line + 1, value)) {
-                Serial.println("[SERIAL] usage: P<tx_power_dbm>, for example P1 or P5");
-                return;
-            }
-            setDiagnosticTxPower((int)value);
-            break;
-        }
-        case 'L': {
-            long length = 0;
-            const char* rest = nullptr;
-            if (!parseSerialLong(line + 1, length, &rest) || length <= 0) {
-                Serial.println("[SERIAL] usage: L<payload_chars> [dest_hash], for example L120");
-                return;
-            }
-            sendDiagnosticLxmf((size_t)length, rest);
-            break;
-        }
-        default:
-            Serial.printf("[SERIAL] unknown line command '%c'\n", line[0]);
-            break;
-    }
-}
-
-static void printSerialHelp() {
-    Serial.println("[SERIAL] commands: ? help | a announce | t raw-test | d diag | r rssi | p tx-power-cycle | m min-power | q iq | +/- freq | f rf-switch");
-    Serial.println("[SERIAL] line commands: F<hz> exact-frequency | P<dBm> exact-tx-power | L<len> [dest_hash] LXMF test");
-}
-
-static void handleSerialCommands() {
-    static char line[96];
-    static size_t lineLen = 0;
-    static bool lineActive = false;
-
-    while (Serial.available() > 0) {
-        char c = (char)Serial.read();
-        if (lineActive) {
-            if (c == '\r' || c == '\n') {
-                line[lineLen] = '\0';
-                handleSerialLineCommand(line);
-                lineLen = 0;
-                lineActive = false;
-                continue;
-            }
-            if (lineLen + 1 >= sizeof(line)) {
-                Serial.println("[SERIAL] line command too long; discarded");
-                lineLen = 0;
-                lineActive = false;
-                continue;
-            }
-            line[lineLen++] = c;
-            continue;
-        }
-
-        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
-        if (c == 'F' || c == 'P' || c == 'L') {
-            lineActive = true;
-            lineLen = 0;
-            line[lineLen++] = c;
-            continue;
-        }
-
-        switch (c) {
-            case '?':
-                printSerialHelp();
-                break;
-            case 'a':
-            case 'A':
-                announceWithName(false);
-                break;
-            case 't':
-            case 'T':
-                onHotkeyRadioTest();
-                break;
-            case 'd':
-            case 'D':
-                onHotkeyDiag();
-                break;
-            case 'r':
-            case 'R':
-                onHotkeyRssiMonitor();
-                break;
-            case 'p':
-                cycleDiagnosticTxPower();
-                break;
-            case 'm':
-            case 'M':
-                setDiagnosticMinTxPower();
-                break;
-            case 'q':
-            case 'Q':
-                toggleDiagnosticInvertIQ();
-                break;
-            case '+':
-            case '=':
-                nudgeDiagnosticFrequency(1000);
-                break;
-            case '-':
-            case '_':
-                nudgeDiagnosticFrequency(-1000);
-                break;
-            case 'f':
-                enableCapLoRaRfSwitch();
-                break;
-            default:
-                Serial.printf("[SERIAL] unknown command '%c'\n", c);
-                printSerialHelp();
-                break;
-        }
-    }
-}
-
 // =============================================================================
 // Setup
 // =============================================================================
 
 void setup() {
+    ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("cardputer", "standalone"));
+    diagnostics.boardHelp = "[SERIAL] f enable Cap LoRa RF switch";
+    diagnostics.boardCommand = [](char command) {
+        if (command != 'f') return false;
+        enableCapLoRaRfSwitch();
+        return true;
+    };
+    diagnostics.extraDump = []() {
+        Serial.printf("WriteQ pending: %d\n", messageStore.writeQueue().drainCount());
+    };
     // Initialize M5Cardputer (includes M5Unified + keyboard)
     auto cfg = M5.config();
     // The PlatformIO target is the generic ESP32-S3 devkit, so display
@@ -805,7 +480,14 @@ void setup() {
                   (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap());
 
     // Initialize UI + boot screen
-    ui.begin();
+    if (!ui.begin()) {
+        Serial.println("[BOOT] Canvas memory unavailable; restart to retry");
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.drawString("Display memory unavailable", 8, 45);
+        M5.Display.drawString("Restart to retry", 8, 65);
+        while (true) delay(1000);
+    }
     ui.setBootMode(true);
     ui.setScreen(&bootScreen);
     bootScreen.setProgress(0.1f, "Display ready");
@@ -838,17 +520,17 @@ void setup() {
     // Initialize flash storage
     bootScreen.setProgress(0.25f, "Mounting flash...");
     ui.render();
-    if (!flash.begin()) {
-        Serial.println("[BOOT] Flash init failed!");
-        bootScreen.setProgress(0.25f, "Storage error - data preserved");
+    const bool flashReady = flash.begin();
+    if (!flashReady) {
+        Serial.println("[BOOT] Flash startup blocked; preserving reset/data recovery");
+        bootScreen.setProgress(0.25f, "Storage recovery pending");
         ui.render();
-        while (true) delay(20);
     }
     bootScreen.setProgress(0.3f, "Storage ready");
     ui.render();
 
     // Boot loop detection (NVS — separate from LittleFS)
-    {
+    if (flashReady) {
         Preferences prefs;
         if (prefs.begin("ratcom", false)) {
             int bc = prefs.getInt("bootc", 0);
@@ -865,18 +547,17 @@ void setup() {
     // Initialize radio
     bootScreen.setProgress(0.4f, "Starting radio...");
     ui.render();
-    enableCapLoRaRfSwitch();
-    if (radio.begin(LORA_DEFAULT_FREQ)) {
+    if (flashReady && enableCapLoRaRfSwitch() && radio.begin(LORA_DEFAULT_FREQ)) {
         radio.setSpreadingFactor(LORA_DEFAULT_SF);
         radio.setSignalBandwidth(LORA_DEFAULT_BW);
         radio.setCodingRate4(LORA_DEFAULT_CR);
         radio.setTxPower(LORA_DEFAULT_TX_POWER);
         radio.setPreambleLength(LORA_DEFAULT_PREAMBLE);
         radio.receive();
-        radioOnline = true;
-        ui.statusBar().setLoRaOnline(true);
-        Serial.println("[RADIO] SX1262 online at 915 MHz");
-        bootScreen.setProgress(0.6f, "Radio online");
+        radioOnline = radio.isRadioOnline();
+        ui.statusBar().setLoRaOnline(radioOnline);
+        Serial.println(radioOnline ? "[RADIO] SX1262 online at 915 MHz" : "[RADIO] Configuration failed");
+        bootScreen.setProgress(0.6f, radioOnline ? "Radio online" : "Radio: OFFLINE");
     } else {
         Serial.println("[RADIO] SX1262 not detected!");
         bootScreen.setProgress(0.6f, "Radio: OFFLINE");
@@ -884,18 +565,32 @@ void setup() {
     ui.render();
 
     // Initialize SD card (shares FSPI/SPI2 with radio — must init after radio)
+    bool sdInitializationFailed = false;
     bootScreen.setProgress(0.65f, "Checking SD card...");
     ui.render();
+    if (!flashReady) {
+        // Recovery mounts only the SD bus; no modem/RF initialization runs.
+        loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+        pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
+    }
     if (sdStore.begin(&loraSPI, SD_CS)) {
-        sdStore.ensureDir("/ratcom");
-        sdStore.ensureDir("/ratcom/messages");
-        sdStore.ensureDir("/ratcom/contacts");
-        sdStore.ensureDir("/ratcom/identity");
-        bootScreen.setProgress(0.68f, "SD card ready");
+        if (flashReady) {
+            sdInitializationFailed = !sdStore.formatForRsDeck();
+        }
+        bootScreen.setProgress(0.68f, sdInitializationFailed ? "SD setup failed" : "SD card ready");
     } else {
         bootScreen.setProgress(0.68f, "No SD card");
     }
     ui.render();
+
+    handheld::factoryResetRecovery(flash, sdStore, keyboard, M5Cardputer.Display, []() { ESP.restart(); });
+
+    // Refuse a known SD initialization failure before dependent imports/writes.
+    if (sdInitializationFailed) {
+        bootScreen.setProgress(0.68f, "SD setup failed; remove & restart");
+        ui.render();
+        for (;;) delay(20);
+    }
 
     // Initialize Reticulum
     bootScreen.setProgress(0.7f, "Starting Reticulum...");
@@ -921,19 +616,35 @@ void setup() {
         for (;;) delay(20);
     }
 
+    if (identityMgr.activeIndex() >= 0 || userConfig.settingsPending()) {
+        if (!SettingsTransaction::recover(userConfig, identityMgr, sdStore, flash).complete()) {
+            bootScreen.setProgress(0.9f, "Settings recovery - restart to retry");
+            ui.render(); for (;;) delay(20);
+        }
+    }
+
     // Initialize message store + LXMF
     bootScreen.setProgress(0.91f, "Starting messaging...");
     ui.render();
-    messageStore.begin(&flash, &sdStore, userConfig.settings().sdStorageEnabled);
+    if (!handheld::storage::legacyMessageArena().reserve() ||
+        !messageStore.begin(&flash, &sdStore, userConfig.settings().sdStorageEnabled)) {
+        bootScreen.setProgress(0.91f, "Storage error - data preserved");
+        ui.render();
+        for (;;) delay(20);
+    }
     // Protocol runtime lifecycle: init -> identity -> boot-seed ->
     // placement open_transport (MICRO node in internal heap) -> pump. LXMF
     // runs store-only so the UI read surface works; sends go through the backend engines.
     if (protocolRuntime.begin(&flash, &sdStore, &identityMgr, &messageStore, nullptr,
                           RS_HANDHELD_PROFILE_MICRO,
                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) {
+        if (!SettingsTransaction::recover(userConfig, identityMgr, sdStore, flash).complete()) {
+            bootScreen.setProgress(0.9f, "Settings error - no interfaces started");
+            ui.render(); for (;;) delay(20);
+        }
         protocolRuntime.pump().attachLoRa(&rustLoraIface);
-        protocolRuntime.pump().attachAuto(&autoIface);  // driver starts on SLAAC (iface 5)
-        if (radioOnline) rustLoraIface.start();
+        if (radioOnline) applyRadioSettings(radio, userConfig.settings());
+        if (radioOnline && userConfig.settings().loraEnabled) rustLoraIface.start();
         Serial.printf("[BOOT] Rust transport up: dest=%s\n",
                       protocolRuntime.destinationHashHex().c_str());
         bootScreen.setProgress(0.92f, "Reticulum ready");
@@ -943,23 +654,22 @@ void setup() {
         for (;;) delay(20);
     }
     lxmf.beginStoreOnly(&messageStore);
-    // Inbound notify (both envs: micro delegates to lxmf, rust fires from the
-    // engines on every delivery path — opportunistic, link packet, resource).
-    backend->setMessageCallback([](const LXMFMessage& msg) {
-        // This runs in the packet callback context — MUST be non-blocking.
-        // No disk I/O, no delays, no heavy computation.
-        Serial.printf("[LXMF] New message from %s\n", msg.sourceHash.toHex().substr(0, 8).c_str());
+    // All receive paths publish a committed record on the protocol owner. The
+    // callback invalidates views; bodies remain in the authoritative store.
+    backend->setMessageCallback([](const LXMFManager::CommittedMessage& message) {
+        const auto* peer = message.key.peer;
+        Serial.printf("[LXMF] New message from %02x%02x%02x%02x\n", peer[0], peer[1], peer[2], peer[3]);
         ui.tabBar().setUnreadCount(TabBar::TAB_MSGS, lxmf.unreadCount());
         ui.markContentDirty();
         ui.markTabDirty();
         messagesScreen.notifyNewMessage();
-        messageView.notifyNewMessage(msg);
+        messageView.notifyNewMessage(message.key);
         pendingMessageSound = true;  // Played from main loop — delay() in callback blocks transport
     });
 
     // Status callback — update UI when send completes (SENT/FAILED)
-    backend->setStatusCallback([](const std::string& peerHex, double timestamp, uint32_t, LXMFStatus status) {
-        messageView.notifyStatusChange(peerHex, timestamp, status);
+    backend->setStatusCallback([](const std::string& peerHex, double, uint32_t counter, LXMFStatus status) {
+        messageView.notifyStatusChange(peerHex, counter, status);
         ui.markContentDirty();
     });
 
@@ -970,41 +680,21 @@ void setup() {
     ui.render();
     // Filter to lxmf.delivery so we don't capture every aspect (lxmf.propagation,
     // nomadnetwork.node, etc.) from the same peer as separate "doubled" entries.
-    announceManager = new AnnounceManager("lxmf.delivery");
-    announceManager->setStorage(&sdStore, &flash);
-    // Protocol runtime: wire the announce contact bridge + own-announce filter.
-    announceManager->setLocalDestHash(rs::Bytes(protocolRuntime.localDestHash(), 16));
-    protocolRuntime.setAnnounceManager(announceManager);
-    {
-        // Pre-announce path responses must carry the capability app_data (no-bz2 etc.).
-        rs::Bytes seed = encodeAnnounceName(userConfig.settings().displayName);
-        protocolRuntime.seedAnnounceAppData(seed.data(), seed.size());
+    if (!handheld::prepareDiscovery(protocolRuntime, sdStore, flash,
+                                    userConfig.settings().displayName, announceManager)) {
+        Serial.println("[BOOT] Discovery memory unavailable; restart to retry");
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.drawString("Memory unavailable", 8, 45);
+        M5.Display.drawString("Restart to retry", 8, 65);
+        while (true) delay(1000);
     }
-    announceManager->loadContacts();
-    announceManager->loadNameCache();
     // Backends consumed the boot seeds above (dedup ids + pending requeue) — free them.
     messageStore.releaseStartupSeeds();
 
-    // Sync display name between active identity slot and config.
-    // The identity slot is the source of truth for the name.
-    {
-        String slotName;
-        if (identityMgr.syncNameFromActive(slotName)) {
-            if (!slotName.isEmpty()) {
-                if (userConfig.settings().displayName != slotName) {
-                    Serial.printf("[BOOT] Name from identity slot: '%s'\n", slotName.c_str());
-                    userConfig.settings().displayName = slotName;
-                    userConfig.save(sdStore, flash);
-                }
-            } else if (!userConfig.settings().displayName.isEmpty()) {
-                // Slot has no name but config does — seed the slot (first boot migration)
-                identityMgr.setDisplayName(identityMgr.activeIndex(),
-                    userConfig.settings().displayName);
-                Serial.printf("[BOOT] Seeded identity slot name: '%s'\n",
-                    userConfig.settings().displayName.c_str());
-            }
-        }
-    }
+
+
+
 
     // Seed default TCP hubs if no connections configured (off by default)
     if (userConfig.settings().tcpConnections.empty()) {
@@ -1029,67 +719,20 @@ void setup() {
         Serial.println("[BOOT] WiFi forced OFF (boot loop recovery)");
     }
 
-    // Apply radio settings
-    if (radioOnline) {
-        auto& s = userConfig.settings();
-        radio.setFrequency(s.loraFrequency);
-        radio.setSpreadingFactor(s.loraSF);
-        radio.setSignalBandwidth(s.loraBW);
-        radio.setCodingRate4(s.loraCR);
-        radio.setTxPower(s.loraTxPower);
-        radio.receive();
-        Serial.printf("[BOOT] Radio configured: %lu Hz, SF%d, BW%lu, CR4/%d, %d dBm\n",
-                      (unsigned long)s.loraFrequency, s.loraSF,
-                      (unsigned long)s.loraBW, s.loraCR, s.loraTxPower);
-    }
-
     // Mode-based WiFi startup
     RatWiFiMode wifiMode = userConfig.settings().wifiMode;
 
-    if (wifiMode == RAT_WIFI_AP) {
-        bootScreen.setProgress(0.95f, "Starting WiFi AP...");
-        ui.render();
-        // Rust env: same device-owned AP server, pumped as iface 6 — no micro
-        // Transport registration (GAP-4).
-        wifiImpl = new WiFiInterface("WiFi.AP");
-        if (!userConfig.settings().wifiAPSSID.isEmpty()) {
-            wifiImpl->setAPCredentials(
-                userConfig.settings().wifiAPSSID.c_str(),
-                userConfig.settings().wifiAPPassword.c_str());
-        }
-        protocolRuntime.pump().attachWifiAp(wifiImpl);
-        wifiImpl->start();
-
-    } else if (wifiMode == RAT_WIFI_STA) {
-        bootScreen.setProgress(0.95f, "WiFi STA starting...");
-        ui.render();
-        if (!staNetworkRO().ssid.isEmpty()) {
-            WiFi.mode(WIFI_STA);
-            WiFi.onEvent(onWiFiEvent);
-            // AutoInterface needs an IPv6 link-local address.  Must be
-            // enabled BEFORE WiFi.begin() so SLAAC starts on STA association.
-            if (userConfig.settings().autoIfaceEnabled) {
-                WiFi.enableIpV6();
-                Serial.println("[WIFI] IPv6 enabled (AutoInterface ON)");
-            }
-            beginSTAConnection();
-            if (WiFi.status() != WL_CONNECTED && !wifiNeedsReconnect.load()) {
-                scheduleWiFiReconnect();
-            }
-        } else {
-            Serial.println("[WIFI] STA mode but SSID empty — skipping");
-        }
-    } else {
-        bootScreen.setProgress(0.95f, "WiFi disabled");
-        ui.render();
-        Serial.println("[WIFI] Disabled by config");
-    }
+    bootScreen.setProgress(0.95f, wifiMode == RAT_WIFI_AP ? "Starting WiFi AP..." :
+        wifiMode == RAT_WIFI_STA ? "WiFi STA starting..." : "WiFi disabled");
+    ui.render();
+    if (!network.begin(userConfig.settings())) Serial.println("[WIFI] Selected mode could not start");
 
     // BLE disabled
     Serial.println("[BLE] Disabled (stub — v1.1)");
 
     // Initialize GPS (Cap LoRa-1262 GNSS module)
 #if HAS_GPS
+    gps.setTimeEnabled(userConfig.settings().gpsTimeEnabled);
     if (userConfig.settings().gpsTimeEnabled || userConfig.settings().gpsLocationEnabled) {
         gps.setPosixTZ(currentPosixTZ());
         gps.setLocationEnabled(userConfig.settings().gpsLocationEnabled);
@@ -1160,115 +803,60 @@ void setup() {
     settingsScreen.setUserConfig(&userConfig);
     settingsScreen.setFlashStore(&flash);
     settingsScreen.setSDStore(&sdStore);
-    settingsScreen.setRadio(&radio);
+    settingsScreen.setRadioApply([](const UserSettings& settings, bool accepting) {
+        return applyLiveRadioSettings(radio, rustLoraIface, settings, accepting);
+    });
     settingsScreen.setAudio(&audio);
     settingsScreen.setPower(&power);
-    settingsScreen.setWiFi(wifiImpl);
-    settingsScreen.setTCPClients(&tcpClients);
+    settingsScreen.setNetworkActions({
+        []() { return wifiConnection.startScan(); },
+        [](String& json) { return wifiConnection.finishScan(json); },
+        []() { return network.begin(userConfig.settings()); },
+        []() { network.disconnect(); }
+    });
     settingsScreen.setBackend(backend);
+    settingsScreen.setMaintenanceCallback(requestMaintenance);
     settingsScreen.setIdentityHash(backend->destinationHashHex());
+    settingsScreen.setSaveCallback([](UserConfig& candidate) {
+        return saveCardSettings(candidate, CardSettingsStep::Settings);
+    });
 
     tabScreens[TabBar::TAB_HOME]  = &homeScreen;
     tabScreens[TabBar::TAB_MSGS]  = &messagesScreen;
     tabScreens[TabBar::TAB_NODES] = &nodesScreen;
     tabScreens[TabBar::TAB_SETUP] = &settingsScreen;
 
-    // Data clean screen (first boot only — when SD has old data)
-    dataCleanScreen.setDoneCallback([](bool wipe) {
-        if (wipe) {
-            Serial.println("[BOOT] User chose to wipe old data");
-            dataCleanScreen.setStatus("Clearing old data...");
-            ui.markAllDirty();
-            ui.render();
-            ui.flush();
-            sdStore.wipeRsDeck();
-            if (announceManager) announceManager->clearAll();
-            Serial.println("[BOOT] Old data cleared");
-            dataCleanScreen.setStatus("Done! Rebooting...");
-            ui.markAllDirty();
-            ui.render();
-            ui.flush();
-            delay(1500);
-            ESP.restart();
-        } else {
-            Serial.println("[BOOT] User chose to keep old data");
-            ui.setScreen(&nameInputScreen);
+    // Boot flow: each accepted step waits for the shared durable transaction.
+    nameInputScreen.setDoneCallback([](const String& name) {
+        if (userConfig.settingsPending()) return;
+        UserConfig candidate;
+        if (!candidate.tryAssign(userConfig) || !UserConfig::trySetString(candidate.settings().displayName, name.c_str(), name.length())) {
+            nameInputScreen.setSaveStatus("Memory unavailable; Enter retries", false); return;
         }
-    });
-
-    // Boot flow: timezone → name → home
-    // Helper: finalize boot and go to home screen
-    auto finalizeBoot = []() {
-        ui.setBootMode(false);
-        ui.setScreen(&homeScreen);
-        ui.tabBar().setActiveTab(TabBar::TAB_HOME);
-        const auto result = announceWithName();
-        Serial.println(result == ProtocolBackend::AnnounceResult::Sent
-                           ? "[BOOT] Initial announce sent"
-                           : (result == ProtocolBackend::AnnounceResult::Deferred
-                                  ? "[BOOT] Initial announce queued"
-                                  : "[BOOT] Initial announce not sent"));
-        lastAutoAnnounce = millis();
-    };
-
-    // Helper: save config to best available backend
-    auto saveConfig = []() {
-        if (sdStore.isReady()) {
-            userConfig.save(sdStore, flash);
-        } else {
-            userConfig.save(flash);
-        }
-    };
-
-    // Name input callback — shared between fresh boot and timezone-only flow
-    nameInputScreen.setDoneCallback([=](const String& name) {
-        if (!name.isEmpty()) {
-            userConfig.settings().displayName = name;
-            if (identityMgr.activeIndex() >= 0) {
-                identityMgr.setDisplayName(identityMgr.activeIndex(), name);
-            }
-            saveConfig();
-        }
-        finalizeBoot();
+        candidate.settings().nameComplete = true; // Explicit empty is complete.
+        saveCardSettings(candidate, CardSettingsStep::Name);
     });
     nameInputScreen.setBackCallback([]() {
+        if (userConfig.settingsPending()) return;
         timezoneScreen.setSelectedIndex(userConfig.settings().timezoneIdx);
         ui.setScreen(&timezoneScreen);
     });
-
-    // Timezone selection callback — apply TZ, then proceed to name or home
-    timezoneScreen.setDoneCallback([=](int tzIdx) {
-        userConfig.settings().timezoneIdx = (uint8_t)tzIdx;
-        userConfig.settings().timezoneSet = true;
-
-        // Apply timezone immediately
-        setenv("TZ", TIMEZONE_TABLE[tzIdx].posixTZ, 1);
-        tzset();
-#if HAS_GPS
-        if (gps.isRunning()) gps.setPosixTZ(TIMEZONE_TABLE[tzIdx].posixTZ);
-#endif
-
-        // Auto-set radio region + frequency from timezone
-        uint8_t tzRegion = TIMEZONE_TABLE[tzIdx].radioRegion;
-        userConfig.settings().radioRegion = tzRegion;
-        userConfig.settings().loraFrequency = REGION_FREQ[tzRegion];
-        // Apply to hardware immediately
-        if (radioOnline) {
-            radio.setFrequency(REGION_FREQ[tzRegion]);
-            radio.receive();
+    timezoneScreen.setDoneCallback([](int tzIdx) {
+        if (userConfig.settingsPending() || tzIdx < 0 || tzIdx >= TIMEZONE_COUNT) return;
+        UserConfig candidate;
+        if (!candidate.tryAssign(userConfig)) {
+            timezoneScreen.setSaveStatus("Memory unavailable; Enter retries", false); return;
         }
-        Serial.printf("[BOOT] Timezone set: %s (UTC%+d), radio region: %s (%lu MHz)\n",
-                      TIMEZONE_TABLE[tzIdx].label, TIMEZONE_TABLE[tzIdx].baseOffset,
-                      REGION_LABELS[tzRegion], (unsigned long)(REGION_FREQ[tzRegion] / 1000000));
-
-        saveConfig();
-
-        // If no display name yet, go to name input next
-        if (userConfig.settings().displayName.isEmpty()) {
-            ui.setScreen(&nameInputScreen);
-        } else {
-            finalizeBoot();
+        candidate.settings().timezoneIdx = uint8_t(tzIdx);
+        // Region suggestion is only this explicit first-setup choice. A later
+        // timezone edit/recovery preserves the established manual frequency.
+        if (!candidate.settings().timezoneSet) {
+            const uint8_t region = TIMEZONE_TABLE[tzIdx].radioRegion;
+            candidate.settings().radioRegion = region;
+            candidate.settings().loraFrequency = REGION_FREQ[region];
         }
+        candidate.settings().timezoneSet = true;
+        saveCardSettings(candidate, CardSettingsStep::Timezone);
     });
 
     Serial.printf("[BOOT] displayName='%s' tzSet=%d wifiMode=%d\n",
@@ -1282,7 +870,7 @@ void setup() {
         timezoneScreen.setSelectedIndex(userConfig.settings().timezoneIdx);
         ui.setScreen(&timezoneScreen);
         Serial.println("[BOOT] Showing timezone picker");
-    } else if (userConfig.settings().displayName.isEmpty()) {
+    } else if (!userConfig.settings().nameComplete) {
         // Timezone set but no name — show name input
         ui.setScreen(&nameInputScreen);
         Serial.println("[BOOT] Showing name input");
@@ -1321,16 +909,37 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
+    messageStore.poll(); // owner settles durable results before protocol/UI work
     M5.update();
-    handleSerialCommands();
+    pollCardSettings();
+    pollCardRadioSettings();
+    if (maintenance.accepting()) {
+        diagnostics.poll();
+        diagnostics.pollSamples();
+    } else {
+        protocolRuntime.pollMaintenance();
+        diagnostics.pollResults();
+    }
+    static unsigned long lastMetadataRetry = 0;
+    if (maintenance.accepting() && now - lastMetadataRetry >= 30000) {
+        lastMetadataRetry = now;
+        if (!identityMgr.flushPending()) Serial.println("[STORAGE] Identity metadata retry pending");
+        if (!userConfig.flushPending(sdStore, flash)) Serial.println("[STORAGE] Settings backup retry pending");
+    }
 
     // 1. Input (keyboard refresh is INT-gated, with fallback polling)
+    const bool inputScreenWasOn = power.isScreenOn();
     keyboard.update();
     if (keyboard.hasEvent()) {
         const KeyEvent& evt = keyboard.getEvent();
+        if (inputScreenWasOn) handheld::inputObserved(millis());
         power.activity();
 
-        if (ui.isBootMode()) {
+        if (!inputScreenWasOn) {
+            keyboard.discardPending();
+        } else if (!maintenance.accepting()) {
+            maintenanceScreen.handleKey(evt);
+        } else if (ui.isBootMode()) {
             ui.handleKey(evt);
         }
         else if (helpOverlay.isVisible()) {
@@ -1340,7 +949,7 @@ void loop() {
         else if (!hotkeys.process(evt)) {
             bool consumed = ui.handleKey(evt);
 
-            if (!consumed && !evt.ctrl) {
+            if (!consumed && !evt.ctrl && !evt.repeat) {
                 if (evt.tab || evt.navLeft()) {
                     int direction = evt.tab && evt.shift ? -1 :
                                     (evt.navLeft() ? -1 : 1);
@@ -1359,147 +968,44 @@ void loop() {
 
     // 2. Reticulum + radio (throttled — 200Hz active, 20Hz screen off)
     unsigned long rnsDuration = 0;
-    if (now - lastRNS >= rnsInterval) {
+    if (maintenance.accepting() && now - lastRNS >= rnsInterval) {
         lastRNS = now;
         unsigned long rnsStart = millis();
         backend->loop();
         rnsDuration = millis() - rnsStart;
     }
+    if (messageView.pollSubmission()) ui.markContentDirty();
+    if (messageView.pollReadMarker()) ui.markContentDirty();
+    if (settingsScreen.pollNetworkResults()) ui.markContentDirty();
+    if (messageView.pollHistory(maintenance.accepting())) ui.markContentDirty();
+    if (messagesScreen.pollConversations(maintenance.accepting())) ui.markContentDirty();
+    if (messagesScreen.pollDeletion()) ui.markContentDirty();
+    pollMaintenance();
 
-    // 4. Auto-announce (2 minutes)
-    if (bootComplete && now - lastAutoAnnounce >= ANNOUNCE_INTERVAL_MS) {
-        lastAutoAnnounce = now;
-        if (rustLoraIface.isOnline() && rustLoraIface.airtimeUtilization() > LoRaInterface::AIRTIME_THROTTLE) {
-            Serial.println("[AUTO] Skipping announce: LoRa airtime > 25%");
-        } else {
-            const auto result = announceWithName(!power.isScreenOn());
-            Serial.println(result == ProtocolBackend::AnnounceResult::Sent
-                               ? "[AUTO] Periodic announce sent"
-                               : (result == ProtocolBackend::AnnounceResult::Deferred
-                                      ? "[AUTO] Periodic announce queued"
-                                      : "[AUTO] Periodic announce not sent"));
-        }
-    }
+    // Saved periodic cadence; startup begins only after committed onboarding.
+    if (maintenance.accepting() && bootComplete) pollScheduledAnnounces();
 
-    // 5. WiFi STA non-blocking connection handler
-    if (wifiSTAStarted) {
-        if (wifiNeedsReconnect.load() && WiFi.status() != WL_CONNECTED &&
-            (long)(millis() - wifiReconnectAt.load()) >= 0) {
-            wifiNeedsReconnect.store(false);
-            uint8_t attempt = wifiReconnectAttempt.load();
-            Serial.printf("[WIFI] Reconnect attempt #%u\n", (unsigned)attempt);
-            beginSTAConnection();
-            if (WiFi.status() != WL_CONNECTED && !wifiNeedsReconnect.load()) {
-                scheduleWiFiReconnect();
-            }
-        }
-
-        bool connected = (WiFi.status() == WL_CONNECTED);
-        if (connected && !wifiSTAConnected) {
-            wifiSTAConnected = true;
-            wifiNeedsReconnect.store(false);
-            wifiReconnectAttempt.store(0);
+    if (maintenance.accepting()) {
+        const auto events = network.poll(userConfig.settings(), rnsDuration,
+            handheld::NetworkCoordinator::CardBudget);
+        if (events & handheld::NetworkCoordinator::Connected) {
             Serial.printf("[WIFI] STA connected: %s\n", WiFi.localIP().toString().c_str());
-
-            // NTP time sync — configTzTime() is non-blocking (starts SNTP daemon)
-            {
-                static bool ntpStarted = false;
-                if (!ntpStarted) {
-                    const char* tz = currentPosixTZ();
-                    configTzTime(tz, "pool.ntp.org", "time.nist.gov");
-                    ntpStarted = true;
-                    Serial.printf("[NTP] Time sync started (TZ=%s)\n", tz);
-                }
-            }
-
-            // Recreate TCP clients on every WiFi connect (old clients may have stale sockets)
-            reloadTCPClients();
-            // Arm AutoInterface deferred-start; SLAAC needs ~1.5–10s to assign
-            // a link-local IPv6 address.  Calling enableIpV6() pre-begin is
-            // not enough on every Arduino-ESP32 version — call again now that
-            // STA is associated.
-            if (userConfig.settings().autoIfaceEnabled) {
-                WiFi.enableIpV6();
-                autoIfaceDeferredStart = true;
-                autoIfaceDeferredAt = millis();
-            }
-        } else if (!connected && wifiSTAConnected) {
-            wifiSTAConnected = false;
-            // Stop and deregister TCP clients cleanly
-            protocolRuntime.pump().detachTcpAll();
-            for (auto* tcp : tcpClients) {
-                retireTCPClient(tcp);
-            }
-            tcpClients.clear();
-            Serial.println("[WIFI] STA disconnected, TCP interfaces deregistered");
-            autoIface.stop();
-            autoIfaceDeferredStart = false;
-        }
-    }
-
-    // 5.5. AutoInterface deferred start — fire once SLAAC assigns a link-local
-    // IPv6 address.  Arduino's IPv6Address::toString returns expanded
-    // "0000:0000:..." form before SLAAC completes; check fe80::/10 prefix
-    // bytes directly.  Give up after 10 s on hostile APs.
-    if (autoIfaceDeferredStart) {
-        unsigned long elapsed = millis() - autoIfaceDeferredAt;
-        if (elapsed >= 1500) {
-            IPv6Address ll = WiFi.localIPv6();
-            bool isLinkLocal = (ll[0] == 0xfe) && ((ll[1] & 0xc0) == 0x80);
-            if (isLinkLocal) {
-                autoIfaceDeferredStart = false;
-                esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-                uint32_t scope = sta ? esp_netif_get_netif_impl_index(sta) : 1;
-                // Raw bytes in: the driver formats RFC-5952 itself (Arduino
-                // toString is expanded-form — would break beacon-hash interop).
-                autoIface.start(
-                    userConfig.settings().autoIfaceGroupId.c_str(),
-                    userConfig.settings().autoIfaceMaxPeers,
-                    (const uint8_t*)ll,
-                    scope);
-            } else if (elapsed >= 10000) {
-                autoIfaceDeferredStart = false;
-                Serial.println("[AUTOIFACE] SLAAC timeout — no link-local after 10s");
+            static bool ntpStarted = false;
+            if (!ntpStarted) {
+                configTzTime(currentPosixTZ(), "pool.ntp.org", "time.nist.gov");
+                ntpStarted = true;
             }
         }
-    }
-
-    // 5.6. AutoInterface link-local rotation watch — covers SLAAC privacy
-    // address rotation while STA stays associated.  notify_link_change()
-    // is idempotent in the library, so polling here is cheap (string
-    // compare, no socket churn) and only does real work on actual change.
-    if (autoIface.isOnline() && wifiSTAConnected &&
-        millis() - lastAutoIfaceLinkCheck >= 2000) {
-        lastAutoIfaceLinkCheck = millis();
-        IPv6Address ll = WiFi.localIPv6();
-        bool isLinkLocal = (ll[0] == 0xfe) && ((ll[1] & 0xc0) == 0x80);
-        if (isLinkLocal) {
-            esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            uint32_t scope = sta ? esp_netif_get_netif_impl_index(sta) : 1;
-            autoIface.notifyLinkChange((const uint8_t*)ll, scope);
-        }
-    }
-
-    // 6. TCP transport (with global budget) — skip if RNS was overloaded
-    {
-        drainRetiredTCPClients();
-        bool skipTcp = (rnsDuration > 200);
-        if (!skipTcp && wifiImpl) wifiImpl->loop();
-        if (!skipTcp) {
-            unsigned long tcpBudgetStart = millis();
-            for (auto* tcp : tcpClients) {
-                if (millis() - tcpBudgetStart >= TCP_GLOBAL_BUDGET_MS) break;
-                tcp->loop();
-                yield();
-            }
-        }
-        // AutoInterface always runs — non-blocking, time-gated.  Skipping
-        // it under TCP load drops peers to a 22 s silence timeout.
-        autoIface.loop();
+        if (events & handheld::NetworkCoordinator::Disconnected)
+            Serial.println("[WIFI] STA disconnected, old transports detached");
+        if (events & handheld::NetworkCoordinator::AutoTimeout)
+            Serial.println("[AUTOIFACE] SLAAC timeout — no link-local after 10s");
+        if (events & handheld::NetworkCoordinator::AutoFailed)
+            Serial.println("[AUTOIFACE] Socket startup failed");
     }
 
     // 7. Announce manager deferred saves (contacts + name cache)
-    if (announceManager) {
+    if (maintenance.accepting() && announceManager) {
         announceManager->loop();
 
         // Periodic stale node eviction (every 30 min)
@@ -1512,7 +1018,7 @@ void loop() {
 
     // 8. GPS (read UART bytes — non-blocking, <1ms per call)
 #if HAS_GPS
-    if (gps.isRunning()) gps.loop();
+    if (maintenance.accepting() && gps.isRunning()) gps.loop();
 #endif
 
     // 9. Deferred audio (from packet callbacks — delay() can't run in callbacks)
@@ -1545,8 +1051,9 @@ void loop() {
                     if (tcp->isConnected()) { anyTcpConnected = true; break; }
                 }
                 ui.statusBar().setTCPConnected(anyTcpConnected);
+                ui.statusBar().setLoRaOnline(rustLoraIface.isOnline());
                 ui.statusBar().setWiFiState(WiFi.getMode() != WIFI_OFF,
-                    WiFi.status() == WL_CONNECTED || (wifiImpl && wifiImpl->isAPActive()));
+                    WiFi.status() == WL_CONNECTED || (network.accessPoint() && network.accessPoint()->isAPActive()));
                 ui.statusBar().setAutoIfacePeers(autoIface.isOnline() ? (int)autoIface.peerCount() : -1);
 #if HAS_GPS
                 ui.statusBar().setGPSTimeFix(gps.hasTimeFix());
@@ -1578,6 +1085,14 @@ void loop() {
                           (unsigned)autoIface.peerCount(),
                           millis() / 1000,
                           backend->backendName());
+            const auto& latency = handheld::inputToFlush;
+            uint32_t workerStack = 0;
+            const bool workerLive = messageStore.writeQueue().workerStackHighWater(workerStack);
+            Serial.printf("[LATENCY] samples=%lu p95_le=%lu p99_le=%lu max=%lu flash_ms=%lu worker_stack_live=%u worker_stack=%lu\n",
+                (unsigned long)latency.samples, (unsigned long)latency.percentile(95),
+                (unsigned long)latency.percentile(99), (unsigned long)latency.maximum,
+                (unsigned long)handheld::maximumFlashWriteMs.load(), unsigned(workerLive),
+                (unsigned long)workerStack);
             {
                 rs_handheld_transport_stats_t st = {};
                 const auto& pc = protocolRuntime.pump().counters();

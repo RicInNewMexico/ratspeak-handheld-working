@@ -4,6 +4,31 @@
 #include <cstdint>
 
 namespace handheld {
+// One owner samples these values. A sampled minimum can miss an allocation
+// between polls; allocatorMinimum is the SDK's separate historical statistic.
+struct HeapObservation {
+    uint32_t free = 0, largest = 0, allocatorMinimum = 0;
+    uint32_t sampledMinimumFree = UINT32_MAX, sampledMinimumLargest = UINT32_MAX;
+    void add(uint32_t freeBytes, uint32_t largestBlock, uint32_t minimum) {
+        free = freeBytes; largest = largestBlock; allocatorMinimum = minimum;
+        if (free < sampledMinimumFree) sampledMinimumFree = free;
+        if (largest < sampledMinimumLargest) sampledMinimumLargest = largest;
+    }
+};
+struct HeapObservations {
+    HeapObservation internal, psram;
+    uint32_t samples = 0, lastSample = 0, lastReport = 0;
+    bool due(uint32_t now) const { return !samples || now - lastSample >= 100; }
+    void sampled(uint32_t now) {
+        lastSample = now;
+        if (samples != UINT32_MAX) ++samples;
+    }
+    bool reportDue(uint32_t now) {
+        if (now - lastReport < 5000) return false;
+        lastReport = now;
+        return true;
+    }
+};
 struct LatencyHistogram {
     static constexpr std::array<uint32_t, 8> limits{{16, 33, 50, 100, 200, 500, 1000, UINT32_MAX}};
     std::array<uint32_t, 8> bins{};

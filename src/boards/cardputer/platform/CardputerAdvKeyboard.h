@@ -41,12 +41,12 @@ public:
         const unsigned long now = millis();
         const bool irqActive = digitalRead(INTERRUPT_PIN) == LOW;
         const bool timedPoll = now - _lastPoll >= FALLBACK_POLL_MS;
-        if (!irqActive && !timedPoll) return 0;
+        if (!_pending && !irqActive && !timedPoll) return 0;
         _lastPoll = now;
 
         uint8_t count = _controller.available();
         size_t written = 0;
-        while (count-- > 0) {
+        while (count-- > 0 && written < capacity) {
             const uint8_t raw = _controller.getEvent();
             const uint8_t code = raw & 0x7f;
             if (code == 0) continue;
@@ -67,9 +67,11 @@ public:
             }
         }
 
-        // Acknowledge the keypad interrupt after the FIFO is drained.
-        _controller.writeRegister8(TCA8418_REG_INT_STAT,
-                                   TCA8418_REG_STAT_K_INT);
+        // Keep unread events in the controller when the caller's buffer fills.
+        // They remain eligible even when the GPIO interrupt edge was missed.
+        _pending = _controller.available() != 0;
+        if (!_pending) _controller.writeRegister8(TCA8418_REG_INT_STAT,
+                                                 TCA8418_REG_STAT_K_INT);
         return written;
     }
 
@@ -81,5 +83,6 @@ private:
 
     Adafruit_TCA8418 _controller;
     bool _ready = false;
+    bool _pending = false;
     unsigned long _lastPoll = 0;
 };

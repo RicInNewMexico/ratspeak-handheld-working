@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Build a merged rsDeck image with launcher, Standalone, and RNode."""
+"""Build a merged handheld image with launcher, Standalone, and RNode."""
 
 from __future__ import annotations
 
 import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
-LAUNCHER_OFFSET = "0x10000"
-STANDALONE_OFFSET = "0x110000"
-
-
-def parse_int(value: str) -> int:
-    return int(value, 0)
+from release_catalog import APPLICATIONS, BOARDS, ROOT
+from release_identity import firmware_version, source_identity
+from release_images import verify_component, verify_factory
 
 
 def require_file(path: Path, label: str) -> None:
@@ -24,14 +22,10 @@ def require_file(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} is not a file: {path}")
 
 
-def check_slot(path: Path, label: str, slot_size: int) -> None:
-    size = path.stat().st_size
-    if size > slot_size:
-        raise ValueError(f"{label} image is {size} bytes, exceeds slot size {slot_size}")
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device", required=True, choices=BOARDS)
     parser.add_argument("--bootloader", required=True, type=Path)
     parser.add_argument("--partitions", required=True, type=Path)
     parser.add_argument("--boot-app0", required=True, type=Path)
@@ -39,11 +33,6 @@ def main() -> int:
     parser.add_argument("--standalone", required=True, type=Path)
     parser.add_argument("--rnode", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--launcher-slot-size", default="0x100000", type=parse_int)
-    parser.add_argument("--standalone-slot-size", default="0x400000", type=parse_int)
-    parser.add_argument("--rnode-slot-size", default="0x300000", type=parse_int)
-    parser.add_argument("--rnode-offset", default="0x510000")
-    parser.add_argument("--flash-size", default="16MB")
     args = parser.parse_args()
 
     for label, path in (
@@ -56,38 +45,45 @@ def main() -> int:
     ):
         require_file(path, label)
 
-    check_slot(args.launcher, "Launcher", args.launcher_slot_size)
-    check_slot(args.standalone, "Standalone", args.standalone_slot_size)
-    check_slot(args.rnode, "RNode", args.rnode_slot_size)
+    board = BOARDS[args.device]
+    partitions = board.partitions()
+    version = firmware_version(ROOT)
+    revision, dirty = source_identity(ROOT)
+    for name in ("launcher", *APPLICATIONS):
+        verify_component(getattr(args, name).read_bytes(), args.device, name, version, revision, dirty, partitions[name].size)
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "esptool",
-        "--chip",
-        "esp32s3",
-        "merge-bin",
-        "--flash-mode",
-        "dio",
-        "--flash-size",
-        args.flash_size,
-        "--output",
-        str(args.output),
-        "0x0000",
-        str(args.bootloader),
-        "0x8000",
-        str(args.partitions),
-        "0xe000",
-        str(args.boot_app0),
-        LAUNCHER_OFFSET,
-        str(args.launcher),
-        STANDALONE_OFFSET,
-        str(args.standalone),
-        args.rnode_offset,
-        str(args.rnode),
-    ]
-    subprocess.run(cmd, check=True)
+    with tempfile.TemporaryDirectory(prefix="handheld-merge-", dir=args.output.parent) as directory:
+        temporary = Path(directory) / "merged.bin"
+        cmd = [
+            sys.executable,
+            "-m",
+            "esptool",
+            "--chip",
+            "esp32s3",
+            "merge-bin",
+            "--flash-mode",
+            "dio",
+            "--flash-size",
+            board.flash_size,
+            "--output",
+            str(temporary),
+            "0x0000",
+            str(args.bootloader),
+            "0x8000",
+            str(args.partitions),
+            "0xe000",
+            str(args.boot_app0),
+            hex(partitions["launcher"].offset),
+            str(args.launcher),
+            hex(partitions["standalone"].offset),
+            str(args.standalone),
+            hex(partitions["rnode"].offset),
+            str(args.rnode),
+        ]
+        subprocess.run(cmd, check=True)
+        verify_factory(temporary.read_bytes(), args.device, "full", version, revision, dirty)
+        temporary.replace(args.output)
     print(f"dual firmware image written to {args.output}")
     return 0
 

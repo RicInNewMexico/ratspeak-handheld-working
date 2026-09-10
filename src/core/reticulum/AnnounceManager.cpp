@@ -4,10 +4,178 @@
 #include "config/Config.h"
 #include "storage/SDStore.h"
 #include "storage/FlashStore.h"
+#include "storage/AtomicStream.h"
+#include "storage/StorageJsonAllocator.h"
+#include "storage/StorageLease.h"
 #include "transport/LoRaInterface.h"
 #include "util/PerfTrace.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <string_view>
+#include <cerrno>
+
+namespace {
+constexpr size_t ContactFileLimit = 32768; // Existing FlashStore/SDStore read limit.
+
+// One bounded read buffer, shared by all scalar parses in a pass. ArduinoJson
+// decodes strings/escapes; only the surrounding name-map punctuation is walked.
+class BufferedInput {
+public:
+    explicit BufferedInput(File& file) : _file(file), _length(file.size()) {}
+    int peek() {
+        if (_offset == _count) {
+            if (_loaded == _length) return -1;
+            _count = _file.read(_bytes, std::min(sizeof(_bytes), _length - _loaded));
+            _offset = 0; _loaded += _count;
+            if (!_count) { _failed = true; return -1; }
+        }
+        return _bytes[_offset];
+    }
+    int read() { const int value = peek(); if (value >= 0) ++_offset; return value; }
+    bool failed() const { return _failed; }
+    int nonSpace() {
+        int c = peek();
+        while (c == ' ' || c == '\t' || c == '\r' || c == '\n') { read(); c = peek(); }
+        return c;
+    }
+private:
+    File& _file;
+    size_t _length, _loaded = 0, _offset = 0, _count = 0;
+    uint8_t _bytes[512];
+    bool _failed = false;
+};
+
+bool hexText(const char* text, size_t size) {
+    for (size_t i = 0; i < size; ++i)
+        if (!((text[i] >= '0' && text[i] <= '9') ||
+              (text[i] >= 'a' && text[i] <= 'f') || (text[i] >= 'A' && text[i] <= 'F'))) return false;
+    return true;
+}
+
+bool contactFilename(String& name) {
+    if (name.endsWith(".bak")) name = name.substring(0, name.length() - 4);
+    return name.length() == 21 && name.endsWith(".json") && hexText(name.c_str(), 16);
+}
+
+struct ContactFilter {
+    bool root = true, selected = true;
+    bool allow() const { return selected; }
+    bool allowArray() const { return false; }
+    bool allowObject() const { return root; }
+    bool allowValue() const { return selected; }
+    ContactFilter operator[](JsonString key) const {
+        return {false, root && (key == "hash" || key == "name" || key == "deleted")};
+    }
+    template<class Index> ContactFilter operator[](Index) const { return {false, false}; }
+};
+
+struct ContactInput {
+    handheld::storage::JsonAllocator allocator{handheld::storage::Budget::JsonAllocator};
+    JsonDocument document{&allocator};
+    File file;
+
+    template<class Store> bool open(Store& store, const char* root, const String& name) {
+        const String path = String(root) + "/" + name;
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const String candidate = attempt ? String(path + ".bak") : path;
+            file = store.openFile(candidate.c_str());
+            if (!file || file.isDirectory() || !file.size() || file.size() > ContactFileLimit) {
+                file.close(); continue;
+            }
+            BufferedInput input(file);
+            const auto error = deserializeJson(document, input, ContactFilter{});
+            if (!error && input.nonSpace() < 0 && !input.failed() && document.is<JsonObject>()) {
+                const JsonString hash = document["hash"].as<JsonString>();
+                if (hash.size() == 32 && hexText(hash.c_str(), 32) &&
+                    memcmp(hash.c_str(), name.c_str(), 16) == 0) return true;
+            }
+            file.close(); document.clear();
+        }
+        return false;
+    }
+    ~ContactInput() { file.close(); }
+};
+
+// The source is rewound for the existing atomic write and readback comparison.
+// No complete input String or second JSON serialization is retained.
+class ContactSource final : public handheld::storage::AtomicSource {
+public:
+    explicit ContactSource(File& file) : _file(file), _length(file.size()) {}
+    size_t length() const override { return _length; }
+    bool emit(handheld::storage::ByteSink& sink) const override {
+        if (!_file.seek(0)) return false;
+        uint8_t bytes[512];
+        for (size_t offset = 0; offset < _length;) {
+            const size_t count = std::min(sizeof(bytes), _length - offset);
+            if (_file.read(bytes, count) != count || sink.write(bytes, count) != count) return false;
+            offset += count;
+        }
+        return true;
+    }
+private:
+    File& _file;
+    size_t _length;
+};
+
+template<class Visit> bool readNames(File& file, Visit visit) {
+    if (!file || file.isDirectory() || !file.size() || file.size() > ContactFileLimit || !file.seek(0)) return false;
+    BufferedInput input(file);
+    handheld::storage::JsonAllocator allocator(handheld::storage::Budget::JsonAllocator);
+    JsonDocument scalar(&allocator);
+    if (input.nonSpace() != '{') return false;
+    input.read();
+    if (input.nonSpace() != '}') {
+        for (;;) {
+            if (input.nonSpace() != '"' || deserializeJson(scalar, input)) return false;
+            const JsonString key = scalar.as<JsonString>();
+            if (key.size() != 32 || !hexText(key.c_str(), key.size())) return false;
+            char hash[33]; memcpy(hash, key.c_str(), 32); hash[32] = 0;
+            if (input.nonSpace() != ':') return false;
+            input.read();
+            if (input.nonSpace() != '"' || deserializeJson(scalar, input)) return false;
+            const JsonString value = scalar.as<JsonString>();
+            visit(hash, value);
+            const int separator = input.nonSpace();
+            if (separator == '}') break;
+            if (separator != ',') return false;
+            input.read();
+        }
+    }
+    input.read();
+    return input.nonSpace() < 0 && !input.failed();
+}
+
+class NameCacheSource final : public handheld::storage::AtomicSource {
+public:
+    explicit NameCacheSource(const std::map<std::string, std::string>& names) : _names(names) {
+        struct Counter final : handheld::storage::ByteSink {
+            size_t count = 0;
+            size_t write(const uint8_t*, size_t size) override { count += size; return size; }
+        } counter;
+        if (emit(counter)) _length = counter.count;
+    }
+    size_t length() const override { return _length; }
+    bool emit(handheld::storage::ByteSink& sink) const override {
+        handheld::storage::JsonAllocator allocator(handheld::storage::Budget::JsonAllocator);
+        JsonDocument scalar(&allocator);
+        if (sink.write('{') != 1) return false;
+        bool first = true;
+        for (const auto& entry : _names) {
+            if (!first && sink.write(',') != 1) return false;
+            first = false;
+            if (!scalar.set(entry.first) || serializeJson(scalar, sink) != measureJson(scalar) ||
+                sink.write(':') != 1) return false;
+            scalar.clear();
+            if (!scalar.set(entry.second) || serializeJson(scalar, sink) != measureJson(scalar)) return false;
+            scalar.clear();
+        }
+        return sink.write('}') == 1;
+    }
+private:
+    const std::map<std::string, std::string>& _names;
+    size_t _length = 0;
+};
+} // namespace
 
 // Skip one MsgPack value at data[pos], return new pos (or len on error)
 static size_t mpSkipValue(const uint8_t* data, size_t len, size_t pos) {
@@ -80,7 +248,7 @@ static std::string extractMsgPackName(const uint8_t* data, size_t len) {
 
 // Character filter — safe displayable characters including UTF-8 multibyte
 // (lvgl renders missing glyphs as fallback boxes — cosmetic, accepted)
-static std::string sanitizeName(const std::string& raw, size_t maxLen = 32) {
+static std::string sanitizeName(std::string_view raw, size_t maxLen = 32) {
     std::string clean;
     clean.reserve(std::min(raw.size(), maxLen));
     const uint8_t* p = (const uint8_t*)raw.data();
@@ -120,8 +288,29 @@ AnnounceManager::AnnounceManager(const char* aspectFilter) {
     _hashIndex.reserve(MAX_NODES);
 }
 
+AnnounceManager::~AnnounceManager() { closeContactMirrorDirectory(); }
+
 void AnnounceManager::setStorage(SDStore* sd, FlashStore* flash) {
-    handheld::assertDeviceOwner(); _sd = sd; _flash = flash; }
+    handheld::assertDeviceOwner();
+    closeContactMirrorDirectory();
+    _contactMirrorRetry = _contactMirrorWaiting = false;
+    _sd = sd; _flash = flash;
+}
+
+void AnnounceManager::cacheName(const std::string& hash, const std::string& name) {
+    auto found = _nameCache.find(hash);
+    if (found != _nameCache.end()) { found->second = name; return; }
+    // Preserve live/saved names before historical cache-only names, matching
+    // the existing announce eviction policy. The node limit is below this cap.
+    if (_nameCache.size() >= MAX_NAME_CACHE) {
+        auto victim = std::find_if(_nameCache.begin(), _nameCache.end(), [&](const auto& entry) {
+            return !findNodeByHex(entry.first);
+        });
+        if (victim == _nameCache.end()) return;
+        _nameCache.erase(victim);
+    }
+    _nameCache.emplace(hash, name);
+}
 
 void AnnounceManager::receivedAnnounceEvent(const uint8_t destHash[16], const uint8_t identityHash[16],
                                             const uint8_t* appData, size_t appLen, int rssi,
@@ -191,7 +380,7 @@ void AnnounceManager::receivedAnnounceEvent(const uint8_t destHash[16], const ui
         if (!name.empty()) {
             auto nc = _nameCache.find(destHex);
             if (nc == _nameCache.end() || nc->second != name) {
-                _nameCache[destHex] = name;
+                cacheName(destHex, name);
                 _nameCacheWrites.changed();
                 saveNameCache();
             }
@@ -202,17 +391,8 @@ void AnnounceManager::receivedAnnounceEvent(const uint8_t destHash[16], const ui
     if (!name.empty()) {
         auto nc = _nameCache.find(destHex);
         if (nc == _nameCache.end() || nc->second != name) {
-            _nameCache[destHex] = name;
+            cacheName(destHex, name);
             _nameCacheWrites.changed();
-            if ((int)_nameCache.size() > MAX_NAME_CACHE) {
-                for (auto nit = _nameCache.begin();
-                     nit != _nameCache.end() && (int)_nameCache.size() > MAX_NAME_CACHE;) {
-                    rs::Bytes h;
-                    h.assignHex(nit->first.c_str());
-                    if (!findNode(h)) nit = _nameCache.erase(nit);
-                    else ++nit;
-                }
-            }
             saveNameCache();
         }
     }
@@ -264,6 +444,7 @@ void AnnounceManager::receivedAnnounceEvent(const uint8_t destHash[16], const ui
 
 void AnnounceManager::loop() {
     handheld::assertDeviceOwner();
+    flushContactMirrors();
     unsigned long now = millis();
     if (_contactsDirty && now - _lastContactSave >= CONTACT_SAVE_INTERVAL_MS) {
         _lastContactSave = now;
@@ -359,7 +540,7 @@ bool AnnounceManager::saveNode(const std::string& hexHash) {
         node.saved = true;
         // Always persist contact name to name cache
         if (!node.name.empty()) {
-            _nameCache[hexHash] = node.name;
+            cacheName(hexHash, node.name);
             _nameCacheWrites.changed();
         }
         return true;
@@ -407,7 +588,8 @@ void AnnounceManager::clearAll() {
     _hashIndex.clear();
     _nameCache.clear();
     _contactsDirty = false;
-    _contactMirrorsPending.clear();
+    closeContactMirrorDirectory();
+    _contactMirrorsPending = _contactMirrorRetry = _contactMirrorWaiting = false;
     _nameCacheWrites.reset();
     _lastNameCacheSave = 0;
     Serial.println("[ANNOUNCE] Cleared all nodes and name cache");
@@ -422,23 +604,78 @@ void AnnounceManager::rebuildIndex() {
 }
 
 bool AnnounceManager::commitContact(const std::string& hexHash, const String& json) {
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     const std::string filename = hexHash.substr(0, 16) + ".json";
+    closeContactMirrorDirectory();
     if (!_flash || !_flash->ensureDir(PATH_CONTACTS) ||
         !_flash->writeString((String(PATH_CONTACTS) + "/" + filename.c_str()).c_str(), json)) return false;
-    _contactMirrorsPending.insert(filename);
-    flushContactMirrors();
+    // An incomplete sweep starts afresh after canonical directory mutation.
+    _contactMirrorRetry = _contactMirrorWaiting = false;
+    if (!mirrorContact(filename.c_str())) _contactMirrorsPending = true;
     return true;
 }
 
+bool AnnounceManager::mirrorContact(const char* filename) {
+    if (!_flash || !_sd || !_sd->isReady() || !_sd->ensureDir(SD_PATH_CONTACTS)) return false;
+    ContactInput input;
+    if (!input.open(*_flash, PATH_CONTACTS, String(filename))) return false;
+    input.document.clear();
+    const ContactSource source(input.file);
+    return _sd->writeAtomic((String(SD_PATH_CONTACTS) + "/" + filename).c_str(), source) ==
+        handheld::storage::Error::None;
+}
+
+void AnnounceManager::closeContactMirrorDirectory() {
+    if (!_contactMirrorDirectory) return;
+    FSLock lock;
+    if (::closedir(_contactMirrorDirectory) != 0) _contactMirrorRetry = true;
+    _contactMirrorDirectory = nullptr;
+}
+
 void AnnounceManager::flushContactMirrors() {
-    if (!_flash || !_sd || !_sd->isReady()) return;
-    if (!_sd->ensureDir(SD_PATH_CONTACTS)) return;
-    for (auto it = _contactMirrorsPending.begin(); it != _contactMirrorsPending.end();) {
-        const String json = _flash->readString((String(PATH_CONTACTS) + "/" + it->c_str()).c_str());
-        if (!json.isEmpty() && _sd->writeString((String(SD_PATH_CONTACTS) + "/" + it->c_str()).c_str(), json))
-            it = _contactMirrorsPending.erase(it);
-        else ++it;
+    if (!_contactMirrorsPending) return;
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return; // Owner never waits behind an active writer.
+    if (!_flash || !_sd || !_sd->isReady()) { closeContactMirrorDirectory(); return; }
+    const unsigned long now = millis();
+    if (_contactMirrorWaiting && now - _lastContactMirrorAttempt < CONTACT_SAVE_INTERVAL_MS) return;
+    _contactMirrorWaiting = false;
+    if (!_contactMirrorDirectory) {
+        FSLock lock;
+        // Same pinned LittleFS VFS boundary used by ResetDirectory: Arduino's
+        // openNextFile allocates a path and can conceal failure as EOF.
+        _contactMirrorDirectory = ::opendir("/littlefs" PATH_CONTACTS);
+        if (!_contactMirrorDirectory) {
+            _contactMirrorWaiting = true; _lastContactMirrorAttempt = now; return;
+        }
     }
+    // Exactly one readdir per poll, including duplicates/invalid names. The
+    // next name is copied before the next SDK call; no SD handle is retained.
+    char filename[26] = {};
+    bool ended = false, failed = false;
+    {
+        FSLock lock;
+        errno = 0;
+        const dirent* entry = ::readdir(_contactMirrorDirectory);
+        if (!entry) { ended = true; failed = errno != 0; }
+        else if (entry->d_type == DT_REG) {
+            const size_t length = strnlen(entry->d_name, sizeof(filename));
+            if (length < sizeof(filename)) memcpy(filename, entry->d_name, length + 1);
+        }
+    }
+    if (ended) {
+        closeContactMirrorDirectory();
+        _contactMirrorsPending = _contactMirrorRetry || failed;
+        _contactMirrorRetry = false;
+        _contactMirrorWaiting = _contactMirrorsPending;
+        _lastContactMirrorAttempt = now;
+        return;
+    }
+    String name(filename); const bool backup = name.endsWith(".bak");
+    if (!contactFilename(name)) return;
+    if (backup && _flash->exists((String(PATH_CONTACTS) + "/" + name).c_str())) return;
+    if (!mirrorContact(name.c_str())) _contactMirrorRetry = true;
 }
 
 bool AnnounceManager::saveContact(const DiscoveredNode& node) {
@@ -447,6 +684,7 @@ bool AnnounceManager::saveContact(const DiscoveredNode& node) {
     doc["hash"] = node.hash.toHex(); doc["name"] = node.name;
     String json;
     if (doc.overflowed() || serializeJson(doc, json) != measureJson(doc)) return false;
+    doc.clear(); // Release the JSON pool before the bounded mirror parser.
     return commitContact(node.hash.toHex(), json);
 }
 
@@ -458,6 +696,7 @@ bool AnnounceManager::removeContact(const std::string& hexHash) {
     doc["hash"] = hexHash; doc["deleted"] = true;
     String json;
     if (doc.overflowed() || serializeJson(doc, json) != measureJson(doc)) return false;
+    doc.clear();
     return commitContact(hexHash, json);
 }
 
@@ -497,7 +736,7 @@ bool AnnounceManager::setContactName(const std::string& hexHash, const std::stri
     if (!saveContact(candidate)) return false;
     node = std::move(candidate);
     if (!node.name.empty()) {
-        _nameCache[hexHash] = node.name;
+        cacheName(hexHash, node.name);
         _nameCacheWrites.changed();
     }
     return true;
@@ -505,43 +744,54 @@ bool AnnounceManager::setContactName(const std::string& hexHash, const std::stri
 
 void AnnounceManager::loadContacts() {
     handheld::assertDeviceOwner();
-    std::set<std::string> seen;
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return;
+    closeContactMirrorDirectory();
     auto loadFrom = [&](auto& store, const char* root, bool canonical) {
         File dir = store.openDir(root);
         if (!dir || !dir.isDirectory()) return;
         for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
-            if (entry.isDirectory()) continue;
-            String name = entry.name();
-            if (name.endsWith(".bak")) name = name.substring(0, name.length() - 4);
-            if (!name.endsWith(".json") || !seen.insert(name.c_str()).second) continue;
+            if (entry.isDirectory()) { entry.close(); continue; }
+            String name = entry.name(); const bool backup = name.endsWith(".bak");
+            entry.close();
+            if (!contactFilename(name)) continue;
             const String path = String(root) + "/" + name;
-            String json = store.readString(path.c_str());
-            JsonDocument doc;
-            if (json.isEmpty() || deserializeJson(doc, json)) {
-                json = store.readString((path + ".bak").c_str());
-                if (json.isEmpty() || deserializeJson(doc, json)) continue;
+            // A primary processes its own rollback candidate exactly once.
+            // Canonical presence vetoes stale SD data even if its JSON is bad.
+            if (backup && store.exists(path.c_str())) continue;
+            if (!canonical && _flash &&
+                (_flash->exists((String(PATH_CONTACTS) + "/" + name).c_str()) ||
+                 _flash->exists((String(PATH_CONTACTS) + "/" + name + ".bak").c_str()))) continue;
+            ContactInput input;
+            if (!input.open(store, root, name)) continue;
+            const std::string hexHash = input.document["hash"].as<std::string>();
+            const bool deleted = input.document["deleted"] | false;
+            const std::string safeName = sanitizeName(input.document["name"] | "");
+            input.document.clear();
+            if (!canonical) {
+                const ContactSource source(input.file);
+                if (!_flash || !_flash->ensureDir(PATH_CONTACTS) ||
+                    _flash->writeAtomic((String(PATH_CONTACTS) + "/" + name).c_str(), source) !=
+                        handheld::storage::Error::None) continue;
             }
-            std::string hexHash = doc["hash"] | "";
+            _contactMirrorsPending = true;
+            if (deleted) continue;
             rs::Bytes hash; hash.assignHex(hexHash.c_str());
-            if (hash.size() != 16 || hexHash.substr(0, 16) + ".json" != name.c_str()) continue;
-            if (!canonical && !commitContact(hexHash, json)) continue;
-            if (canonical) _contactMirrorsPending.insert(name.c_str());
-            if (doc["deleted"] | false) continue;
             const std::string key = makeKey(hash);
             if (_hashIndex.count(key) || _nodes.size() >= MAX_NODES) continue;
             DiscoveredNode node;
             node.hash = hash;
-            node.name = sanitizeName(doc["name"] | "");
-            if (node.name.empty()) node.name = hexHash.substr(0, 12);
-            // Reachability is boot-relative; persist only address-book data.
+            node.name = safeName.empty() ? hexHash.substr(0, 12) : safeName;
             node.saved = true;
             _hashIndex[key] = (int)_nodes.size();
             _nodes.push_back(node);
         }
+        dir.close();
     };
     if (_flash) loadFrom(*_flash, PATH_CONTACTS, true);
     if (_sd && _sd->isReady()) loadFrom(*_sd, SD_PATH_CONTACTS, false);
-    flushContactMirrors();
+    // Startup traversal is synchronous; optional mirrors progress one entry at
+    // a time in loop(), rather than a second full scan before boot can finish.
 }
 
 bool AnnounceManager::saveContacts() {
@@ -554,9 +804,12 @@ bool AnnounceManager::saveContacts() {
 
 bool AnnounceManager::flushPending() {
     handheld::assertDeviceOwner();
-    flushContactMirrors();
+    // Final maintenance flush must not retain a directory across media teardown.
+    closeContactMirrorDirectory();
+    _contactMirrorRetry = _contactMirrorWaiting = false;
     const bool contacts = !_contactsDirty || saveContacts();
     const bool names = !_nameCacheWrites.dirty() || saveNameCache();
+    closeContactMirrorDirectory();
     return contacts && names;
 }
 
@@ -575,20 +828,20 @@ bool AnnounceManager::saveNameCache() {
     handheld::assertDeviceOwner();
     _lastNameCacheSave = millis();
     if (!_nameCacheWrites.dirty()) return true;
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return false;
     _nameCacheWrites.require((_flash ? MirrorWriteState::Flash : 0) |
                             (_sd && _sd->isReady() ? MirrorWriteState::SD : 0));
     if (ESP.getFreeHeap() < 20000) return false;
-    JsonDocument doc;
-    for (const auto& kv : _nameCache) doc[kv.first] = kv.second;
-    String json;
-    if (doc.overflowed() || !serializeJson(doc, json)) return false;
+    const NameCacheSource source(_nameCache);
+    if (!source.length()) return false;
     if (_nameCacheWrites.needs(MirrorWriteState::Flash) && _flash)
         _nameCacheWrites.completed(MirrorWriteState::Flash,
-            _flash->writeString("/config/names.json", json));
+            _flash->writeAtomic("/config/names.json", source) == handheld::storage::Error::None);
     if (_nameCacheWrites.needs(MirrorWriteState::Flash)) return false;
     if (_nameCacheWrites.needs(MirrorWriteState::SD) && _sd && _sd->isReady())
         _nameCacheWrites.completed(MirrorWriteState::SD,
-            _sd->writeString(SD_PATH_CONFIG_DIR "/names.json", json));
+            _sd->writeAtomic(SD_PATH_CONFIG_DIR "/names.json", source) == handheld::storage::Error::None);
     const bool ok = _nameCacheWrites.settle();
     if (!ok) Serial.println("[ANNOUNCE] Name cache persistence incomplete; retry pending");
     return ok;
@@ -596,15 +849,26 @@ bool AnnounceManager::saveNameCache() {
 
 void AnnounceManager::loadNameCache() {
     handheld::assertDeviceOwner();
-    String json;
-    if (_flash) json = _flash->readString("/config/names.json");
-    if (json.isEmpty() && _sd && _sd->isReady()) json = _sd->readString(SD_PATH_CONFIG_DIR "/names.json");
-    if (json.isEmpty()) return;
-    JsonDocument doc;
-    if (deserializeJson(doc, json)) return;
-    for (JsonPair kv : doc.as<JsonObject>()) {
-        _nameCache[kv.key().c_str()] = kv.value().as<std::string>();
+    handheld::storage::StorageLease lease;
+    if (!lease.held()) return;
+    File file;
+    if (_flash) {
+        file = _flash->openFile("/config/names.json");
+        if (!file) file = _flash->openFile("/config/names.json.bak");
     }
+    if ((!file || !file.size()) && _sd && _sd->isReady()) {
+        file.close(); file = _sd->openFile(SD_PATH_CONFIG_DIR "/names.json");
+        if (!file) file = _sd->openFile(SD_PATH_CONFIG_DIR "/names.json.bak");
+    }
+    // Validate the entire map before applying anything. A second linear pass
+    // decodes only one key/value at a time; there is no full-file String/DOM or
+    // unbounded temporary map. Duplicate keys retain JSON's last-value policy.
+    if (!readNames(file, [](const char*, JsonString) {})) { file.close(); return; }
+    const bool complete = readNames(file, [&](const char* hash, JsonString value) {
+        cacheName(hash, sanitizeName(std::string_view(value.c_str(), value.size())));
+    });
+    file.close();
+    if (!complete) return; // Never persist a partial read after media failure.
     _nameCacheWrites.changed(); // Repair an older SD mirror from canonical flash.
     Serial.printf("[ANNOUNCE] Name cache loaded (%d entries)\n", (int)_nameCache.size());
 }

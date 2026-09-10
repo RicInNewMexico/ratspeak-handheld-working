@@ -7,6 +7,9 @@ import configparser
 import re
 from pathlib import Path
 
+from release_catalog import BOARDS, check_rnode_partition_producers
+from release_identity import check_local
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -32,6 +35,12 @@ def main() -> int:
         "tools/doctor.py",
         "tools/collect_licenses.py",
         "tools/prepare_release.py",
+        "tools/release_catalog.py",
+        "tools/release_boards.json",
+        "tools/release_identity.json",
+        "tools/release_identity.py",
+        "tools/check_build_identity.py",
+        "src/core/config/FirmwareVersion.h",
         "licenses/THIRD-PARTY.txt",
         "licenses/manifest.json",
     ]
@@ -77,31 +86,26 @@ def main() -> int:
             continue
         if "@" not in action or not SHA.fullmatch(action.rsplit("@", 1)[1]):
             fail(f"workflow action is not commit-pinned: {action}")
-    for device in ("tdeck", "tpager", "cardputer"):
-        if device not in workflow:
-            fail(f"workflow does not cover {device}")
-    package = workflow.split("\n  package:", 1)[1].split("\n  experimental-cardputer:", 1)[0]
+    package = workflow.split("\n  package:", 1)[1].split("\n  prepare-release:", 1)[0]
     preparation = workflow.split("\n  prepare-release:", 1)[1]
-    if "device: [tdeck, tpager]" not in package or "cardputer" in package:
-        fail("release package matrix must contain only T-Deck and T-Pager")
-    if "name: tdeck-dist" not in preparation or "name: tpager-dist" not in preparation or "pattern:" in preparation:
-        fail("release downloads must explicitly allowlist T-Deck and T-Pager")
-    if "experimental-cardputer" in re.search(r"needs:.*", preparation).group(0):
-        fail("experimental Cardputer must not gate release-board publication")
+    catalog_job = workflow.split("\n  release-config:", 1)[1].split("\n  package:", 1)[0]
+    if "tools/release_catalog.py matrix" not in catalog_job or "tools/release_catalog.py check" not in catalog_job:
+        fail("release board matrix must come from the validated catalog")
+    if "needs: release-config" not in package or "matrix: ${{ fromJSON(needs.release-config.outputs.matrix) }}" not in package:
+        fail("all catalog boards must build complete release packages")
+    if "make package DEVICE=${{ matrix.device }}" not in package:
+        fail("release board matrix must build all advertised modes")
+    if "experimental-cardputer" in workflow:
+        fail("Cardputer must qualify in the complete release matrix")
+    if "pattern: '*-dist'" not in preparation or "merge-multiple: true" not in preparation:
+        fail("candidate must collect board artifacts for exact inventory verification")
     if "contents: write" in workflow or "gh release" in workflow or "gh pr" in workflow:
         fail("CI must build and verify artifacts without changing repository content")
     if "needs: [protocol-quality, package]" not in preparation or "tools/prepare_release.py" not in preparation:
         fail("candidate must depend on complete source/package validation")
     if '--check-tag "$GITHUB_REF_NAME" --source-revision "$GITHUB_SHA"' not in preparation:
         fail("manual tag qualification must verify source and version binding")
-    for variable, expected in (
-        ("RNS_LITE_COMMIT", "25842ef187e2e29819c73121b90e57f5e367b419"),
-        ("LXMF_LITE_COMMIT", "f4c16b87b595f4f484fa33fe3984cbafbdce714b"),
-        ("RNS_FULL_COMMIT", "3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c"),
-        ("LXMF_FULL_COMMIT", "e210e0c244c76532faae99696f83c94d44c27dc6"),
-    ):
-        if f"{variable}: {expected}" not in workflow:
-            fail(f"workflow does not use the reviewed {variable} pin")
+    check_local(ROOT)
     if "secrets.PRIVATE_LITE_READ_TOKEN || github.token" not in workflow:
         fail("workflow must support private and public Lite checkouts")
     for checkout in workflow.split("uses: actions/checkout@")[1:]:
@@ -116,26 +120,33 @@ def main() -> int:
 
     config = configparser.ConfigParser(interpolation=None)
     config.read(ROOT / "platformio.ini")
-    for board in ("tdeck", "tpager"):
-        flags = config[f"env:{board}"]["build_flags"]
-        if re.findall(r"-DDEVICE_SERVICE_TASK=([01])", flags) != ["1"]:
-            fail(f"{board}: normal builds must enable the dedicated service task")
+    for name, board in BOARDS.items():
+        board.partitions(ROOT)
+        board.partitions(ROOT, standalone=True)
+        flags = config[f"env:{name}"]["build_flags"]
+        service = re.findall(r"-DDEVICE_SERVICE_TASK=([01])", flags)
+        if service != (["1"] if board.runtime == "dedicated" else []):
+            fail(f"{name}: standard execution profile differs from release catalog")
+        if "${protocol_" + board.protocol_profile + ".build_flags}" not in flags:
+            fail(f"{name}: protocol profile differs from release catalog")
     if "STANDALONE_ENV ?= $(DEVICE)" not in (ROOT / "Makefile").read_text():
         fail("normal packaging must use the standard board environment")
     if "STANDALONE_ENV=" in package:
         fail("release CI must not override the standard board environment")
 
+    if "pre:tools/check_build_identity.py" not in config["common"]["extra_scripts"]:
+        fail("normal builds must check the generated product version")
+
     rnode = (ROOT / "vendor/rnode_firmware/Makefile").read_text(encoding="utf-8")
+    check_rnode_partition_producers(ROOT)
     for spec in re.findall(r'arduino-cli lib install "([^"]+)"', rnode):
         if "@" not in spec:
             fail(f"unpinned Arduino library: {spec}")
 
-    for board in ("tdeck", "tpager", "cardputer"):
+    for board in BOARDS:
         config = (ROOT / f"src/boards/{board}/config/BoardConfig.h").read_text(
             encoding="utf-8"
         )
-        if '#define RSDECK_VERSION_STRING "2.1.0"' not in config:
-            fail(f"{board} is not on unified firmware version 2.1.0")
         if '#define BOARD_RELEASE_REPO    "ratspeak/ratspeak-handheld"' not in config:
             fail(f"{board} does not use the unified release repository")
 
@@ -148,7 +159,7 @@ def main() -> int:
     ):
         fail("unresolved TODO(reveal) remains")
 
-    print("source-release contract: PASS (3 build targets, 2 release targets, pinned dependencies/actions)")
+    print(f"source-release contract: PASS ({len(BOARDS)} release targets, pinned dependencies/actions)")
     return 0
 
 

@@ -1,35 +1,11 @@
 #include "UIManager.h"
 #include "util/PerfTrace.h"
 
-void UIManager::begin() {
-    // 8-bit palette mode: 240×135×1 = 32,400 bytes (vs 64,800 at 16-bit)
-    // Saves 32KB heap — critical on this no-PSRAM device
+bool UIManager::begin() {
+    // RGB332: 240x135 one-byte pixels plus the driver's sentinel byte.
     _canvas.setColorDepth(8);
-    _canvas.createSprite(Theme::SCREEN_W, Theme::SCREEN_H);
-    // Register theme colors in palette — M5GFX auto-matches when drawing
-    _canvas.setPaletteColor(0, Theme::BG);
-    _canvas.setPaletteColor(1, Theme::PRIMARY);
-    _canvas.setPaletteColor(2, Theme::SECONDARY);
-    _canvas.setPaletteColor(3, Theme::MUTED);
-    _canvas.setPaletteColor(4, Theme::ERROR);
-    _canvas.setPaletteColor(5, Theme::WARNING);
-    _canvas.setPaletteColor(6, Theme::ACCENT);
-    _canvas.setPaletteColor(7, Theme::BORDER);
-    _canvas.setPaletteColor(8, Theme::SELECTION_BG);
-    _canvas.setPaletteColor(9, Theme::BAR_BG);
-    _canvas.setPaletteColor(10, Theme::BADGE_BG);
-    _canvas.setPaletteColor(11, Theme::BADGE_TEXT);
-    _canvas.setPaletteColor(12, Theme::BG_ELEVATED);
-    _canvas.setPaletteColor(13, Theme::BG_SURFACE);
-    _canvas.setPaletteColor(14, Theme::BG_HOVER);
-    _canvas.setPaletteColor(15, Theme::TEXT_PRIMARY);
-    _canvas.setPaletteColor(16, Theme::TEXT_SECONDARY);
-    _canvas.setPaletteColor(17, Theme::TEXT_MUTED);
-    _canvas.setPaletteColor(18, Theme::PRIMARY_MUTED);
-    _canvas.setPaletteColor(19, Theme::PRIMARY_SUBTLE);
-    _canvas.setPaletteColor(20, Theme::SUCCESS);
-    _canvas.setPaletteColor(21, Theme::DIVIDER);
-    Serial.printf("[UI] Canvas: 8-bit palette, %d bytes\n", Theme::SCREEN_W * Theme::SCREEN_H);
+    if (!_canvas.createSprite(Theme::SCREEN_W, Theme::SCREEN_H)) return false;
+    Serial.printf("[UI] Canvas: RGB332, %d bytes\n", Theme::SCREEN_W * Theme::SCREEN_H);
     Theme::useSmallFont(_canvas);
     _canvas.fillScreen(Theme::BG);
     _needsRender = true;
@@ -40,6 +16,7 @@ void UIManager::begin() {
     // Wire up dirty flag callbacks
     _statusBar.setDirtyFlag(&_statusDirty);
     _tabBar.setDirtyFlag(&_tabDirty);
+    return true;
 }
 
 void UIManager::setScreen(Screen* screen) {
@@ -103,6 +80,7 @@ void UIManager::render() {
 
 void UIManager::flush() {
     _canvas.pushSprite(&M5.Display, 0, 0);
+    handheld::displayFlushed(millis());
 }
 
 bool UIManager::handleKey(const KeyEvent& event) {

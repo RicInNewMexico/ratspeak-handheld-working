@@ -1,10 +1,13 @@
 // =============================================================================
-// SX1262 LoRa Radio Driver — Direct port from Ratputer
-// Only change: pin assignments via BoardConfig.h (T-Deck Plus)
+// Shared SX1262 driver with board-specific pins and bounded I/O recovery.
 // =============================================================================
 
 #include "SX1262.h"
 #include "RadioFrequency.h"
+#include "RadioBandwidth.h"
+#include "SX1262Timing.h"
+#include "RadioTimingPolicy.h"
+#include <cmath>
 #include "config/BoardConfig.h"
 #include "hal/SharedSPIBus.h"
 
@@ -58,10 +61,10 @@ bool SX1262::preInit() {
 
     // SPI bus is initialized by main.cpp — do NOT call _spiModem->begin() here
 
-    long start = millis();
+    const uint32_t start = millis();
     uint8_t syncmsb = 0, synclsb = 0;
     int probes = 0;
-    while (((millis() - start) < 2000) && (millis() >= start)) {
+    while (uint32_t(millis() - start) < 2000) {
         syncmsb = readRegister(REG_SYNC_WORD_MSB_6X);
         synclsb = readRegister(REG_SYNC_WORD_LSB_6X);
         uint16_t sw = (uint16_t)(syncmsb << 8 | synclsb);
@@ -70,6 +73,7 @@ bool SX1262::preInit() {
         if (sw == 0x1424 || sw == 0x4434) {
             break;
         }
+        if (_ioFailed) return false;
         delay(100);
     }
 
@@ -93,9 +97,9 @@ void SX1262::writeRegister(uint16_t address, uint8_t value) {
 }
 
 uint8_t IRAM_ATTR SX1262::singleTransfer(uint8_t opcode, uint16_t address, uint8_t value) {
-    waitOnBusy();
+    if (!waitOnBusy()) return 0;
     SharedSPILock lock;
-    if (!lock.locked()) return 0;
+    if (!lock.locked()) { failIo(); return 0; }
     uint8_t response;
     _spiModem->beginTransaction(_spiSettings);
     digitalWrite(_ss, LOW);
@@ -112,9 +116,9 @@ uint8_t IRAM_ATTR SX1262::singleTransfer(uint8_t opcode, uint16_t address, uint8
 }
 
 void SX1262::executeOpcode(uint8_t opcode, uint8_t* buffer, uint8_t size) {
-    waitOnBusy();
+    if (!waitOnBusy()) return;
     SharedSPILock lock;
-    if (!lock.locked()) return;
+    if (!lock.locked()) { failIo(); return; }
     _spiModem->beginTransaction(_spiSettings);
     digitalWrite(_ss, LOW);
     _spiModem->transfer(opcode);
@@ -126,9 +130,10 @@ void SX1262::executeOpcode(uint8_t opcode, uint8_t* buffer, uint8_t size) {
 }
 
 void SX1262::executeOpcodeRead(uint8_t opcode, uint8_t* buffer, uint8_t size) {
-    waitOnBusy();
+    memset(buffer, 0, size);
+    if (!waitOnBusy()) return;
     SharedSPILock lock;
-    if (!lock.locked()) return;
+    if (!lock.locked()) { failIo(); return; }
     _spiModem->beginTransaction(_spiSettings);
     digitalWrite(_ss, LOW);
     _spiModem->transfer(opcode);
@@ -141,9 +146,9 @@ void SX1262::executeOpcodeRead(uint8_t opcode, uint8_t* buffer, uint8_t size) {
 }
 
 void SX1262::writeBuffer(const uint8_t* buffer, size_t size) {
-    waitOnBusy();
+    if (!waitOnBusy()) return;
     SharedSPILock lock;
-    if (!lock.locked()) return;
+    if (!lock.locked()) { failIo(); return; }
     _spiModem->beginTransaction(_spiSettings);
     digitalWrite(_ss, LOW);
     _spiModem->transfer(OP_FIFO_WRITE_6X);
@@ -157,9 +162,10 @@ void SX1262::writeBuffer(const uint8_t* buffer, size_t size) {
 }
 
 void SX1262::readBuffer(uint8_t* buffer, size_t size) {
-    waitOnBusy();
+    memset(buffer, 0, size);
+    if (!waitOnBusy()) return;
     SharedSPILock lock;
-    if (!lock.locked()) return;
+    if (!lock.locked()) { failIo(); return; }
     _spiModem->beginTransaction(_spiSettings);
     digitalWrite(_ss, LOW);
     _spiModem->transfer(OP_FIFO_READ_6X);
@@ -172,24 +178,47 @@ void SX1262::readBuffer(uint8_t* buffer, size_t size) {
     _spiModem->endTransaction();
 }
 
+void SX1262::failIo() {
+    // A partially applied tuple/FIFO cannot be used safely. Only an explicit
+    // begin/reset can restore all configuration after a failed command.
+    _ioFailed = true;
+    _radioOnline = false;
+    _txFailed = true;
+    packetAvailable = false;
+}
+
 bool SX1262::waitOnBusy(unsigned long capMs) {
+    if (_ioFailed) return false;
+    if (_sleeping) {
+        // SX1261/2 datasheet 8.2.2: NSS wakes the chip; BUSY remains high
+        // throughout sleep. Do not clock a command until wake-up completes.
+        SharedSPILock lock;
+        if (!lock.locked()) { failIo(); return false; }
+        digitalWrite(_ss, LOW);
+        delayMicroseconds(1000);
+        digitalWrite(_ss, HIGH);
+        _sleeping = false;
+    }
     if (_busy == -1) return true;
-    unsigned long t = millis();
+    const uint32_t started = millis();
     while (digitalRead(_busy) == HIGH) {
-        if (millis() - t >= capMs) {
-            // A dropped wait means the next SPI command lands on a BUSY chip
-            // and is silently discarded — make it observable.
-            _busyTimeouts++;
+        if (uint32_t(millis() - started) >= capMs) {
+            ++_busyTimeouts;
+            failIo();
             Serial.printf("[SX1262] BUSY wait timeout after %lums (count=%lu)\n",
                           capMs, (unsigned long)_busyTimeouts);
             return false;
         }
         if (_yieldCb) _yieldCb();
+        yield();
     }
     return true;
 }
 
 void SX1262::reset() {
+    _ioFailed = _sleeping = _txActive = _txFailed = false;
+    _radioOnline = _preinitDone = packetAvailable = false;
+    _imageCalBand = IMAGE_CAL_UNSUPPORTED;
     if (_reset != -1) {
         pinMode(_reset, OUTPUT);
         digitalWrite(_reset, LOW);
@@ -199,28 +228,25 @@ void SX1262::reset() {
     }
 }
 
-void SX1262::startXoscRobust() {
-    if (_busy == -1) return;
-    // Wait for the TCXO to stabilize after entering STDBY_XOSC (DIO3 timeout 640ms).
-    unsigned long t0 = millis();
-    while (digitalRead(_busy) == HIGH && (millis() - t0) < 800) {
-        if (_yieldCb) _yieldCb();
-        delay(2);
-    }
-    // Still busy => XOSC did not start. Clear the error and retry the oscillator
-    // start; the integrated TCXO occasionally needs a second kick.
-    for (int attempt = 0; attempt < 5 && digitalRead(_busy) == HIGH; attempt++) {
-        clearDeviceErrors();
-        delay(20);
-        uint8_t mode = MODE_STDBY_XOSC_6X;
-        executeOpcode(OP_STANDBY_6X, &mode, 1);
-        unsigned long tr = millis();
-        while (digitalRead(_busy) == HIGH && (millis() - tr) < 800) {
-            if (_yieldCb) _yieldCb();
-            delay(2);
+bool SX1262::startXoscRobust() {
+    // Retain the bounded oscillator-start retries for integrated TCXO boards.
+    // A stuck BUSY cannot accept ClearDeviceErrors/SetStandby. Reset into RC,
+    // then restore TCXO configuration before trying XOSC again.
+    for (unsigned attempt = 0; attempt < 6; ++attempt) {
+        if (attempt) {
+            if (_reset == -1) return false;
+            reset();
+            if (!preInit()) return false;
+            enableTCXO();
+            delay(10);
+            standby();
+        }
+        if (waitOnBusy(800)) {
+            clearDeviceErrors();
+            return !_ioFailed;
         }
     }
-    clearDeviceErrors();
+    return false;
 }
 
 void SX1262::calibrate() {
@@ -276,6 +302,7 @@ void SX1262::enableTCXO() {
         // If too short, chip stays in STDBY_RC and calibration uses RC oscillator.
         uint8_t buf[4] = {LORA_TCXO_VOLTAGE, 0x00, 0xA0, 0x00};
         executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
+    waitOnBusy(800);
     }
 }
 
@@ -348,9 +375,9 @@ bool SX1262::begin(uint32_t frequency) {
     // T-Pager SX1262 this is marginal: the crystal sometimes fails to start on
     // the first attempt (BUSY stuck high + XOSC_START_ERR 0x20), which then
     // wedges calibration and the whole radio. Start it robustly: wait for BUSY
-    // to clear, and on failure clear the error and retry before proceeding.
+    // to clear, and on failure reset and reinitialize before retrying.
     standby();
-    startXoscRobust();
+    if (!startXoscRobust()) return false;
 
     // Set regulator mode. The T-Deck Plus integrated radio works in DC-DC
     // mode; cap-style modules may need board-specific LDO-only mode.
@@ -361,7 +388,7 @@ bool SX1262::begin(uint32_t frequency) {
 
     // Calibrate from STDBY_RC with TCXO already running
     calibrate();
-    calibrate_image(_frequency);
+    if (_ioFailed || !calibrate_image(_frequency)) return false;
 
     // Set LoRa packet type and return to STDBY_XOSC
     if (!loraMode()) {
@@ -404,18 +431,21 @@ bool SX1262::begin(uint32_t frequency) {
     executeOpcode(OP_RX_TX_FALLBACK_MODE_6X, &fallback, 1);
 
     clearDeviceErrors();
-    _radioOnline = true;
-    return true;
+    _radioOnline = !_ioFailed;
+    return _radioOnline;
 }
 
 void SX1262::end() {
+    onReceive(nullptr);
     sleep();
-    _spiModem->end();
+    // The board owns this bus; ending it would also stop display/SD access.
     _radioOnline = false;
     _preinitDone = false;
 }
 
 int SX1262::beginPacket(int implicitHeader) {
+    if (_ioFailed || _txActive) return 0;
+    _txFailed = false;
     standby();
     if (!ensureLoRaMode("beginPacket")) return 0;
 
@@ -423,78 +453,52 @@ int SX1262::beginPacket(int implicitHeader) {
     _payloadLength = 0;
     _fifo_tx_addr_ptr = 0;
     setPacketParams(_preambleLength, _implicitHeaderMode, _payloadLength, _crcMode);
-    return 1;
+    return !_ioFailed;
 }
 
 int SX1262::endPacket(bool async) {
-    if (!ensureLoRaMode("endPacket")) return 0;
+    if (_ioFailed || _txActive || !ensureLoRaMode("endPacket")) return 0;
     setPacketParams(_preambleLength, _implicitHeaderMode, _payloadLength, _crcMode);
     enableDio2RfSwitch();
-
+    uint8_t clear[2] = {0xFF, 0xFF};
+    executeOpcode(OP_CLEAR_IRQ_STATUS_6X, clear, 2);
+    const uint32_t airtime = handheld::sx1262_timing::airtimeMs(_payloadLength, {
+        _sf, _bw, getCodingRate4(), static_cast<uint16_t>(_preambleLength),
+        _implicitHeaderMode != 0, _crcMode != 0, _ldro});
+    if (!airtime) { _txFailed = true; return 0; }
+    _txBudgetMs = handheld::radio_timing::transmitTimeoutMs(airtime);
     uint8_t timeout[3] = {0};
     _txStartMs = millis();
-    _txBudgetMs = (uint32_t)(getAirtime(_payloadLength) * MODEM_TIMEOUT_MULT) + 2000;
     executeOpcode(OP_TX_6X, timeout, 3);
-
-    if (async) {
-        _txActive = true;
-        Serial.printf("[SX1262] TX ASYNC: payload=%d calc=%.0fms\n",
-                      _payloadLength, getAirtime(_payloadLength));
-        return 1;
-    }
-
-    // Blocking mode: wait for TX completion
-    uint8_t buf[2] = {0};
-    executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
-
-    while ((millis() - _txStartMs < _txBudgetMs) && ((buf[1] & IRQ_TX_DONE_MASK_6X) == 0)) {
-        buf[0] = 0x00; buf[1] = 0x00;
-        executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
+    // BUSY falls after the TX transition/PA ramp. Admission must not report
+    // a physical start when that transition failed. XOSC is already running.
+    if (!waitOnBusy()) return 0;
+    _txFailed = false;
+    _txActive = true;
+    if (async) return 1;
+    while (isTxBusy()) {
         yield();
         if (_yieldCb) _yieldCb();
     }
-    uint32_t txActual = millis() - _txStartMs;
-    bool timed_out = millis() - _txStartMs >= _txBudgetMs;
-
-    if (timed_out) {
-        Serial.printf("[SX1262] TX TIMEOUT: payload=%d actual=%dms calc=%.0fms\n",
-                      _payloadLength, txActual, getAirtime(_payloadLength));
-    } else {
-        Serial.printf("[SX1262] TX OK: payload=%d actual=%dms calc=%.0fms\n",
-                      _payloadLength, txActual, getAirtime(_payloadLength));
-    }
-
-    uint8_t mask[2] = {0x00, IRQ_TX_DONE_MASK_6X};
-    executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
-    return !timed_out;
+    return !_txFailed;
 }
 
 bool SX1262::isTxBusy() {
     if (!_txActive) return false;
+    uint8_t irq[2] = {0};
+    executeOpcodeRead(OP_GET_IRQ_STATUS_6X, irq, 2);
+    const bool done = (irq[1] & IRQ_TX_DONE_MASK_6X) != 0;
+    if (!_ioFailed && !done && uint32_t(millis() - _txStartMs) < _txBudgetMs)
+        return true;
 
-    // Check for timeout
-    if (millis() - _txStartMs >= _txBudgetMs) {
-        Serial.printf("[SX1262] TX ASYNC TIMEOUT after %dms\n",
-                      (int)(millis() - _txStartMs));
-        uint8_t mask[2] = {0x00, IRQ_TX_DONE_MASK_6X};
-        executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
-        _txActive = false;
-        return false;
-    }
-
-    // Poll IRQ status
-    uint8_t buf[2] = {0};
-    executeOpcodeRead(OP_GET_IRQ_STATUS_6X, buf, 2);
-    if (buf[1] & IRQ_TX_DONE_MASK_6X) {
-        Serial.printf("[SX1262] TX ASYNC OK: %dms\n",
-                      (int)(millis() - _txStartMs));
-        uint8_t mask[2] = {0x00, IRQ_TX_DONE_MASK_6X};
-        executeOpcode(OP_CLEAR_IRQ_STATUS_6X, mask, 2);
-        _txActive = false;
-        return false;
-    }
-
-    return true;  // Still transmitting
+    _txActive = false;
+    _txFailed = _ioFailed || !done;
+    // A timeout is not TX_DONE. Abort the radio operation before the caller
+    // restores RX, and retain the failure until the next beginPacket.
+    if (_txFailed) standby();
+    uint8_t clear[2] = {0x00, IRQ_TX_DONE_MASK_6X};
+    executeOpcode(OP_CLEAR_IRQ_STATUS_6X, clear, 2);
+    return false;
 }
 
 size_t SX1262::write(uint8_t byte) { return write(&byte, 1); }
@@ -507,11 +511,13 @@ size_t SX1262::write(const uint8_t* buffer, size_t size) {
         size = MAX_PACKET_SIZE - _payloadLength;
     }
     writeBuffer(buffer, size);
+    if (_ioFailed) return 0;
     _payloadLength += size;
     return size;
 }
 
 void SX1262::receive(int size) {
+    standby();
     if (!ensureLoRaMode("receive")) return;
 
     uint8_t clear[2] = {0xFF, 0xFF};
@@ -575,6 +581,7 @@ int SX1262::parsePacket(int size) {
     _packetIndex = 0;
     readBuffer(_packet, pktLen);
 
+    if (_ioFailed) return 0;
     if (!crcOk) {
         Serial.printf("[SX1262] RX CRC FAIL: %d bytes RSSI=%.0f SNR=%.1f\n",
                       pktLen, rssi, snr);
@@ -594,7 +601,7 @@ int SX1262::parsePacket(int size) {
 int IRAM_ATTR SX1262::available() {
     uint8_t buf[2] = {0};
     executeOpcodeRead(OP_RX_BUFFER_STATUS_6X, buf, 2);
-    return buf[0] - _packetIndex;
+    return _ioFailed || buf[0] <= _packetIndex ? 0 : buf[0] - _packetIndex;
 }
 
 int IRAM_ATTR SX1262::read() {
@@ -605,6 +612,7 @@ int IRAM_ATTR SX1262::read() {
         int size = rxbuf[0];
         _fifo_rx_addr_ptr = rxbuf[1];
         readBuffer(_packet, size);
+        if (_ioFailed) return -1;
     }
     uint8_t byte = _packet[_packetIndex];
     _packetIndex++;
@@ -619,6 +627,7 @@ int SX1262::peek() {
         int size = rxbuf[0];
         _fifo_rx_addr_ptr = rxbuf[1];
         readBuffer(_packet, size);
+        if (_ioFailed) return -1;
     }
     return _packet[_packetIndex];
 }
@@ -731,27 +740,11 @@ void SX1262::setSpreadingFactor(int sf) {
 uint8_t SX1262::getSpreadingFactor() { return _sf; }
 
 uint32_t SX1262::getSignalBandwidth() {
-    switch (_bw) {
-        case 0x00: return 7800;   case 0x01: return 15600;
-        case 0x02: return 31250;  case 0x03: return 62500;
-        case 0x04: return 125000; case 0x05: return 250000;
-        case 0x06: return 500000; case 0x08: return 10400;
-        case 0x09: return 20800;  case 0x0A: return 41700;
-    }
-    return 0;
+    return RadioBandwidth::fromCode(_bw);
 }
 
 void SX1262::setSignalBandwidth(uint32_t sbw) {
-    if      (sbw <= 7800)   _bw = 0x00;
-    else if (sbw <= 10400)  _bw = 0x08;
-    else if (sbw <= 15600)  _bw = 0x01;
-    else if (sbw <= 20800)  _bw = 0x09;
-    else if (sbw <= 31250)  _bw = 0x02;
-    else if (sbw <= 41700)  _bw = 0x0A;
-    else if (sbw <= 62500)  _bw = 0x03;
-    else if (sbw <= 125000) _bw = 0x04;
-    else if (sbw <= 250000) _bw = 0x05;
-    else                    _bw = 0x06;
+    _bw = RadioBandwidth::code(sbw);
     handleLowDataRate();
     setModulationParams(_sf, _bw, _cr, _ldro);
 }
@@ -841,58 +834,37 @@ void SX1262::implicitHeaderMode() {
 }
 
 void SX1262::handleLowDataRate() {
-    uint32_t bw = getSignalBandwidth();
-    if (_sf == 0 || bw == 0) {
-        _ldro = false;
-        return;
-    }
-    float symbolTimeMs = 1000.0f * (float)(1UL << _sf) / (float)bw;
-    _ldro = symbolTimeMs > 16.0f;
+    _ldro = handheld::sx1262_timing::lowDataRateOptimize(_sf, _bw);
 }
 
 void SX1262::standby() {
     uint8_t byte = _tcxo ? MODE_STDBY_XOSC_6X : MODE_STDBY_RC_6X;
     executeOpcode(OP_STANDBY_6X, &byte, 1);
+    waitOnBusy(_tcxo ? 800 : 100);
 }
 
 void SX1262::sleep() {
-    uint8_t byte = 0x00;
+    standby();
+    // Warm sleep retains the programmed modem tuple for a later wake-up.
+    uint8_t byte = 0x04;
     executeOpcode(OP_SLEEP_6X, &byte, 1);
+    if (!_ioFailed) { _sleeping = true; delayMicroseconds(500); }
 }
 
 float SX1262::getAirtime(uint16_t written) {
     if (!_radioOnline) return 0;
-    uint32_t bw = getSignalBandwidth();
-    uint8_t crDen = getCodingRate4();
-    if (_sf == 0 || bw == 0 || crDen < 5 || crDen > 8) return 0;
-
-    float symbolRate = (float)bw / (float)(1UL << _sf);
-    float symbolTimeMs = 1000.0 / symbolRate;
-    float payloadSymbols;
-    if (_sf >= 7) {
-        payloadSymbols = (8.0 * written + PHY_CRC_LORA_BITS - 4.0 * _sf + 8 + PHY_HEADER_LORA_SYMBOLS);
-        payloadSymbols /= 4.0 * (_sf - 2 * (_ldro ? 1 : 0));
-        if (payloadSymbols < 0) payloadSymbols = 0;
-        payloadSymbols = ceil(payloadSymbols) * crDen;
-        payloadSymbols += _preambleLength + 0.25 + 8;
-    } else {
-        payloadSymbols = (8.0 * written + PHY_CRC_LORA_BITS - 4.0 * _sf + PHY_HEADER_LORA_SYMBOLS);
-        payloadSymbols /= 4.0 * _sf;
-        if (payloadSymbols < 0) payloadSymbols = 0;
-        payloadSymbols = ceil(payloadSymbols) * crDen;
-        payloadSymbols += _preambleLength + 2.25 + 8;
-    }
-    return payloadSymbols * symbolTimeMs;
+    const uint32_t milliseconds = handheld::sx1262_timing::airtimeMs(written, {
+        _sf, _bw, getCodingRate4(), static_cast<uint16_t>(_preambleLength),
+        _implicitHeaderMode != 0, _crcMode != 0, _ldro});
+    // Keep the existing float API for accounting/diagnostic callers. Supported
+    // configurations are exactly representable; also round conservatively for
+    // callers that program the full 16-bit preamble register directly.
+    const float result = static_cast<float>(milliseconds);
+    return static_cast<double>(result) < milliseconds ? std::nextafter(result, INFINITY) : result;
 }
 
 uint32_t SX1262::getBitrate() {
-    uint32_t bw = getSignalBandwidth();
-    uint8_t crDen = getCodingRate4();
-    if (_sf == 0 || bw == 0 || crDen < 5 || crDen > 8) return 0;
-
-    float bitrate = (float)_sf * (4.0f / (float)crDen) * (float)bw / (float)(1UL << _sf);
-    if (bitrate < 1.0f) return 1;
-    return (uint32_t)bitrate;
+    return handheld::sx1262_timing::bitrate(_sf, _bw, getCodingRate4());
 }
 
 void IRAM_ATTR SX1262::onDio0Rise() {
