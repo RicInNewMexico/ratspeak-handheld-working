@@ -116,7 +116,12 @@ void LvDataCleanScreen::createUI(lv_obj_t* parent) {
                               Theme::WARNING_CLR, 280, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(_confirmLabel, LV_ALIGN_TOP_MID, 0, 164);
 
-    _hintLabel = makeLabel(parent, "Left/Right choose  Enter continues",
+    _hintLabel = makeLabel(parent,
+#if HAS_SCROLLWHEEL
+                          "Wheel chooses  Enter continues",
+#else
+                          "Left/Right choose  Enter continues",
+#endif
                            &lv_font_rsdeck_12, Theme::ACCENT,
                            286, LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_DOT);
     lv_obj_align(_hintLabel, LV_ALIGN_TOP_MID, 0, 188);
@@ -152,14 +157,24 @@ void LvDataCleanScreen::updateSelection() {
         }
         if (_hintLabel) {
             lv_label_set_text(_hintLabel,
+#if HAS_SCROLLWHEEL
+                _confirmWipe ? "Enter: erase  Wheel up: cancel" :
+                               "Enter: arm erase  Wheel up: cancel");
+#else
                 _confirmWipe ? "Enter confirms erase  Left cancels" :
                                "Enter arms erase  Left cancels");
+#endif
         }
     } else {
         lv_obj_set_style_text_color(_yesLabel, lv_color_hex(Theme::TEXT_MUTED), 0);
         lv_obj_set_style_text_color(_noLabel, lv_color_hex(Theme::ACCENT), 0);
         if (_confirmLabel) lv_label_set_text(_confirmLabel, "Recommended: keep existing data.");
-        if (_hintLabel) lv_label_set_text(_hintLabel, "Enter keeps data  Right selects erase");
+        if (_hintLabel) lv_label_set_text(_hintLabel,
+#if HAS_SCROLLWHEEL
+            "Enter: keep  Wheel down: erase");
+#else
+            "Enter keeps data  Right selects erase");
+#endif
     }
 }
 

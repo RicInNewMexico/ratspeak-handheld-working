@@ -15,7 +15,11 @@ constexpr int kHeaderH = 36;
 constexpr int kInputH = 31;
 constexpr int kComposerButtonW = 44;
 constexpr int kBubbleMaxW = Theme::CONTENT_W * 3 / 4;
+#if HAS_SCROLLWHEEL
+constexpr const char* kComposerPlaceholder = "Message... or Enter to read full";
+#else
 constexpr const char* kComposerPlaceholder = "Message...";
+#endif
 
 bool isPendingStatus(LXMFStatus status) {
     return status == LXMFStatus::QUEUED || status == LXMFStatus::SENDING;
@@ -446,13 +450,20 @@ void LvMessageView::scrollHistory(int pixels) {
     }
 }
 
-void LvMessageView::focusNextRead() {
-    if (!boundWindow()) return;
+bool LvMessageView::hasReadFocus() const {
+    return boundWindow() && _service->historyWindow().mode() == HistoryWindow::Mode::Chat &&
+        _service->historyWindow().focusedSpan() < _rowCount &&
+        _readButtons[_service->historyWindow().focusedSpan()];
+}
+
+void LvMessageView::focusNextRead(int direction) {
+    if (!boundWindow() || _service->historyWindow().mode() != HistoryWindow::Mode::Chat) return;
     auto& window = _service->historyWindow();
     const auto first = window.focusedSpan();
     size_t next = first;
     for (size_t tries = 0; tries <= HistoryWindow::VisibleSpans; ++tries) {
-        next = next == HistoryWindow::VisibleSpans ? 0 : next + 1;
+        if (direction < 0) next = next == 0 ? HistoryWindow::VisibleSpans : next - 1;
+        else next = next == HistoryWindow::VisibleSpans ? 0 : next + 1;
         if (next == HistoryWindow::VisibleSpans || (next < _rowCount && _readButtons[next])) break;
     }
     window.focusSpan(next); updateHistoryFocus();
@@ -856,6 +867,15 @@ bool LvMessageView::handleKey(const KeyEvent& event) {
     }
 
     if (event.del || event.character == 0x08) {
+#if HAS_SCROLLWHEEL
+        if (_inputText.empty() && hasReadFocus()) {
+            if (!event.repeat) {
+                _service->historyWindow().focusSpan(HistoryWindow::VisibleSpans);
+                updateHistoryFocus();
+            }
+            return true;
+        }
+#endif
         if (!_inputText.empty()) {
             _inputText.pop_back();
             composerEdited();
@@ -869,15 +889,29 @@ bool LvMessageView::handleKey(const KeyEvent& event) {
 
     if (event.enter || event.character == '\n' || event.character == '\r') {
         if (event.repeat) return true;
-        if (boundWindow() && _service->historyWindow().mode() == HistoryWindow::Mode::Chat &&
-            _service->historyWindow().focusedSpan() < _rowCount &&
-            _readButtons[_service->historyWindow().focusedSpan()]) {
+        if (hasReadFocus()) {
             readFull(_service->historyWindow().focusedSpan()); return true;
         }
+#if HAS_SCROLLWHEEL
+        // The Pager has no Tab key or touch. An empty composer lets a wheel
+        // click enter Read full selection; typing returns to composing.
+        if (_inputText.empty()) {
+            focusNextRead();
+            if (hasReadFocus() && _ui)
+                _ui->lvStatusBar().showToast("Wheel: select  Enter: read  Back: cancel", 2000);
+            return true;
+        }
+#endif
         sendCurrentMessage(false);
         return true;
     }
 
+#if HAS_SCROLLWHEEL
+    if (hasReadFocus() && (event.up || event.down)) {
+        focusNextRead(event.up ? -1 : 1);
+        return true;
+    }
+#endif
     if (event.up) { scrollHistory(-30); return true; }
     if (event.down) { scrollHistory(30); return true; }
     if (event.tab) { focusNextRead(); return true; }

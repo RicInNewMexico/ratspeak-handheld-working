@@ -54,6 +54,20 @@ String formatRadioFrequency(uint32_t hz) {
     return String(buf);
 }
 
+String formatEditedValue(const SettingItem& item, int value) {
+    String text;
+    if (item.type == SettingType::ENUM_CHOICE && !item.enumLabels.empty()) {
+        text = item.enumLabels[constrain(value, 0, (int)item.enumLabels.size() - 1)];
+    } else {
+        text = item.formatter ? item.formatter(value) : String(value);
+    }
+#if HAS_SCROLLWHEEL
+    return String("[ ") + text + " ]";
+#else
+    return String("< ") + text + " >";
+#endif
+}
+
 String maskedValue(const String& value) {
     if (value.isEmpty()) return String("");
     int len = constrain((int)value.length(), 4, 12);
@@ -115,7 +129,9 @@ void LvSettingsScreen::applyPreset(int presetIdx) {
 
 bool LvSettingsScreen::isEditable(int idx) const {
     if (idx < 0 || idx >= (int)_items.size()) return false;
-    auto t = _items[idx].type;
+    const auto& item = _items[idx];
+    auto t = item.type;
+    if (t == SettingType::ENUM_CHOICE && item.minVal >= item.maxVal) return false;
     return t == SettingType::INTEGER || t == SettingType::TOGGLE
         || t == SettingType::ENUM_CHOICE || t == SettingType::ACTION
         || t == SettingType::TEXT_INPUT;
@@ -1390,7 +1406,7 @@ void LvSettingsScreen::rebuildItemList() {
         lv_obj_set_style_border_width(row, rebootPending || armed ? 2 : 1, 0);
         lv_obj_set_style_border_side(row, rebootPending || armed ? (lv_border_side_t)(LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_BOTTOM) : LV_BORDER_SIDE_BOTTOM, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         if (editable) {
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_user_data(row, (void*)(intptr_t)i);
@@ -1422,7 +1438,7 @@ void LvSettingsScreen::rebuildItemList() {
             rebootPending ? Theme::WARNING_CLR :
             destructive ? Theme::ERROR_CLR :
             item.type == SettingType::ACTION ? Theme::TEXT_PRIMARY :
-            item.type == SettingType::READONLY ? Theme::TEXT_MUTED : Theme::TEXT_SECONDARY;
+            !editable ? Theme::TEXT_MUTED : Theme::TEXT_SECONDARY;
         lv_obj_set_style_text_color(nameLbl, lv_color_hex(nameColor), 0);
         clipLabel(nameLbl, Theme::CONTENT_W - 136);
         lv_label_set_text(nameLbl, item.label);
@@ -1430,20 +1446,13 @@ void LvSettingsScreen::rebuildItemList() {
 
         // Value
         String valStr;
-        uint32_t valColor = Theme::PRIMARY;
+        uint32_t valColor = editable ? Theme::PRIMARY : Theme::TEXT_MUTED;
 
         if (_freqEditing && selected) {
             valStr = String("< ") + freqFormatWithCursor() + " >";
             valColor = Theme::WARNING_CLR;
         } else if (_editing && selected) {
-            if (item.type == SettingType::ENUM_CHOICE && !item.enumLabels.empty()) {
-                int vi = constrain(_editValue, 0, (int)item.enumLabels.size() - 1);
-                valStr = String("< ") + item.enumLabels[vi] + " >";
-            } else if (item.formatter) {
-                valStr = String("< ") + item.formatter(_editValue) + " >";
-            } else {
-                valStr = String("< ") + String(_editValue) + " >";
-            }
+            valStr = formatEditedValue(item, _editValue);
             valColor = Theme::WARNING_CLR;
         } else if (_textEditing && selected) {
             valStr = _editText + "_";
@@ -1851,6 +1860,12 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
             // Value edit mode
             if (_editing) {
                 auto& item = _items[_selectedIdx];
+                // Keep the focused row and viewport intact while turning the
+                // wheel or typing. Rebuilding here restarts focus scrolling.
+                auto updateValue = [&] {
+                    if (_editValueLbl)
+                        lv_label_set_text(_editValueLbl, formatEditedValue(item, _editValue).c_str());
+                };
                 // Direct digit entry for INTEGER fields
                 if (item.type == SettingType::INTEGER && event.character >= '0' && event.character <= '9') {
                     int digit = event.character - '0';
@@ -1861,20 +1876,20 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                         int newVal = _editValue * 10 + digit;
                         if (newVal <= item.maxVal) _editValue = newVal;
                     }
-                    rebuildItemList(); return true;
+                    updateValue(); return true;
                 }
                 // Wheel adjusts engaged values: up = previous/decrement, down = next/increment
                 if (event.left || event.up) {
                     _editValue -= item.step;
                     if (_editValue < item.minVal) _editValue = item.minVal;
                     _numericTyping = false;
-                    rebuildItemList(); return true;
+                    updateValue(); return true;
                 }
                 if (event.right || event.down) {
                     _editValue += item.step;
                     if (_editValue > item.maxVal) _editValue = item.maxVal;
                     _numericTyping = false;
-                    rebuildItemList(); return true;
+                    updateValue(); return true;
                 }
                 if (event.enter || event.character == '\n' || event.character == '\r') {
                     if (_editValue < item.minVal) _editValue = item.minVal;
@@ -1891,6 +1906,8 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                 if (event.del || event.character == 8) {
                     if (_numericTyping && _editValue > 0) {
                         _editValue /= 10;
+                        updateValue();
+                        return true;
                     } else if (event.repeat) {
                         return true;  // held repeat deletes digits but never exits edit
                     } else {

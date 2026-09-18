@@ -66,13 +66,14 @@ void LvHelpOverlay::create() {
               Theme::TEXT_SECONDARY, 180, LV_TEXT_ALIGN_RIGHT);
 
 #if HAS_SCROLLWHEEL
-    addHelpRow(_overlay, "Encoder", "Move selection");
+    addHelpRow(_overlay, "Encoder", "Move selection / edit value");
     addHelpRow(_overlay, "Click/Enter", "Open or confirm");
     addHelpRow(_overlay, "Backspace", "Back; then select a tab");
     addHelpRow(_overlay, "Alt+Back", "Cancel editing (Esc)");
     addHelpRow(_overlay, "Alt+Q..P", "Type numbers 1..0");
     addHelpRow(_overlay, "A / D", "Select frequency digit");
     addHelpRow(_overlay, "Encoder", "Tune selected digit");
+    addHelpRow(_overlay, "Chat Enter", "Read full (empty draft)");
     addHelpRow(_overlay, "BOOT", "Tap sleep; hold power off");
 #else
     addHelpRow(_overlay, "Trackball", "Move selection");

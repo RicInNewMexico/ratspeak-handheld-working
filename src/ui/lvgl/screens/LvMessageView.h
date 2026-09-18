@@ -44,7 +44,8 @@ private:
     void readFull(size_t index);
     void goBack();
     void scrollHistory(int pixels);
-    void focusNextRead();
+    bool hasReadFocus() const;
+    void focusNextRead(int direction = 1);
     void updateHistoryControls();
     void updateHistoryFocus();
     void saveScroll(bool userChange = false);

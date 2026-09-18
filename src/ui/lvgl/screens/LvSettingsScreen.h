@@ -207,5 +207,5 @@ private:
     // LVGL widgets
     lv_obj_t* _scrollContainer = nullptr;
     std::vector<lv_obj_t*> _rowObjs;
-    lv_obj_t* _editValueLbl = nullptr;  // Cached for in-place updates during text/freq editing
+    lv_obj_t* _editValueLbl = nullptr;  // Cached for in-place updates during editing
 };

@@ -618,7 +618,11 @@ bool LvNodesScreen::handleKey(const KeyEvent& event) {
             }
             return true;
         }
-        if (event.character == 0x1B) { hideOverlay(); return true; }
+        if (event.character == 0x1B ||
+            ((event.del || event.character == '\b') && !event.repeat)) {
+            hideOverlay();
+            return true;
+        }
         return true;
     }
 

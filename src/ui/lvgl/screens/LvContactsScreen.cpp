@@ -138,6 +138,13 @@ void LvContactsScreen::refreshUI() {
 void LvContactsScreen::rebuildList() {
     if (!_am || !_list) return;
     _lastRebuild = millis();
+    std::string focusedHex;
+    auto* focused = lv_group_get_focused(LvInput::group());
+    if (focused && lv_obj_get_parent(focused) == _list) {
+        int index = (int)(intptr_t)lv_obj_get_user_data(focused);
+        if (index >= 0 && index < (int)_contactHexes.size()) focusedHex = _contactHexes[index];
+    }
+    lv_obj_t* restoredFocus = nullptr;
     _contactHexes.clear();
 
     lv_obj_clean(_list);
@@ -242,6 +249,7 @@ void LvContactsScreen::rebuildList() {
         }, LV_EVENT_FOCUSED, nullptr);
 
         std::string hashHex = node.hash.toHex();
+        if (hashHex == focusedHex) restoredFocus = row;
         _avatarBuffers.emplace_back(LxmFaceAvatar::bufferSize(kContactAvatar));
         auto avatar = LxmFaceAvatar::create(row, 8, 3, kContactAvatar,
                                             _avatarBuffers.back().data(),
@@ -277,6 +285,8 @@ void LvContactsScreen::rebuildList() {
         lv_obj_set_pos(idLbl, kContactTextX, 22);
     }
 
+    if (restoredFocus) LvInput::focusObj(restoredFocus);
+
 #if !HAS_SCROLLWHEEL
     // Trackball/touch boards defer visible focus until the user navigates.
     if (!_focusActive) {
@@ -293,7 +303,7 @@ bool LvContactsScreen::handleLongPress() {
     if (!_focusActive) return false;
 #endif
     lv_obj_t* focused = lv_group_get_focused(LvInput::group());
-    if (!focused) return false;
+    if (!focused || lv_obj_get_parent(focused) != _list) return false;
     int idx = (int)(intptr_t)lv_obj_get_user_data(focused);
     if (idx < 0 || idx >= (int)_contactHexes.size()) return false;
     _deleteHex = _contactHexes[idx];
