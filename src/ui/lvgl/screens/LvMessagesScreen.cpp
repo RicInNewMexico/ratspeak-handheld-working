@@ -39,6 +39,40 @@ lv_obj_t* label(lv_obj_t* parent, const lv_font_t* font, uint32_t color, int x, 
     lv_label_set_long_mode(result,LV_LABEL_LONG_CLIP);
     return result;
 }
+lv_obj_t* createEmptyState(lv_obj_t* parent) {
+    // Match Contacts' centered icon/title/hint composition.
+    auto* box=lv_obj_create(parent);
+    lv_obj_set_size(box,252,94);lv_obj_center(box);
+    lv_obj_set_style_bg_opa(box,LV_OPA_TRANSP,0);
+    lv_obj_set_style_border_width(box,0,0);lv_obj_set_style_pad_all(box,0,0);
+    lv_obj_clear_flag(box,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE);
+
+    auto* bubble=lv_obj_create(box);
+    lv_obj_set_pos(bubble,108,7);lv_obj_set_size(bubble,36,28);
+    lv_obj_set_style_radius(bubble,6,0);lv_obj_set_style_bg_opa(bubble,LV_OPA_TRANSP,0);
+    lv_obj_set_style_border_width(bubble,2,0);
+    lv_obj_set_style_border_color(bubble,lv_color_hex(Theme::PRIMARY),0);
+    lv_obj_set_style_pad_all(bubble,0,0);
+    lv_obj_clear_flag(bubble,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE);
+    static const lv_point_t tailPoints[]={{0,0},{0,8},{8,0}};
+    auto* tail=lv_line_create(box);lv_line_set_points(tail,tailPoints,3);
+    lv_obj_set_pos(tail,116,34);lv_obj_set_style_line_width(tail,2,0);
+    lv_obj_set_style_line_color(tail,lv_color_hex(Theme::PRIMARY),0);
+    for (int i=0;i<3;++i) {
+        auto* dot=lv_obj_create(box);lv_obj_set_pos(dot,117+7*i,20);lv_obj_set_size(dot,3,3);
+        lv_obj_set_style_radius(dot,LV_RADIUS_CIRCLE,0);lv_obj_set_style_border_width(dot,0,0);
+        lv_obj_set_style_bg_color(dot,lv_color_hex(Theme::BORDER_ACTIVE),0);
+        lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);lv_obj_set_style_pad_all(dot,0,0);
+        lv_obj_clear_flag(dot,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE);
+    }
+    auto* title=label(box,&lv_font_rsdeck_14,Theme::TEXT_SECONDARY,0,49,252);
+    lv_obj_set_style_text_align(title,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text_static(title,"No conversations");
+    auto* hint=label(box,&lv_font_rsdeck_10,Theme::TEXT_MUTED,0,70,252);
+    lv_obj_set_style_text_align(hint,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text_static(hint,"Your chats appear here");
+    return box;
+}
 }
 
 bool LvMessagesScreen::bound() const {
@@ -68,6 +102,7 @@ void LvMessagesScreen::createUI(lv_obj_t* parent) {
     },LV_EVENT_SCROLL,this);
     _empty=label(parent,&lv_font_rsdeck_14,Theme::TEXT_SECONDARY,12,55,Theme::CONTENT_W-24);
     lv_obj_set_style_text_align(_empty,LV_TEXT_ALIGN_CENTER,0);
+    _emptyState=createEmptyState(parent);
     _update=lv_btn_create(parent);
     lv_obj_set_pos(_update,4,19);lv_obj_set_size(_update,Theme::CONTENT_W-8,26);
     lv_obj_add_style(_update,LvTheme::styleListBtn(),0);
@@ -123,7 +158,7 @@ void LvMessagesScreen::onExit() {
     }
 }
 void LvMessagesScreen::destroyUI() {
-    onExit();_list=nullptr;_caption=nullptr;_empty=nullptr;_update=nullptr;
+    onExit();_list=nullptr;_caption=nullptr;_empty=nullptr;_update=nullptr;_emptyState=nullptr;
     for (auto& button:_navigation) button=nullptr;
     LvScreen::destroyUI();
 }
@@ -265,13 +300,16 @@ void LvMessagesScreen::updateCaptions() {
         window->state()==Window::State::Retrying?" · Read failed; retrying":
             window->state()==Window::State::Exhausted?" · Reads unavailable":window->loading()?" · Loading":"");
     lv_label_set_text(_caption,text);
-    if (!_rowCount) {
+    const bool emptyReady=window && _active && !_rowCount && window->state()==Window::State::Ready &&
+        !window->loading() && window->statusReady();
+    if (emptyReady) lv_obj_clear_flag(_emptyState,LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(_emptyState,LV_OBJ_FLAG_HIDDEN);
+    if (!_rowCount && !emptyReady) {
         const char* empty=!window || !_active?"":
             window->state()==Window::State::Retrying || window->state()==Window::State::Exhausted?"Unable to read conversations":
             window->loading() || !window->statusReady()?"Loading conversations...":"No conversations";
         lv_label_set_text(_empty,empty);lv_obj_clear_flag(_empty,LV_OBJ_FLAG_HIDDEN);
     } else lv_obj_add_flag(_empty,LV_OBJ_FLAG_HIDDEN);
-    const bool paging=window && _active && (window->canPrevious() || window->canNext());
     bool retry=_nameFailed;
     if (window && bound()) for (size_t i=0;i<window->count();++i)
         retry|=bool(window->row(i)->flags&(Row::Unavailable|Row::StatusUnavailable));
@@ -282,19 +320,17 @@ void LvMessagesScreen::updateCaptions() {
     if (update) lv_obj_clear_flag(_update,LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(_update,LV_OBJ_FLAG_HIDDEN);
     for (size_t i=0;i<4;++i) {
-        if (paging) lv_obj_clear_flag(_navigation[i],LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(_navigation[i],LV_OBJ_FLAG_HIDDEN);
         const bool enabled=window && _active && (i<2?window->canPrevious():window->canNext());
         if (enabled) lv_obj_clear_state(_navigation[i],LV_STATE_DISABLED);
         else lv_obj_add_state(_navigation[i],LV_STATE_DISABLED);
         lv_obj_set_style_text_color(lv_obj_get_child(_navigation[i],0),
             lv_color_hex(enabled?Theme::TEXT_PRIMARY:Theme::TEXT_MUTED),0);
     }
-    // Keep the ordinary single-page list full-height. Contextual actions reserve
-    // a touch-sized row only while there is something for the user to do.
+    // Keep paging controls visible at a stable position, including empty lists.
+    // Contextual actions reserve a row only while there is something to do.
     const int top=update?48:19;
     _binding=true;
-    const int height=Theme::CONTENT_H-top-(paging?32:0);
+    const int height=Theme::CONTENT_H-top-32;
     if (lv_obj_get_y(_list)!=top || lv_obj_get_height(_list)!=height) {
         lv_obj_set_y(_list,top);lv_obj_set_height(_list,height);lv_obj_update_layout(_list);
     }
@@ -305,6 +341,7 @@ void LvMessagesScreen::updateCaptions() {
             lv_group_focus_obj(_rows[selected<_rowCount?selected:0].row);
         }
         else if (update) lv_group_focus_obj(_update);
+        else lv_obj_clear_state(focus,LV_STATE_FOCUSED|LV_STATE_FOCUS_KEY);
     }
     _binding=false;
 }
