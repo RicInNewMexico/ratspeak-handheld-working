@@ -257,8 +257,13 @@ void SX1262::calibrate() {
     executeOpcode(OP_STANDBY_6X, &mode_byte, 1);
     uint8_t cal = MASK_CALIBRATE_ALL;
     executeOpcode(OP_CALIBRATE_6X, &cal, 1);
+    const uint32_t calibrationStarted = millis();
     delay(5);
-    waitOnBusy(500);  // calibration paths get a generous cap
+    // Calibration restarts the TCXO from RC standby. Its configured 640 ms
+    // startup already exceeds 500 ms, before calibration itself completes.
+    const bool calibrationReady = waitOnBusy(handheld::sx1262_timing::calibrationTimeoutMs(_tcxo));
+    Serial.printf("[SX1262] Calibration ready=%d after %lums\n", calibrationReady,
+                  (unsigned long)(millis() - calibrationStarted));
 }
 
 bool SX1262::calibrate_image(uint32_t frequency) {
@@ -300,7 +305,8 @@ void SX1262::enableTCXO() {
         // Timeout: how long SX1262 waits for TCXO to stabilize when entering
         // STDBY_XOSC/TX/RX. Units = 15.625µs. 0x00A000 = 640ms (matches RadioLib).
         // If too short, chip stays in STDBY_RC and calibration uses RC oscillator.
-        uint8_t buf[4] = {LORA_TCXO_VOLTAGE, 0x00, 0xA0, 0x00};
+        constexpr uint32_t ticks = handheld::sx1262_timing::tcxoStartupTicks;
+        uint8_t buf[4] = {LORA_TCXO_VOLTAGE, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
         executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
     waitOnBusy(800);
     }

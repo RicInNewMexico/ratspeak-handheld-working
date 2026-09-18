@@ -38,6 +38,13 @@
 
 namespace handheld::sx1262_timing {
 
+// Handheld TCXO startup is programmed in 15.625 us units. Calibration from
+// RC standby can restart it, then still needs the existing 500 ms work budget.
+constexpr uint32_t tcxoStartupTicks = 0x00A000;
+constexpr uint32_t calibrationTimeoutMs(bool usesTcxo) {
+    return 500 + (usesTcxo ? (tcxoStartupTicks + 63) / 64 : 0);
+}
+
 // SX126x SetModulationParams bandwidth codes, not the saved/UI labels.
 // Semtech sx126x_driver a10c5df, sx126x_get_lora_bw_in_hz. Use the lower
 // integer Hz at the two codes whose fractional bandwidth rounds upward in

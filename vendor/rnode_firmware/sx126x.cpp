@@ -413,7 +413,9 @@ void sx126x::calibrate(void) {
   executeOpcode(OP_CALIBRATE_6X, &calibrate, 1);
 
   delay(5);
-  waitOnBusy(500);
+  // RC-standby calibration restarts the configured TCXO (640 ms on handhelds).
+  // Keep a finite wait, but allow oscillator startup plus calibration work.
+  waitOnBusy(handheld::sx1262_timing::calibrationTimeoutMs(HAS_TCXO));
 }
 
 void sx126x::calibrate_image(long frequency) {
@@ -842,12 +844,13 @@ void sx126x::sleep() {
 
 void sx126x::enableTCXO() {
   #if HAS_TCXO
+    constexpr uint32_t ticks = handheld::sx1262_timing::tcxoStartupTicks;
     #if BOARD_MODEL == BOARD_RAK4631 || BOARD_MODEL == BOARD_HELTEC32_V3 || BOARD_MODEL == BOARD_XIAO_S3
       uint8_t buf[4] = {MODE_TCXO_3_3V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_TBEAM
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_TDECK
-      uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0xA0, 0x00};
+      uint8_t buf[4] = {MODE_TCXO_1_8V_6X, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
     #elif BOARD_MODEL == BOARD_TBEAM_S_V1
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_T3S3
@@ -859,10 +862,10 @@ void sx126x::enableTCXO() {
     #elif BOARD_MODEL == BOARD_HELTEC32_V4
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_CARDPUTER_ADV
-      uint8_t buf[4] = {MODE_TCXO_3_0V_6X, 0x00, 0xA0, 0x00};
+      uint8_t buf[4] = {MODE_TCXO_3_0V_6X, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
     #elif BOARD_MODEL == BOARD_TPAGER
       // 3.0V TCXO, 640ms stabilisation timeout — matches the rsPager standalone driver.
-      uint8_t buf[4] = {MODE_TCXO_3_0V_6X, 0x00, 0xA0, 0x00};
+      uint8_t buf[4] = {MODE_TCXO_3_0V_6X, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
     #endif
     executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
     waitOnBusy(800);
