@@ -1819,7 +1819,7 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                     auto& item = _items[_selectedIdx];
                     long stepHz = 1;
                     for (int i = _freqCursor; i < 8; i++) stepHz *= 10;
-                    long v = (long)freqRecompose() + (event.down ? stepHz : -stepHz);
+                    long v = (long)freqRecompose() + (event.up ? stepHz : -stepHz);
                     long lo = item.minVal;
                     long hi = item.maxVal < 999999999 ? item.maxVal : 999999999;
                     if (v < lo) v = lo;
@@ -1884,8 +1884,8 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                     }
                     updateValue(); return true;
                 }
-                // Wheel adjusts engaged values: up = previous/decrement, down = next/increment
-                if (event.left || event.up) {
+                // Engaged values: up/right increases, down/left decreases.
+                if (event.left || event.down) {
                     if (item.allowOff && _editValue <= item.minVal) _editValue = 0;
                     else {
                         _editValue -= item.step;
@@ -1894,7 +1894,7 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                     _numericTyping = false;
                     updateValue(); return true;
                 }
-                if (event.right || event.down) {
+                if (event.right || event.up) {
                     if (item.allowOff && _editValue < item.minVal) _editValue = item.minVal;
                     else _editValue += item.step;
                     if (_editValue > item.maxVal) _editValue = item.maxVal;
