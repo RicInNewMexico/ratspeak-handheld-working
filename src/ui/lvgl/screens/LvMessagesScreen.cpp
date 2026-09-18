@@ -15,6 +15,28 @@ namespace {
 constexpr int RowHeight = 70;
 constexpr int AvatarSize = 32;
 constexpr int TextX = 54;
+constexpr int NavigationHeight = 30;
+constexpr int NavigationSpace = NavigationHeight + 6;
+void drawNavigation(lv_event_t* event) {
+    auto* button=lv_event_get_target(event);
+    const auto index=reinterpret_cast<uintptr_t>(lv_obj_get_user_data(button));
+    lv_area_t area;lv_obj_get_coords(button,&area);
+    const lv_coord_t cx=(area.x1+area.x2)/2,cy=(area.y1+area.y2)/2;
+    const bool doubleArrow=index==0 || index==3;
+    lv_draw_line_dsc_t stroke;lv_draw_line_dsc_init(&stroke);
+    stroke.width=2;stroke.round_start=1;stroke.round_end=1;
+    stroke.color=lv_color_hex(lv_obj_has_state(button,LV_STATE_DISABLED)?Theme::TEXT_MUTED:Theme::TEXT_PRIMARY);
+    // Geometric icons keep the visible strokes centered independently of font
+    // bearings. The complete button, including the icon, remains the hit area.
+    for (int i=0;i<(doubleArrow?2:1);++i) {
+        const lv_coord_t x=cx-(doubleArrow?7:3)+i*8;
+        const lv_coord_t outer=index<2?x+6:x,tip=index<2?x:x+6;
+        const lv_point_t points[]={{outer,static_cast<lv_coord_t>(cy-6)},
+                                  {tip,cy},{outer,static_cast<lv_coord_t>(cy+6)}};
+        lv_draw_line(lv_event_get_draw_ctx(event),&stroke,&points[0],&points[1]);
+        lv_draw_line(lv_event_get_draw_ctx(event),&stroke,&points[1],&points[2]);
+    }
+}
 void peerText(const uint8_t* peer, char (&out)[33]) {
     constexpr char hex[] = "0123456789abcdef";
     for (size_t i=0;i<16;++i) { out[2*i]=hex[peer[i]>>4]; out[2*i+1]=hex[peer[i]&15]; }
@@ -114,16 +136,14 @@ void LvMessagesScreen::createUI(lv_obj_t* parent) {
         static_cast<LvMessagesScreen*>(lv_event_get_user_data(event))->applyUpdate();
     },LV_EVENT_CLICKED,this);
     lv_group_add_obj(LvInput::group(),_update);
-    static const char* captions[]={"<<","<",">",">>"};
     for (size_t i=0;i<4;++i) {
         auto* button=lv_btn_create(parent);_navigation[i]=button;
-        lv_obj_set_pos(button,4+i*(Theme::CONTENT_W-8)/4,Theme::CONTENT_H-29);
-        lv_obj_set_size(button,(Theme::CONTENT_W-8)/4-3,26);
+        lv_obj_set_pos(button,4+i*(Theme::CONTENT_W-8)/4,Theme::CONTENT_H-NavigationHeight-3);
+        lv_obj_set_size(button,(Theme::CONTENT_W-8)/4-3,NavigationHeight);
         lv_obj_add_style(button,LvTheme::styleListBtn(),0);
         lv_obj_add_style(button,LvTheme::styleListBtnFocused(),LV_STATE_FOCUSED);
         lv_obj_set_style_pad_all(button,0,0);lv_obj_set_user_data(button,reinterpret_cast<void*>(i));
-        auto* text=label(button,&lv_font_rsdeck_12,Theme::TEXT_PRIMARY,0,0,(Theme::CONTENT_W-8)/4-3);
-        lv_label_set_text_static(text,captions[i]);lv_obj_center(text);
+        lv_obj_add_event_cb(button,drawNavigation,LV_EVENT_DRAW_MAIN,nullptr);
         lv_obj_add_event_cb(button,[](lv_event_t* event) {
             auto* self=static_cast<LvMessagesScreen*>(lv_event_get_user_data(event));
             self->navigate(static_cast<Navigation>(reinterpret_cast<uintptr_t>(lv_obj_get_user_data(lv_event_get_target(event)))));
@@ -323,14 +343,12 @@ void LvMessagesScreen::updateCaptions() {
         const bool enabled=window && _active && (i<2?window->canPrevious():window->canNext());
         if (enabled) lv_obj_clear_state(_navigation[i],LV_STATE_DISABLED);
         else lv_obj_add_state(_navigation[i],LV_STATE_DISABLED);
-        lv_obj_set_style_text_color(lv_obj_get_child(_navigation[i],0),
-            lv_color_hex(enabled?Theme::TEXT_PRIMARY:Theme::TEXT_MUTED),0);
     }
     // Keep paging controls visible at a stable position, including empty lists.
     // Contextual actions reserve a row only while there is something to do.
     const int top=update?48:19;
     _binding=true;
-    const int height=Theme::CONTENT_H-top-32;
+    const int height=Theme::CONTENT_H-top-NavigationSpace;
     if (lv_obj_get_y(_list)!=top || lv_obj_get_height(_list)!=height) {
         lv_obj_set_y(_list,top);lv_obj_set_height(_list,height);lv_obj_update_layout(_list);
     }
