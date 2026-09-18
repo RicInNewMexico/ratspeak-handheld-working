@@ -51,7 +51,9 @@ click or press Enter to select, and use Backspace to return to tab navigation.
 Under **Settings → LoRa**, unlock **Developer Radio Controls** as prompted.
 In **Frequency**, **A/D** selects a digit, the encoder tunes it, **Enter** saves
 and **Alt+Backspace** cancels. No touch or horizontal encoder is required.
-Cardputer uses **Fn+arrows**, **Enter**, **Fn+`** to go back, and **Ctrl+H** for help.
+Cardputer uses **Fn+arrows**, **Enter**, **Backspace** to go back outside text entry,
+and **Ctrl+H** for help. In text fields, Backspace deletes text; a fresh press on
+an empty field goes back. **Fn+Backspace** is forward Delete.
 
 A send first saves the message; `sent` means transmission started, while
 `delivered` requires a verified delivery proof. A separate `save retry` or

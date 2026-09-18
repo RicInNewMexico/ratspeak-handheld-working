@@ -98,10 +98,6 @@ void drawScreen() {
   drawOption(48, "Standalone", "On-device messenger", selection.selected() == Choice::Standalone);
   drawOption(87, "RNode", "BLE / USB radio", selection.selected() == Choice::RNode);
 
-  d.setTextColor(kMuted, kBg);
-  d.setCursor(75, 125);
-  d.print("Arrows + Enter");
-
   drawCountdown(true);
 }
 
