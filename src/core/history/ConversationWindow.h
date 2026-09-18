@@ -39,6 +39,7 @@ public:
     bool first();
     bool previous();
     bool nextPage();
+    bool last();
     void refresh();
     void observeRevision(uint32_t revision);
     void observeStatusRevision(uint32_t revision);
@@ -85,7 +86,7 @@ public:
     uint32_t scrollOffset() const { return _control.value.scrollOffset; }
 
 private:
-    enum class Intent : uint8_t { None, First, Previous, Next, Refresh };
+    enum class Intent : uint8_t { None, First, Previous, Next, Last, Refresh };
     enum class Phase : uint8_t { Idle, Page, Detail, Status };
     struct Control {
         storage::Ticket owner;

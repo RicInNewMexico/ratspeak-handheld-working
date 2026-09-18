@@ -68,7 +68,18 @@ void LvMessagesScreen::createUI(lv_obj_t* parent) {
     },LV_EVENT_SCROLL,this);
     _empty=label(parent,&lv_font_rsdeck_14,Theme::TEXT_SECONDARY,12,55,Theme::CONTENT_W-24);
     lv_obj_set_style_text_align(_empty,LV_TEXT_ALIGN_CENTER,0);
-    static const char* captions[]={"Prev","Next","First","Refresh"};
+    _update=lv_btn_create(parent);
+    lv_obj_set_pos(_update,4,19);lv_obj_set_size(_update,Theme::CONTENT_W-8,26);
+    lv_obj_add_style(_update,LvTheme::styleListBtn(),0);
+    lv_obj_add_style(_update,LvTheme::styleListBtnFocused(),LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_all(_update,0,0);
+    auto* updateText=label(_update,&lv_font_rsdeck_12,Theme::TEXT_PRIMARY,0,0,Theme::CONTENT_W-8);
+    lv_obj_set_style_text_align(updateText,LV_TEXT_ALIGN_CENTER,0);lv_obj_center(updateText);
+    lv_obj_add_event_cb(_update,[](lv_event_t* event) {
+        static_cast<LvMessagesScreen*>(lv_event_get_user_data(event))->applyUpdate();
+    },LV_EVENT_CLICKED,this);
+    lv_group_add_obj(LvInput::group(),_update);
+    static const char* captions[]={"<<","<",">",">>"};
     for (size_t i=0;i<4;++i) {
         auto* button=lv_btn_create(parent);_navigation[i]=button;
         lv_obj_set_pos(button,4+i*(Theme::CONTENT_W-8)/4,Theme::CONTENT_H-29);
@@ -99,7 +110,7 @@ void LvMessagesScreen::detachRows() {
     _binding=true;
     if (_screen && _list) lv_obj_clean(_list);
     for (auto& row:_rows) row={};
-    _rowCount=0;_boundRevision=0;_boundIdentity=0;_namesResolved=0;
+    _rowCount=0;_boundRevision=0;_boundIdentity=0;_namesResolved=0;_nameFailed=false;
     _binding=false;
 }
 void LvMessagesScreen::onExit() {
@@ -112,7 +123,7 @@ void LvMessagesScreen::onExit() {
     }
 }
 void LvMessagesScreen::destroyUI() {
-    onExit();_list=nullptr;_caption=nullptr;_empty=nullptr;
+    onExit();_list=nullptr;_caption=nullptr;_empty=nullptr;_update=nullptr;
     for (auto& button:_navigation) button=nullptr;
     LvScreen::destroyUI();
 }
@@ -127,8 +138,8 @@ void LvMessagesScreen::refreshUI() {
     }
     if (bound() && _statusRevision!=window.statusRevision()) updateStatuses();
     if (bound() && _nodeRevision!=(_am?_am->revision():0)) updateNames();
-    updateCaptions();
     if (bound() && !window.loading() && _lpState==LP_NONE) pollName();
+    updateCaptions();
 }
 void LvMessagesScreen::bindRows() {
     auto& window=_service->conversationWindow();
@@ -222,7 +233,7 @@ void LvMessagesScreen::updateStatuses() {
     for (size_t i=0;i<_rowCount;++i) {
         const auto* value=window.row(i);if (!value) continue;
         char text[128]={};const char* detail=nullptr;
-        if (value->flags&Row::Unavailable) detail="Read failed; refresh to retry";
+        if (value->flags&Row::Unavailable) detail="Read failed; tap Retry";
         else if (value->flags&Row::StatusUnavailable) detail="Status unavailable";
         else detail=messageStatusDetail(static_cast<LXMFStatus>(value->status),value->flags&Row::StatusPending,
             value->error,value->flags&Row::TxSuppressed);
@@ -250,10 +261,9 @@ void LvMessagesScreen::updateCaptions() {
     const auto* window=_service?&_service->conversationWindow():nullptr;
     char text[100];
     if (!window || !_active) snprintf(text,sizeof(text),"Conversations closed");
-    else snprintf(text,sizeof(text),"%u of %u chats%s%s%s",unsigned(window->count()),unsigned(window->total()),
+    else snprintf(text,sizeof(text),"%u of %u chats%s",unsigned(window->count()),unsigned(window->total()),
         window->state()==Window::State::Retrying?" · Read failed; retrying":
-            window->state()==Window::State::Exhausted?" · Reads unavailable":window->loading()?" · Loading":"",
-        window->updated()?" · Updated":"",window->freshnessAvailable()?"":" · Refresh to check");
+            window->state()==Window::State::Exhausted?" · Reads unavailable":window->loading()?" · Loading":"");
     lv_label_set_text(_caption,text);
     if (!_rowCount) {
         const char* empty=!window || !_active?"":
@@ -261,13 +271,42 @@ void LvMessagesScreen::updateCaptions() {
             window->loading() || !window->statusReady()?"Loading conversations...":"No conversations";
         lv_label_set_text(_empty,empty);lv_obj_clear_flag(_empty,LV_OBJ_FLAG_HIDDEN);
     } else lv_obj_add_flag(_empty,LV_OBJ_FLAG_HIDDEN);
+    const bool paging=window && _active && (window->canPrevious() || window->canNext());
+    bool retry=_nameFailed;
+    if (window && bound()) for (size_t i=0;i<window->count();++i)
+        retry|=bool(window->row(i)->flags&(Row::Unavailable|Row::StatusUnavailable));
+    const bool update=window && _active && window->state()!=Window::State::Exhausted &&
+        (window->updated() || retry || !window->freshnessAvailable());
+    lv_label_set_text_static(lv_obj_get_child(_update,0),window && window->updated()?"New activity":
+        retry?"Retry":"Check for updates");
+    if (update) lv_obj_clear_flag(_update,LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(_update,LV_OBJ_FLAG_HIDDEN);
     for (size_t i=0;i<4;++i) {
-        const bool enabled=window && _active && (i>=2 || (i==0?window->canPrevious():window->canNext()));
+        if (paging) lv_obj_clear_flag(_navigation[i],LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(_navigation[i],LV_OBJ_FLAG_HIDDEN);
+        const bool enabled=window && _active && (i<2?window->canPrevious():window->canNext());
         if (enabled) lv_obj_clear_state(_navigation[i],LV_STATE_DISABLED);
         else lv_obj_add_state(_navigation[i],LV_STATE_DISABLED);
         lv_obj_set_style_text_color(lv_obj_get_child(_navigation[i],0),
             lv_color_hex(enabled?Theme::TEXT_PRIMARY:Theme::TEXT_MUTED),0);
     }
+    // Keep the ordinary single-page list full-height. Contextual actions reserve
+    // a touch-sized row only while there is something for the user to do.
+    const int top=update?48:19;
+    _binding=true;
+    const int height=Theme::CONTENT_H-top-(paging?32:0);
+    if (lv_obj_get_y(_list)!=top || lv_obj_get_height(_list)!=height) {
+        lv_obj_set_y(_list,top);lv_obj_set_height(_list,height);lv_obj_update_layout(_list);
+    }
+    auto* focus=lv_group_get_focused(LvInput::group());
+    if (focus && (lv_obj_has_flag(focus,LV_OBJ_FLAG_HIDDEN) || lv_obj_has_state(focus,LV_STATE_DISABLED))) {
+        if (_rowCount) {
+            const auto selected=window?window->selectedIndex():RowCount;
+            lv_group_focus_obj(_rows[selected<_rowCount?selected:0].row);
+        }
+        else if (update) lv_group_focus_obj(_update);
+    }
+    _binding=false;
 }
 void LvMessagesScreen::reportViewport() {
     if (_binding || !bound()) return;
@@ -282,9 +321,18 @@ void LvMessagesScreen::navigate(Navigation navigation) {
     switch (navigation) {
         case Navigation::Previous:window.previous();break;
         case Navigation::Next:window.nextPage();break;
-        case Navigation::First:window.first();break;
-        case Navigation::Refresh:window.refresh();_namesResolved=0;break;
+        case Navigation::First:if (window.canPrevious()) window.first();break;
+        case Navigation::Last:window.last();break;
     }
+    refreshUI();
+}
+void LvMessagesScreen::applyUpdate() {
+    if (!_active || !_service || _lpState!=LP_NONE || lv_obj_has_flag(_update,LV_OBJ_FLAG_HIDDEN)) return;
+    auto& window=_service->conversationWindow();
+    if (bound()) reportViewport();
+    if (window.updated()) window.first();
+    else window.refresh();
+    _namesResolved=0;_nameFailed=false;
     refreshUI();
 }
 void LvMessagesScreen::openRow(size_t index) {
@@ -315,14 +363,15 @@ void LvMessagesScreen::pollName() {
                 std::memcmp(_service->conversationWindow().row(i)->peer,expected.data(),16)) return;
             _namesResolved|=uint64_t{1}<<i;
             if (result.outcome==handheld::Outcome::Ok && name && *name) lv_label_set_text(_rows[i].name,name);
+            if (result.outcome!=handheld::Outcome::Ok) _nameFailed=true;
         });
-        // Admission pressure waits for explicit Refresh; never spin per frame.
-        if (!_nameRequest) _namesResolved|=bit;
+        // Admission pressure waits for explicit Retry; never spin per frame.
+        if (!_nameRequest) { _namesResolved|=bit;_nameFailed=true; }
         return;
     }
 }
 void LvMessagesScreen::updateNames() {
-    _nodeRevision=_am?_am->revision():0;_namesResolved=0;
+    _nodeRevision=_am?_am->revision():0;_namesResolved=0;_nameFailed=false;
     if (!_am) return;
     const auto& window=_service->conversationWindow();
     for (size_t i=0;i<_rowCount;++i) {

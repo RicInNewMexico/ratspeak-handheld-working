@@ -86,6 +86,7 @@ template<size_t N> bool ConversationWindow<N>::navigate(Intent intent) {
 template<size_t N> bool ConversationWindow<N>::first() { return navigate(Intent::First); }
 template<size_t N> bool ConversationWindow<N>::previous() { return canPrevious() && navigate(Intent::Previous); }
 template<size_t N> bool ConversationWindow<N>::nextPage() { return canNext() && navigate(Intent::Next); }
+template<size_t N> bool ConversationWindow<N>::last() { return canNext() && navigate(Intent::Last); }
 template<size_t N> void ConversationWindow<N>::refresh() {
     auto& c = _control.value;
     if (!c.open || c.state == State::Exhausted) return;
@@ -136,6 +137,8 @@ template<size_t N> void ConversationWindow<N>::beginIntent() {
     info = live().info.value;
     if (intent == Intent::First || !visible() || (intent == Intent::Refresh && c.followFirst)) {
         info = {}; info.identity = c.identity; info.order = c.order;
+    } else if (intent == Intent::Last) {
+        info = {}; info.identity = c.identity; info.order = c.order; info.direction = Direction::Before;
     } else if ((intent == Intent::Previous || intent == Intent::Next) && count()) {
         const auto* boundary = row(intent == Intent::Previous ? 0 : count() - 1);
         info.bound.timestamp = boundary->timestamp; std::memcpy(info.bound.peer, boundary->peer, 16);
@@ -269,6 +272,15 @@ template<size_t N> bool ConversationWindow<N>::pageResult(const storage::Result&
     info.count = entries; info.total = result.total;
     info.moreBefore = entries && (info.direction == Direction::Before ? result.more : info.hasCursor);
     info.moreAfter = entries && (info.direction == Direction::After ? result.more : info.hasCursor);
+    if (entries && info.direction == Direction::Before && !info.hasCursor) {
+        // Storage returns the last N selectors in one bounded scan. Keep the
+        // final partial page, matching repeated Next on an unchanged directory.
+        const size_t tail = (result.total - 1) % N + 1;
+        if (tail > entries) return false;
+        for (size_t i = 0; tail < entries && i < tail; ++i)
+            std::memcpy(candidate().rows[i].bytes, candidate().rows[entries - tail + i].bytes, sizeof(Selector));
+        info.count = tail; info.moreBefore = result.total > tail;
+    }
     c.index = 0; c.phase = Phase::Detail;
     if (!entries) c.publish = true;
     return true;

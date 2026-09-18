@@ -27,7 +27,7 @@ private:
     using Row = Window::Row;
     struct RowWidgets { lv_obj_t *row = nullptr, *name = nullptr, *preview = nullptr, *status = nullptr; };
     static constexpr size_t RowCount = Window::PageSize;
-    enum class Navigation : uint8_t { Previous, Next, First, Refresh };
+    enum class Navigation : uint8_t { First, Previous, Next, Last };
     enum LongPressState : uint8_t { LP_NONE, LP_MENU, LP_CONFIRM_DELETE };
     bool bound() const;
     void detachRows();
@@ -38,6 +38,7 @@ private:
     void pollName();
     void reportViewport();
     void navigate(Navigation);
+    void applyUpdate();
     void openRow(size_t);
     int focusedIndex() const;
     void showActionMenu(size_t);
@@ -52,7 +53,7 @@ private:
     UIManager* _ui = nullptr;
     OpenCallback _onOpen;
     RowWidgets _rows[RowCount];
-    lv_obj_t *_list = nullptr, *_caption = nullptr, *_empty = nullptr;
+    lv_obj_t *_list = nullptr, *_caption = nullptr, *_empty = nullptr, *_update = nullptr;
     lv_obj_t* _navigation[4] = {};
     lv_obj_t* _actionOverlay = nullptr;
     lv_obj_t* _actionRows[3] = {};
@@ -64,4 +65,5 @@ private:
     uint8_t _rowCount = 0, _menuIdx = 0;
     LongPressState _lpState = LP_NONE;
     bool _active = false, _binding = false, _focusActive = false;
+    bool _nameFailed = false;
 };
