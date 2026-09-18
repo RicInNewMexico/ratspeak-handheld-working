@@ -812,7 +812,8 @@ void setup() {
         []() { return wifiConnection.startScan(); },
         [](String& json) { return wifiConnection.finishScan(json); },
         []() { return network.begin(userConfig.settings()); },
-        []() { network.disconnect(); }
+        []() { network.disconnect(); },
+        []() { return wifiConnection.connecting(); }
     });
     settingsScreen.setBackend(backend);
     settingsScreen.setMaintenanceCallback(requestMaintenance);

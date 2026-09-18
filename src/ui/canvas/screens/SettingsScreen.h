@@ -38,9 +38,10 @@ public:
         handheld::ScanResult (*finishScan)(String&) = nullptr;
         bool (*connect)() = nullptr;
         void (*disconnect)() = nullptr;
+        bool (*connecting)() = nullptr;
     };
     void setNetworkActions(NetworkActions actions) { _network = actions; }
-    bool pollNetworkResults(); // Global loop: retire an owned scan even while hidden.
+    bool pollNetworkResults(); // Refresh connection controls; retire scans even while hidden.
     void setBackend(ProtocolBackend* backend) { _backend = backend; }
     void setIdentityHash(const String& hash) { _identityHash = hash; }
     using SaveCallback = std::function<SettingsTransaction::Result(UserConfig&)>;
@@ -73,6 +74,10 @@ private:
     void selectNetwork(int index);
     void disconnectWiFi();
     void connectWiFi();
+    enum class WiFiAction : uint8_t { None, Connect, Cancel, Disconnect };
+    WiFiAction currentWiFiAction() const;
+    bool pollWiFiStatus();
+    void activateWiFiAction();
 
     void addTCPConnection(const std::string& host, uint16_t port);
     void toggleTCPConnection(int index);
@@ -98,6 +103,7 @@ private:
     AudioNotify* _audio = nullptr;
     PowerManager* _power = nullptr;
     NetworkActions _network;
+    WiFiAction _wifiAction = WiFiAction::None; // Action associated with the displayed label.
     bool _scanPending = false;
     handheld::ScanResult _scanOutcome = handheld::ScanResult::Ready;
     ProtocolBackend* _backend = nullptr;

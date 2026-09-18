@@ -24,6 +24,8 @@ public:
     void stop();
     void closeAdmissions() { _closed = true; }
     bool connected() const;
+    // Includes the owner's scheduled retry/backoff, until explicitly stopped.
+    bool connecting() const { return !_closed && _state != State::Disabled && !connected(); }
     bool scanning() const { return _scanning || _scanRequested; }
 private:
     enum class State { Disabled, Waiting, Connecting, Connected };

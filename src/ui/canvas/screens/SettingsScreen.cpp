@@ -91,6 +91,13 @@ static const ::WiFiNetwork& staNetworkRO(const UserSettings& s) {
     return s.wifiSTANetworks[idx];
 }
 
+SettingsScreen::WiFiAction SettingsScreen::currentWiFiAction() const {
+    if (!_config || _candidate.settings().wifiMode != RAT_WIFI_STA) return WiFiAction::None;
+    if (WiFi.status() == WL_CONNECTED) return WiFiAction::Disconnect;
+    if (_network.connecting && _network.connecting()) return WiFiAction::Cancel;
+    return staNetworkRO(_candidate.settings()).ssid.isEmpty() ? WiFiAction::None : WiFiAction::Connect;
+}
+
 void SettingsScreen::onEnter() {
     _candidateReady = _config && _candidate.tryAssign(*_config);
     if (_candidateReady) _candidateDirty = false;
@@ -149,6 +156,7 @@ void SettingsScreen::buildRadioMenu() {
 
 void SettingsScreen::buildWiFiMenu() {
     _list.clear();
+    _wifiAction = currentWiFiAction();
     if (!_config) return;
     auto& s = _candidate.settings();
 
@@ -165,12 +173,15 @@ void SettingsScreen::buildWiFiMenu() {
         _list.addItem(s.wifiAPPassword.isEmpty() ? "AP Pass: (open)" : "AP Pass: ********");
     } else if (s.wifiMode == RAT_WIFI_STA) {
         // Item 1: Connection status
-        if (WiFi.status() == WL_CONNECTED) {
+        if (_wifiAction == WiFiAction::Disconnect) {
             char statusBuf[48];
             snprintf(statusBuf, sizeof(statusBuf), "Connected: %s", WiFi.SSID().c_str());
             _list.addItem(statusBuf);
             _list.addItem("[Disconnect]");          // Item 2
-        } else if (!staNetworkRO(s).ssid.isEmpty()) {
+        } else if (_wifiAction == WiFiAction::Cancel) {
+            _list.addItem("Connecting...");
+            _list.addItem("[Cancel]");              // Item 2
+        } else if (_wifiAction == WiFiAction::Connect) {
             char statusBuf[48];
             snprintf(statusBuf, sizeof(statusBuf), "Saved: %s (offline)", staNetworkRO(s).ssid.c_str());
             _list.addItem(statusBuf);
@@ -309,10 +320,11 @@ void SettingsScreen::startWiFiScan() {
 }
 
 bool SettingsScreen::pollNetworkResults() {
-    if (!_scanPending || !_network.finishScan) return false;
+    const bool changed = pollWiFiStatus();
+    if (!_scanPending || !_network.finishScan) return changed;
     String json;
     const auto result = _network.finishScan(json);
-    if (result == handheld::ScanResult::Pending) return false;
+    if (result == handheld::ScanResult::Pending) return changed;
     _scanPending = false; _scanOutcome = result; _scanResults.clear();
     if (result == handheld::ScanResult::Ready) {
         JsonDocument doc;
@@ -373,8 +385,28 @@ void SettingsScreen::buildScanResultsMenu() {
 void SettingsScreen::disconnectWiFi() {
     if (!_network.disconnect) { showToast("Network unavailable"); return; }
     _network.disconnect();
-    showToast("Disconnected");
+    showToast(_wifiAction == WiFiAction::Cancel ? "Connection cancelled" : "Disconnected");
     buildWiFiMenu();
+}
+
+bool SettingsScreen::pollWiFiStatus() {
+    if (_subMenu != MENU_WIFI || _editing || _wifiAction == currentWiFiAction()) return false;
+    const int selected = _list.getSelectedIndex();
+    buildWiFiMenu();
+    _list.setSelected(selected);
+    return true;
+}
+
+void SettingsScreen::activateWiFiAction() {
+    // A connection can finish between the last refresh and Enter. Update a
+    // stale label without executing the opposite action on that same press.
+    if (pollWiFiStatus()) return;
+    switch (_wifiAction) {
+        case WiFiAction::Connect: connectWiFi(); break;
+        case WiFiAction::Cancel: case WiFiAction::Disconnect: disconnectWiFi(); break;
+        case WiFiAction::None: return;
+    }
+    _list.setSelected(2);
 }
 
 void SettingsScreen::connectWiFi() {
@@ -917,12 +949,7 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
                 return true;
             }
             if (sel == 2) {
-                // [Disconnect] or [Connect]
-                if (WiFi.status() == WL_CONNECTED) {
-                    disconnectWiFi();
-                } else {
-                    connectWiFi();
-                }
+                if (!event.repeat) activateWiFiAction();
                 return true;
             }
             if (sel == 3) {
