@@ -4,8 +4,14 @@
 #include "reticulum/AnnounceManager.h"
 #include "protocol/ProtocolBackend.h"
 
+namespace {
+constexpr int NavigationHeight = 18;
+constexpr int NavigationGap = 8;
+constexpr int NavigationWidth = 46;
+}
+
 void MessagesScreen::onEnter() {
-    _showingContext = false; _visible = true;
+    _showingContext = false; _visible = true; _pageFocus = -1;
     // Cardputer identity switches commit through an orderly restart.
     _conversations.resume(1);
 }
@@ -37,6 +43,7 @@ bool MessagesScreen::pollConversations(bool allowAdmission) {
     const auto publication = _conversations.revision(), statuses = _conversations.statusRevision();
     const auto state = _conversations.state(); const auto error = _conversations.error();
     const bool updated = _conversations.updated();
+    const auto pageFocus = _pageFocus;
     if (allowAdmission) {
         _conversations.observeRevision(_lxmf->storeRevision());
         if (_backend) _conversations.observeStatusRevision(_backend->lxmfStatusRevision());
@@ -55,13 +62,16 @@ bool MessagesScreen::pollConversations(bool allowAdmission) {
         });
     if (!_conversations.visible() || _conversations.statusReady())
         _conversations.acknowledgePublication(_conversations.revision());
+    if (_pageFocus >= 0 && !_conversations.loading() && !pageEnabled(_pageFocus))
+        _pageFocus = pageEnabled(2) ? 2 : pageEnabled(1) ? 1 : -1;
     return publication != _conversations.revision() || statuses != _conversations.statusRevision() ||
-        state != _conversations.state() || error != _conversations.error() || updated != _conversations.updated();
+        state != _conversations.state() || error != _conversations.error() || updated != _conversations.updated() ||
+        pageFocus != _pageFocus;
 }
 
 void MessagesScreen::renderList(M5Canvas& canvas, int y, int height) {
     Theme::useUiFont(canvas);
-    const int listHeight = height - Theme::CHAR_H - 2;
+    const int listHeight = height - NavigationHeight - 4;
     const size_t visible = std::max(1, listHeight / Theme::LIST_ROW_H);
     const auto count = _conversations.count(), selected = _conversations.selectedIndex();
     uint32_t offset = std::min(_conversations.scrollOffset(), uint32_t(count > visible ? count - visible : 0));
@@ -75,7 +85,8 @@ void MessagesScreen::renderList(M5Canvas& canvas, int y, int height) {
         auto label = peerLabel(peerHex(i));
         if (row.flags & handheld::storage::ConversationView::Unavailable) label += " [unavailable]";
         else if (row.unreadCount) label += " [" + std::to_string(row.unreadCount) + "]";
-        ScrollList::renderRow(canvas, label, 0, y + (i - offset) * Theme::LIST_ROW_H, Theme::CONTENT_W, i == selected);
+        ScrollList::renderRow(canvas, label, 0, y + (i - offset) * Theme::LIST_ROW_H,
+                              Theme::CONTENT_W, _pageFocus < 0 && i == selected);
     }
     if (!count) {
         canvas.setTextColor(Theme::TEXT_SECONDARY);
@@ -83,8 +94,31 @@ void MessagesScreen::renderList(M5Canvas& canvas, int y, int height) {
             _conversations.state() == Conversations::State::Exhausted ? "Restart needed to read list" :
             _conversations.loading() ? "Loading conversations..." : "No conversations yet", 8, y + 1);
     }
-    Theme::useSmallFont(canvas); canvas.setTextColor(Theme::TEXT_SECONDARY);
-    canvas.drawString("Left/Right: page  R: refresh  N: first", 2, y + height - Theme::CHAR_H);
+    renderNavigation(canvas, y + height - NavigationHeight);
+}
+
+void MessagesScreen::renderNavigation(M5Canvas& canvas, int y) {
+    constexpr int groupWidth = 4 * NavigationWidth + 3 * NavigationGap;
+    for (int action = 0; action < 4; ++action) {
+        const int x = (Theme::CONTENT_W - groupWidth) / 2 + action * (NavigationWidth + NavigationGap);
+        const bool enabled = pageEnabled(action), focused = enabled && _pageFocus == action;
+        canvas.fillRoundRect(x, y, NavigationWidth, NavigationHeight, 3,
+                             focused ? Theme::SELECTION_BG : Theme::BG_ELEVATED);
+        canvas.drawRoundRect(x, y, NavigationWidth, NavigationHeight, 3,
+                             focused ? Theme::ACCENT : Theme::BORDER);
+        const uint16_t color = !enabled ? Theme::TEXT_MUTED : focused ? Theme::ACCENT : Theme::TEXT_PRIMARY;
+        const bool doubled = action == 0 || action == 3, right = action >= 2;
+        const int width = doubled ? 14 : 6;
+        const int left = x + (NavigationWidth - width) / 2;
+        // Two-pixel strokes, centered by their actual ink bounds.
+        for (int chevron = 0; chevron < (doubled ? 2 : 1); ++chevron) {
+            for (int row = 0; row < 10; ++row) {
+                const int slope = row < 5 ? row : 9 - row;
+                canvas.drawFastHLine(left + chevron * 8 + (right ? slope : 4 - slope),
+                                    y + (NavigationHeight - 10) / 2 + row, 2, color);
+            }
+        }
+    }
 }
 
 void MessagesScreen::showContextMenu(int idx) {
@@ -183,8 +217,12 @@ void MessagesScreen::render(M5Canvas& canvas) {
     canvas.fillRect(0, y + 2, 3, headerH - 4, Theme::ACCENT);
     canvas.setTextColor(Theme::ACCENT);
     Theme::useUiFont(canvas);
-    const char* notice = _deleteNotice ? _deleteNotice : !_conversations.freshnessAvailable() ? "List needs manual refresh" :
-        _conversations.state() == Conversations::State::Retrying ? "Read failed; retrying..." :
+    bool unavailable = false;
+    for (size_t i = 0; i < _conversations.count(); ++i)
+        unavailable |= bool(_conversations.row(i)->flags & (handheld::storage::ConversationView::Unavailable |
+                                                          handheld::storage::ConversationView::StatusUnavailable));
+    const char* notice = _deleteNotice ? _deleteNotice : !_conversations.freshnessAvailable() ? "Refresh needed (R)" :
+        unavailable || _conversations.state() == Conversations::State::Retrying ? "Read failed; R to retry" :
         _conversations.updated() ? "List updated; R to refresh" : nullptr;
     const auto heading = notice ? std::string(notice) : "Messages (" + std::to_string(_conversations.total()) + ")";
     canvas.drawString(heading.c_str(), 8, y + 2);
@@ -213,6 +251,27 @@ void MessagesScreen::render(M5Canvas& canvas) {
     Theme::useSmallFont(canvas);
 }
 
+bool MessagesScreen::pageEnabled(int action) const {
+    return action >= 0 && action < 4 && !_conversations.loading() &&
+        (action < 2 ? _conversations.canPrevious() : _conversations.canNext());
+}
+
+void MessagesScreen::activatePage(int action) {
+    if (!pageEnabled(action)) return;
+    switch (action) {
+        case 0: _conversations.first(); break;
+        case 1: _conversations.previous(); break;
+        case 2: _conversations.nextPage(); break;
+        case 3: _conversations.last(); break;
+    }
+}
+
+void MessagesScreen::movePageFocus(int direction) {
+    for (int action = _pageFocus + direction; action >= 0 && action < 4; action += direction) {
+        if (pageEnabled(action)) { _pageFocus = action; return; }
+    }
+}
+
 bool MessagesScreen::handleKey(const KeyEvent& event) {
     if (event.repeat && (event.backspace || event.forwardDelete)) return true;
     if (_showingContext) {
@@ -231,9 +290,24 @@ bool MessagesScreen::handleKey(const KeyEvent& event) {
 
     const size_t selected = _conversations.selectedIndex();
     const size_t count = _conversations.count();
+    if (_pageFocus >= 0) {
+        if (event.escape || event.backspace || event.navUp()) {
+            if (!event.repeat) _pageFocus = -1;
+            return true;
+        }
+        if (event.navLeft() || event.navRight()) {
+            movePageFocus(event.navLeft() ? -1 : 1);
+            return true;
+        }
+        if (event.enter) {
+            if (!event.repeat) activatePage(_pageFocus);
+            return true;
+        }
+        if (event.navDown() || event.forwardDelete) return true;
+    }
     if (event.left || event.right) {
         if (!event.repeat) {
-            if (event.left) _conversations.previous(); else _conversations.nextPage();
+            activatePage(event.left ? (event.shift ? 0 : 1) : (event.shift ? 3 : 2));
         }
         return true;
     }
@@ -245,11 +319,9 @@ bool MessagesScreen::handleKey(const KeyEvent& event) {
                 _conversations.select(event.navUp() ? count - 1 : 0);
             } else if (event.navUp()) {
                 if (selected > 0 && selected < count) _conversations.select(selected - 1);
-                else if (_conversations.canPrevious()) _conversations.previous();
                 else _conversations.select(0);
             } else if (selected + 1 < count) _conversations.select(selected + 1);
-            else if (_conversations.canNext()) _conversations.nextPage();
-            else _conversations.select(count - 1);
+            else if (!event.repeat) _pageFocus = pageEnabled(2) ? 2 : pageEnabled(1) ? 1 : -1;
             _conversations.setViewportAtFirst(_conversations.selectedIndex() == 0 && !_conversations.canPrevious());
         }
         return true;
@@ -258,7 +330,7 @@ bool MessagesScreen::handleKey(const KeyEvent& event) {
         _conversations.refresh(); return true;
     }
     if (!event.ctrl && !event.repeat && (event.character == 'n' || event.character == 'N')) {
-        _conversations.first(); return true;
+        _pageFocus = -1; _conversations.first(); return true;
     }
     if (event.enter) {
         if (!event.repeat && selected < count && _openCb) {

@@ -38,6 +38,10 @@ private:
     std::string peerHex(size_t index) const;
     std::string peerLabel(const std::string& peer) const;
     void renderList(M5Canvas&, int y, int height);
+    void renderNavigation(M5Canvas&, int y);
+    bool pageEnabled(int action) const;
+    void activatePage(int action);
+    void movePageFocus(int direction);
     void showContextMenu(int idx);
     void executeContextAction();
     void exitContextMenu();
@@ -49,6 +53,7 @@ private:
     OpenConversationCb _openCb;
     AddContactCb _addContactCb;
     bool _needsRefresh = false, _visible = false, _deleteSettled = false;
+    int8_t _pageFocus = -1; // -1 = conversation list; 0..3 = first/previous/next/last.
     handheld::storage::Ticket _deleteTicket;
     uint8_t _deletePeer[16] = {};
     const char* _deleteNotice = nullptr;

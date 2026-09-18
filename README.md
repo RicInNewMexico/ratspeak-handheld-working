@@ -54,6 +54,9 @@ and **Alt+Backspace** cancels. No touch or horizontal encoder is required.
 Cardputer uses **Fn+arrows**, **Enter**, **Backspace** to go back outside text entry,
 and **Ctrl+H** for help. In text fields, Backspace deletes text; a fresh press on
 an empty field goes back. **Fn+Backspace** is forward Delete.
+In Cardputer Messages, move down past the last conversation on a page to select
+the paging arrows, then use left/right and Enter. **Fn+Left/Right** changes pages
+directly; add **Shift** to jump to the first or last page.
 
 A send first saves the message; `sent` means transmission started, while
 `delivered` requires a verified delivery proof. A separate `save retry` or
