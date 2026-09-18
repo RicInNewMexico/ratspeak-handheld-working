@@ -37,7 +37,8 @@ public:
         bool encrypted;
     };
     static std::vector<ScanResult> scanNetworks(int maxResults = 15);
-    static void startAsyncScan();
+    // False when mode initialization or SDK scan admission fails.
+    static bool startAsyncScan();
     static bool isScanComplete();
     // Reads at most15 strongest unique rows; caller retires SDK results with scanDelete.
     static std::vector<ScanResult> getScanResults(int maxResults = 15);

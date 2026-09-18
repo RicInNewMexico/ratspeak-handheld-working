@@ -58,7 +58,14 @@ WiFiConnection::Transition WiFiConnection::poll() {
     if (_scanRequested && _state != State::Connecting) {
         _scanRequested = false; _scanning = true;
         _scanPreviousMode = WiFi.getMode();
-        WiFiInterface::startAsyncScan(); _scanDeadline = now + 15000;
+        _scanStartedAt = now;
+        if (!WiFiInterface::startAsyncScan()) {
+            _scanResult = "";
+            _scanOutcome = ScanResult::Failed;
+            releaseScan();
+        } else {
+            _scanDeadline = static_cast<uint32_t>(millis()) + 15000;
+        }
         return Transition::None;
     }
     const auto sequence = disconnectSequence.load(std::memory_order_acquire);
@@ -94,7 +101,15 @@ void WiFiConnection::releaseScan() {
 void WiFiConnection::pollActiveScan() {
     const auto result = WiFi.scanComplete();
     if (result == WIFI_SCAN_RUNNING && static_cast<int32_t>(static_cast<uint32_t>(millis()) - _scanDeadline) < 0) return;
-    if (result == WIFI_SCAN_RUNNING) esp_wifi_scan_stop();
+    // Arduino can report WIFI_SCAN_FAILED at its own six-second deadline
+    // without stopping the driver scan. Retire it before deleting results or
+    // allowing a retry, also when our longer owner deadline was not reached.
+    if (result < 0) {
+        esp_wifi_scan_stop();
+        Serial.printf("[WIFI] Scan failed (status=%d elapsed=%lums heap=%lu largest=%lu)\n",
+                      (int)result, (unsigned long)(static_cast<uint32_t>(millis()) - _scanStartedAt),
+                      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+    }
     _scanResult = "";
     _scanOutcome = ScanResult::Failed;
     if (result >= 0) {

@@ -337,6 +337,10 @@ bool SettingsScreen::pollNetworkResults() {
             }
         }
     }
+    if (result == handheld::ScanResult::Ready && _scanOutcome == handheld::ScanResult::Failed)
+        Serial.printf("[WIFI] Scan results unavailable (bytes=%u heap=%lu largest=%lu)\n",
+                      (unsigned)json.length(), (unsigned long)ESP.getFreeHeap(),
+                      (unsigned long)ESP.getMaxAllocHeap());
     if (_subMenu == MENU_WIFI_SCAN) buildScanResultsMenu();
     return true;
 }

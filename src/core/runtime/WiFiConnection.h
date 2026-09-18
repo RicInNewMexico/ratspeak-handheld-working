@@ -32,7 +32,7 @@ private:
     void releaseScan();
     State _state = State::Disabled;
     String _ssid, _password;
-    uint32_t _deadline = 0, _scanDeadline = 0;
+    uint32_t _deadline = 0, _scanDeadline = 0, _scanStartedAt = 0;
     uint8_t _attempt = 0;
     bool _scanRequested = false, _scanning = false;
     ScanResult _scanOutcome = ScanResult::Pending;

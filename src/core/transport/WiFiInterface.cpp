@@ -184,16 +184,23 @@ std::vector<WiFiInterface::ScanResult> WiFiInterface::scanNetworks(int maxResult
     return results;
 }
 
-void WiFiInterface::startAsyncScan() {
-    wifi_mode_t mode = WiFi.getMode();
-    if (mode == WIFI_OFF) {
-        WiFi.mode(WIFI_STA);
-    } else if (mode == WIFI_AP) {
-        WiFi.mode(WIFI_AP_STA);
+bool WiFiInterface::startAsyncScan() {
+    const wifi_mode_t mode = WiFi.getMode();
+    const wifi_mode_t scanMode = mode == WIFI_OFF ? WIFI_STA :
+        mode == WIFI_AP ? WIFI_AP_STA : mode;
+    if (!WiFi.mode(scanMode)) {
+        Serial.printf("[WIFI] Scan mode startup failed (mode=%d heap=%lu largest=%lu)\n",
+                      (int)mode, (unsigned long)ESP.getFreeHeap(),
+                      (unsigned long)ESP.getMaxAllocHeap());
+        return false;
     }
     WiFi.scanDelete();
-    WiFi.scanNetworks(true, false, false, 300, 0);  // async=true
-    Serial.println("[WIFI] Async scan started");
+    const int result = WiFi.scanNetworks(true, false, false, 300, 0);
+    const bool started = result == WIFI_SCAN_RUNNING || result >= 0;
+    Serial.printf("[WIFI] Async scan %s (status=%d mode=%d heap=%lu largest=%lu)\n",
+                  started ? "started" : "rejected", result, (int)scanMode,
+                  (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+    return started;
 }
 
 bool WiFiInterface::isScanComplete() {
