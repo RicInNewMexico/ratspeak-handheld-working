@@ -46,7 +46,7 @@ void NameInputScreen::render(M5Canvas& canvas) {
     }
 
     canvas.setTextColor(Theme::MUTED);
-    const char* hint = _saveStatus ? _saveStatus : "Enter continue | Fn+` back";
+    const char* hint = _saveStatus ? _saveStatus : "Enter continue";
     int hw = strlen(hint) * Theme::CHAR_W;
     canvas.setCursor(cx - hw / 2, Theme::CONTENT_Y + Theme::CONTENT_H - 22);
     canvas.print(hint);
@@ -61,8 +61,8 @@ void NameInputScreen::render(M5Canvas& canvas) {
 
 bool NameInputScreen::handleKey(const KeyEvent& event) {
     if (_savePending) return true;
-    if (event.escape) {
-        if (_backCb) _backCb();
+    if (event.escape || (event.backspace && _nameLen == 0)) {
+        if (!event.repeat && _backCb) _backCb();
         return true;
     }
     if (event.enter) {

@@ -218,10 +218,10 @@ void MessageView::render(M5Canvas& canvas) {
     canvas.drawFastHLine(0, inputY - 2, Theme::CONTENT_W, Theme::DIVIDER);
     if (_history.mode() == History::Mode::Full) {
         canvas.setTextColor(Theme::TEXT_SECONDARY);
-        canvas.drawString("Arrows: read  R: refresh  Esc: chat", 2, inputY + 2);
+        canvas.drawString("Arrows: read  R: refresh", 2, inputY + 2);
     } else if (_history.focusedSpan() < _history.spanCount()) {
         canvas.setTextColor(Theme::TEXT_SECONDARY);
-        canvas.drawString("Enter: read  R: refresh  Esc: type", 2, inputY + 2);
+        canvas.drawString("Enter: read  R: refresh", 2, inputY + 2);
     } else if (_draftReady) {
         _input.render(canvas, 0, inputY, Theme::CONTENT_W);
     } else {
@@ -236,7 +236,8 @@ bool MessageView::handleKey(const KeyEvent& event) {
         onEnter();
         return true;
     }
-    if (event.escape || (full && event.backspace)) {
+    if (event.escape || (event.backspace &&
+                        (full || _history.focusedSpan() < _history.spanCount()))) {
         if (event.repeat) return true;
         if (full) { _history.backToChat(); _history.focusSpan(History::VisibleSpans); _input.setActive(true); }
         else if (_history.focusedSpan() < _history.spanCount()) {

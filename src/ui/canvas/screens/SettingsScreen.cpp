@@ -651,7 +651,7 @@ void SettingsScreen::render(M5Canvas& canvas) {
     if (!_candidateReady) {
         Theme::useSmallFont(canvas); canvas.setTextColor(Theme::MUTED);
         canvas.drawString("Settings memory unavailable", 4, Theme::CONTENT_Y + 8);
-        canvas.drawString("Enter=retry  Fn+`=back", 4, Theme::CONTENT_Y + 22);
+        canvas.drawString("Enter=retry", 4, Theme::CONTENT_Y + 22);
         return;
     }
     if (_subMenu == MENU_ABOUT) {
@@ -684,7 +684,7 @@ void SettingsScreen::render(M5Canvas& canvas) {
 
         // Hint
         canvas.setTextColor(Theme::MUTED);
-        canvas.drawString("Enter=save  Fn+`=cancel", 4, y0 + headerH + 36);
+        canvas.drawString("Enter=save", 4, y0 + headerH + 36);
     } else {
         _list.render(canvas, 0, y0 + headerH + 2, Theme::CONTENT_W,
                      Theme::CONTENT_H - headerH - 3);
@@ -745,10 +745,7 @@ void SettingsScreen::renderAbout(M5Canvas& canvas) {
 
     char uptime[32];
     snprintf(uptime, sizeof(uptime), "Up: %lus", millis() / 1000);
-    canvas.drawString(uptime, 4, y); y += 12;
-
-    canvas.setTextColor(Theme::MUTED);
-    canvas.drawString("[Fn+`: back]", 4, y);
+    canvas.drawString(uptime, 4, y);
 }
 
 bool SettingsScreen::handleKey(const KeyEvent& event) {
@@ -778,8 +775,9 @@ bool SettingsScreen::handleKey(const KeyEvent& event) {
         return true;
     }
 
-    // Escape goes back from anywhere; Backspace goes back outside an editor.
-    if (event.escape || (event.backspace && !_editing)) {
+    // Escape goes back from anywhere; a fresh Backspace also leaves an empty editor.
+    if (event.escape || (event.backspace && !event.repeat &&
+                         (!_editing || _editInput.getText().empty()))) {
         if (_editing) {
             if (!_config || !_candidate.tryAssign(*_config)) {
                 showToast("Settings memory unavailable; retry", 2500); return true;

@@ -23,12 +23,9 @@ void HelpOverlay::render(M5Canvas& canvas) {
     canvas.drawString("Ctrl N/S  New/Settings", x, y); y += 9;
     canvas.drawString("Ctrl A/D  Announce/Diag", x, y); y += 9;
     canvas.drawString("Fn+arrows  Move / tabs", x, y); y += 9;
-    canvas.drawString("Enter Select | Fn+` Back", x, y); y += 9;
-    canvas.drawString("Bksp Edit/back | Fn+Bksp Del", x, y); y += 9;
-    canvas.drawString("Tab / Shift+Tab  Cycle tabs", x, y); y += 11;
-
-    canvas.setTextColor(Theme::MUTED);
-    canvas.drawString("Press Ctrl+H to close", x, y);
+    canvas.drawString("Enter  Select", x, y); y += 9;
+    canvas.drawString("Fn+Bksp  Delete", x, y); y += 9;
+    canvas.drawString("Tab / Shift+Tab  Cycle tabs", x, y);
 }
 
 bool HelpOverlay::handleKey(const KeyEvent& event) {
