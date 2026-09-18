@@ -103,7 +103,8 @@ private:
     AudioNotify* _audio = nullptr;
     PowerManager* _power = nullptr;
     NetworkActions _network;
-    WiFiAction _wifiAction = WiFiAction::None; // Action associated with the displayed label.
+    WiFiAction _wifiAction = WiFiAction::None;
+    WiFiAction _drawnWiFiAction = WiFiAction::None; // Gate activation until the label is drawn.
     bool _scanPending = false;
     handheld::ScanResult _scanOutcome = handheld::ScanResult::Ready;
     ProtocolBackend* _backend = nullptr;

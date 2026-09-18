@@ -157,6 +157,7 @@ void SettingsScreen::buildRadioMenu() {
 void SettingsScreen::buildWiFiMenu() {
     _list.clear();
     _wifiAction = currentWiFiAction();
+    _drawnWiFiAction = WiFiAction::None;
     if (!_config) return;
     auto& s = _candidate.settings();
 
@@ -400,7 +401,7 @@ bool SettingsScreen::pollWiFiStatus() {
 void SettingsScreen::activateWiFiAction() {
     // A connection can finish between the last refresh and Enter. Update a
     // stale label without executing the opposite action on that same press.
-    if (pollWiFiStatus()) return;
+    if (pollWiFiStatus() || _wifiAction != _drawnWiFiAction) return;
     switch (_wifiAction) {
         case WiFiAction::Connect: connectWiFi(); break;
         case WiFiAction::Cancel: case WiFiAction::Disconnect: disconnectWiFi(); break;
@@ -724,6 +725,7 @@ void SettingsScreen::render(M5Canvas& canvas) {
     } else {
         _list.render(canvas, 0, y0 + headerH + 2, Theme::CONTENT_W,
                      Theme::CONTENT_H - headerH - 3);
+        if (_subMenu == MENU_WIFI) _drawnWiFiAction = _wifiAction;
     }
 
     // Confirmation dialog overlay
