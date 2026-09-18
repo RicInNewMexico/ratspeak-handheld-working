@@ -131,12 +131,32 @@ void setChipState(lv_obj_t* chip, lv_obj_t* label, const char* text, bool active
     }
 }
 
+void makeFocusable(lv_obj_t* obj) {
+    if (!obj) return;
+    lv_obj_add_style(obj, LvTheme::styleBtnFocused(), LV_STATE_FOCUSED);
+#if HAS_TOUCH
+    // LVGL also assigns keypad focus during automatic group registration.
+    // On touch boards, paint a ring only for actual key/trackball navigation.
+    lv_obj_add_event_cb(obj, [](lv_event_t* event) {
+        const auto code = lv_event_get_code(event);
+        if (code != LV_EVENT_FOCUSED && code != LV_EVENT_PRESSED) return;
+        auto* input = lv_indev_get_act();
+        const bool touch = input && lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER;
+        if ((code == LV_EVENT_FOCUSED && !input) || touch) {
+            auto* target = lv_event_get_target(event);
+            auto* focused = lv_group_get_focused(static_cast<lv_group_t*>(lv_obj_get_group(target)));
+            if (focused) lv_obj_clear_state(focused, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+            lv_obj_clear_state(target, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+        }
+    }, LV_EVENT_ALL, nullptr);
+#endif
+    lv_group_add_obj(LvInput::group(), obj);
+}
+
 void makeClickable(lv_obj_t* obj, void (*cb)(lv_event_t*), void* userData) {
     if (!obj) return;
     lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-    // Encoder focus ring — same visual language as the Announce button
-    lv_obj_add_style(obj, LvTheme::styleBtnFocused(), LV_STATE_FOCUSED);
-    lv_group_add_obj(LvInput::group(), obj);
+    makeFocusable(obj);
     lv_obj_add_event_cb(obj, cb, LV_EVENT_CLICKED, userData);
 }
 
@@ -263,7 +283,6 @@ void LvHomeScreen::createUI(lv_obj_t* parent) {
     lv_obj_set_pos(_btnAnnounce, kAnnounceX, kFooterY);
     lv_obj_set_size(_btnAnnounce, kActionW, kFooterH);
     lv_obj_add_style(_btnAnnounce, LvTheme::styleBtn(), 0);
-    lv_obj_add_style(_btnAnnounce, LvTheme::styleBtnFocused(), LV_STATE_FOCUSED);
     lv_obj_add_style(_btnAnnounce, LvTheme::styleBtnPressed(), LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(_btnAnnounce, lv_color_hex(Theme::PRIMARY_SUBTLE), 0);
     lv_obj_set_style_border_color(_btnAnnounce, lv_color_hex(Theme::PRIMARY), 0);
@@ -277,7 +296,7 @@ void LvHomeScreen::createUI(lv_obj_t* parent) {
     lv_label_set_text(_lblAnnounceAction, "ANNOUNCE");
     lv_obj_center(_lblAnnounceAction);
 
-    lv_group_add_obj(LvInput::group(), _btnAnnounce);
+    makeFocusable(_btnAnnounce);
     lv_obj_add_event_cb(_btnAnnounce, [](lv_event_t* e) {
         auto* self = (LvHomeScreen*)lv_event_get_user_data(e);
         if (self->_announceCb) self->_announceCb();
