@@ -2,6 +2,7 @@
 #include "Theme.h"
 #include "config/Config.h"
 #include "config/SettingsInput.h"
+#include "config/AnnounceInterval.h"
 #include "radio/RadioFrequency.h"
 #include "radio/RadioPresets.h"
 #include "radio/RadioSettings.h"
@@ -434,6 +435,11 @@ void SettingsScreen::buildDisplayMenu() {
 
     String name = s.displayName.isEmpty() ? "(none)" : s.displayName;
     _list.addItem(("Name: " + std::string(name.c_str())));
+    if (s.announceInterval == handheld::announce::Off) _list.addItem("Auto Announce: OFF");
+    else {
+        snprintf(buf, sizeof(buf), "Auto Announce: %um", unsigned(s.announceInterval));
+        _list.addItem(buf);
+    }
     _list.addItem("< Back");
 }
 
@@ -452,6 +458,7 @@ void SettingsScreen::buildAudioMenu() {
 // Start editing a field — show TextInput with current value
 void SettingsScreen::startEditing(int field, const std::string& currentValue) {
     _editField = field;
+    _editLabel = _subMenu == MENU_DISPLAY && field == 4 ? "Announce: 0=OFF, 30-360m" : "";
     _editing = true;
     _editInput.clear();
     _editInput.setText(currentValue);
@@ -560,7 +567,12 @@ void SettingsScreen::commitEdit(const std::string& value) {
         buildWiFiMenu();
     } else if (_subMenu == MENU_DISPLAY) {
         int32_t v = 0;
-        if (_editField != 3 && !handheld::settings::parseInteger(value,
+        if (_editField == 4) {
+            if (!handheld::settings::parseInteger(value, 0, handheld::announce::MaximumMinutes, v) ||
+                (v != handheld::announce::Off && v < handheld::announce::MinimumMinutes)) {
+                showToast("Announce: 0=OFF or 30-360m"); return;
+            }
+        } else if (_editField != 3 && !handheld::settings::parseInteger(value,
                 _editField == 0 ? 1 : _editField == 1 ? 5 : 10,
                 _editField == 0 ? 100 : _editField == 1 ? 3600 : 7200, v)) {
             showToast(_editField == 0 ? "Brightness: 1-100%" :
@@ -572,6 +584,7 @@ void SettingsScreen::commitEdit(const std::string& value) {
             case 1: s.screenDimTimeout = (uint16_t)v; break;
             case 2: s.screenOffTimeout = (uint16_t)v; break;
             case 3: if (!assign(s.displayName)) return; break;
+            case 4: s.announceInterval = uint16_t(v); break;
             default: return;
         }
         if (!applyAndSave()) return;
@@ -626,6 +639,7 @@ std::string SettingsScreen::getCurrentValue(SubMenu menu, int field) {
             case 1: snprintf(buf, sizeof(buf), "%d", s.screenDimTimeout); return buf;
             case 2: snprintf(buf, sizeof(buf), "%d", s.screenOffTimeout); return buf;
             case 3: return s.displayName.c_str();
+            case 4: snprintf(buf, sizeof(buf), "%u", unsigned(s.announceInterval)); return buf;
         }
     } else if (menu == MENU_AUDIO) {
         if (field == 1) { snprintf(buf, sizeof(buf), "%d", s.audioVolume); return buf; }

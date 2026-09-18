@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "config/AnnounceInterval.h"
 
 namespace handheld {
 
@@ -11,7 +12,7 @@ namespace handheld {
 class AnnounceScheduler {
 public:
     enum class Startup : uint8_t { ImmediateOnce, DelayedThree };
-    enum class Phase : uint8_t { Dormant, Startup, Periodic, Stopped };
+    enum class Phase : uint8_t { Dormant, Startup, Periodic, Disabled, Stopped };
     enum class Action : uint8_t { None, Startup, Periodic };
     enum class Result : uint8_t { Sent, Deferred, Failed, Skipped };
     struct Event {
@@ -20,8 +21,8 @@ public:
         uint8_t attempt = 0; // Startup ordinal 1..3; zero for periodic/none.
     };
     static constexpr uint32_t StartupDelayMs = 5000;
-    static constexpr uint16_t MinimumMinutes = 30;
-    static constexpr uint16_t MaximumMinutes = 360;
+    static constexpr uint16_t MinimumMinutes = announce::MinimumMinutes;
+    static constexpr uint16_t MaximumMinutes = announce::MaximumMinutes;
 
     AnnounceScheduler() = default;
     AnnounceScheduler(const AnnounceScheduler&) = delete;
@@ -49,7 +50,17 @@ public:
     // send from settings callbacks. A late poll never catches up in a burst.
     template<class Attempt>
     Event poll(uint32_t now, uint16_t savedMinutes, bool airtimeBlocked, Attempt&& attempt) {
-        if (_attempting || (_phase != Phase::Startup && _phase != Phase::Periodic)) return {};
+        if (_attempting || _phase == Phase::Dormant || _phase == Phase::Stopped) return {};
+        if (savedMinutes == announce::Off) {
+            _phase = Phase::Disabled;
+            return {};
+        }
+        if (_phase == Phase::Disabled) {
+            // Re-enabling starts a full interval, without a startup/catch-up burst.
+            _phase = Phase::Periodic;
+            _anchor = now;
+            return {};
+        }
         const bool startup = _phase == Phase::Startup;
         const uint32_t delay = startup
             ? (_policy == Startup::ImmediateOnce ? 0 : StartupDelayMs)
@@ -84,9 +95,7 @@ public:
 
 private:
     static uint32_t intervalMs(uint16_t minutes) {
-        if (minutes < MinimumMinutes) minutes = MinimumMinutes;
-        if (minutes > MaximumMinutes) minutes = MaximumMinutes;
-        return uint32_t(minutes) * 60000u;
+        return uint32_t(announce::normalizeMinutes(minutes)) * 60000u;
     }
     uint32_t _anchor = 0;
     Phase _phase = Phase::Dormant;

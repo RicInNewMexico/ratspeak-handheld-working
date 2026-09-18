@@ -1,4 +1,5 @@
 #include "UserConfig.h"
+#include "config/AnnounceInterval.h"
 #include "config/BoardConfig.h"
 #include "radio/RadioFrequency.h"
 #include "radio/RadioBandwidth.h"
@@ -184,7 +185,7 @@ void UserConfig::sanitizeSettings(UserSettings& settings) {
     settings.audioVolume = constrain(settings.audioVolume, 0, 100);
     if (settings.timezoneIdx >= 21) settings.timezoneIdx = 6;
     settings.autoIfaceMaxPeers = constrain(settings.autoIfaceMaxPeers, 1, 16);
-    settings.announceInterval = constrain(settings.announceInterval, 30, 360);
+    settings.announceInterval = handheld::announce::normalizeMinutes(settings.announceInterval);
 
     size_t retained = 0;
     for (size_t i = 0; i < settings.tcpConnections.size(); ++i) {
@@ -352,7 +353,7 @@ bool UserConfig::parseJson(const char* json, size_t length, bool persisted, bool
         if (!assignConfigString(parsed.displayName, doc["display_name"] | "")) return memoryFailure();
         parsed.nameComplete = doc["name_complete"] | !parsed.displayName.isEmpty();
         parsed.sdStorageEnabled = doc["sd_storage"] | parsed.sdStorageEnabled;
-        parsed.announceInterval = constrain(doc["announce_int"] | 30, 30, 360);
+        parsed.announceInterval = handheld::announce::normalizeMinutes(doc["announce_int"] | 30);
         parsed.devMode     = doc["dev_mode"]     | false;
 
         sanitizeSettings(parsed);

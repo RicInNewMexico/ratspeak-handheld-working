@@ -42,6 +42,7 @@ struct SettingItem {
     std::function<const String&()> textGetter;
     std::function<bool(const String&)> textSetter;
     int maxTextLen = 16;
+    bool allowOff = false; // INTEGER: zero is OFF; minVal is the minimum enabled value.
 };
 
 struct SettingsCategory {

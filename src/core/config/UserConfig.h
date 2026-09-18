@@ -124,7 +124,7 @@ struct UserSettings {
     bool sdStorageEnabled = BOARD_DEFAULT_SD_STORAGE;
 
     // Announce
-    uint16_t announceInterval = 30; // minutes, 30-360
+    uint16_t announceInterval = 30; // 0 = OFF; otherwise minutes, 30-360
 
     // Developer mode — unlocks custom radio parameters
     bool devMode = false;

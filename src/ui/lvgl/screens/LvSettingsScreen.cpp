@@ -4,6 +4,7 @@
 #include "LvTheme.h"
 #include "LvInput.h"
 #include "config/Config.h"
+#include "config/AnnounceInterval.h"
 #include "config/UserConfig.h"
 #include "radio/RadioFrequency.h"
 #include "radio/RadioBandwidth.h"
@@ -56,7 +57,9 @@ String formatRadioFrequency(uint32_t hz) {
 
 String formatEditedValue(const SettingItem& item, int value) {
     String text;
-    if (item.type == SettingType::ENUM_CHOICE && !item.enumLabels.empty()) {
+    if (item.allowOff && value == 0) {
+        text = "OFF";
+    } else if (item.type == SettingType::ENUM_CHOICE && !item.enumLabels.empty()) {
         text = item.enumLabels[constrain(value, 0, (int)item.enumLabels.size() - 1)];
     } else {
         text = item.formatter ? item.formatter(value) : String(value);
@@ -412,7 +415,10 @@ void LvSettingsScreen::buildItems() {
     }
     _items.push_back({"Auto Announce", SettingType::INTEGER,
         [&s]() { return s.announceInterval; }, [&s](int v) { s.announceInterval = v; },
-        [](int v) { return String(v) + "m"; }, 30, 60 * 6, 5}); // 30m - 6h
+        [](int v) { return v == 0 ? String("OFF") : String(v) + "m"; },
+        handheld::announce::MinimumMinutes, handheld::announce::MaximumMinutes,
+        handheld::announce::StepMinutes});
+    _items.back().allowOff = true;
     idx++;
     _categories.push_back({"Identity & Device", devStart, idx - devStart,
         [&s]() -> String {
@@ -1880,19 +1886,24 @@ bool LvSettingsScreen::handleKey(const KeyEvent& event) {
                 }
                 // Wheel adjusts engaged values: up = previous/decrement, down = next/increment
                 if (event.left || event.up) {
-                    _editValue -= item.step;
-                    if (_editValue < item.minVal) _editValue = item.minVal;
+                    if (item.allowOff && _editValue <= item.minVal) _editValue = 0;
+                    else {
+                        _editValue -= item.step;
+                        if (_editValue < item.minVal) _editValue = item.minVal;
+                    }
                     _numericTyping = false;
                     updateValue(); return true;
                 }
                 if (event.right || event.down) {
-                    _editValue += item.step;
+                    if (item.allowOff && _editValue < item.minVal) _editValue = item.minVal;
+                    else _editValue += item.step;
                     if (_editValue > item.maxVal) _editValue = item.maxVal;
                     _numericTyping = false;
                     updateValue(); return true;
                 }
                 if (event.enter || event.character == '\n' || event.character == '\r') {
-                    if (_editValue < item.minVal) _editValue = item.minVal;
+                    if (_editValue < item.minVal && !(item.allowOff && _editValue == 0))
+                        _editValue = item.minVal;
                     try { if (item.setter) item.setter(_editValue); }
                     catch (const std::bad_alloc&) {
                         if (_ui) _ui->lvStatusBar().showToast("Settings memory unavailable; retry", 2000);
