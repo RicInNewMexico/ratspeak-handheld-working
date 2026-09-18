@@ -208,6 +208,10 @@ void LvNodesScreen::createUI(lv_obj_t* parent) {
     lv_obj_set_pos(_nicknameHint, 0, 46);
 
     lv_obj_t* cancel = lv_btn_create(_nicknameBox);
+    // Nickname keys are handled by the screen; this button is a touch action.
+    // Leaving a hidden default-group button behind during a row rebuild can
+    // strand the group's focus and prevent keypad/encoder input reaching peers.
+    lv_group_remove_obj(cancel);
     lv_obj_set_pos(cancel, 154, 61);
     lv_obj_set_size(cancel, 80, 22);
     lv_obj_add_style(cancel, LvTheme::styleBtn(), 0);
@@ -262,6 +266,8 @@ void LvNodesScreen::rebuildList() {
     _lastRebuild = millis();
     // Preserve scroll position across rebuilds
     lv_coord_t scrollY = lv_obj_get_scroll_y(_list);
+    const std::string focusedHex = getFocusedNodeHex();
+    lv_obj_t* restoredFocus = nullptr;
     lv_obj_clean(_list);
     _sortedContactIndices.clear();
     _sortedOnlineIndices.clear();
@@ -333,6 +339,7 @@ void LvNodesScreen::rebuildList() {
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_user_data(row, (void*)(intptr_t)_rowHexes.size());
         _rowHexes.push_back(node.hash.toHex());
+        if (_rowHexes.back() == focusedHex) restoredFocus = row;
 
         lv_obj_add_event_cb(row, [](lv_event_t* e) {
             auto* self = (LvNodesScreen*)lv_event_get_user_data(e);
@@ -392,6 +399,8 @@ void LvNodesScreen::rebuildList() {
         for (int idx : _sortedOnlineIndices) addNodeRow(idx);
     }
 
+    if (restoredFocus) LvInput::focusObj(restoredFocus);
+
     // Restore scroll position so the list doesn't jump to top on refresh
     if (scrollY > 0) {
         lv_obj_update_layout(_list);
@@ -409,7 +418,7 @@ void LvNodesScreen::rebuildList() {
 
 std::string LvNodesScreen::getFocusedNodeHex() const {
     lv_obj_t* focused = lv_group_get_focused(LvInput::group());
-    if (!focused) return "";
+    if (!focused || lv_obj_get_parent(focused) != _list) return "";
     int idx = (int)(intptr_t)lv_obj_get_user_data(focused);
     if (idx < 0 || idx >= (int)_rowHexes.size()) return "";
     return _rowHexes[idx];
