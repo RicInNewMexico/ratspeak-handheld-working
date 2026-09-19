@@ -36,12 +36,15 @@ public:
     uint32_t autoDeferredElapsed() const { return _deferred ? uint32_t(millis()) - _deferredAt : 0; }
 private:
     void retireTransports();
+    void deferAuto(uint32_t now);
     WiFiConnection& _wifi;
     RustInterfacePump& _pump;
     TcpClientSet& _tcp;
     RnsAutoInterface& _auto;
     WiFiInterface* _ap = nullptr; // only owned dynamic driver, at most one
     uint32_t _deferredAt = 0, _lastLinkCheck = 0;
+    uint32_t _autoCheckedAt = 0, _autoCheckMs = 0, _autoRetryMs = 0;
+    bool _autoNoticeSent = false;
     bool _connected = false, _deferred = false, _reload = false;
     bool _closed = false, _helpersStopped = false;
 };

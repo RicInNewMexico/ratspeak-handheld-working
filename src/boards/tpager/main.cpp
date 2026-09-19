@@ -1250,9 +1250,9 @@ static void serviceNetworkPoll() {
     if (networkEvents & handheld::NetworkCoordinator::Disconnected)
         Serial.println("[WIFI] STA disconnected, old transports detached");
     if (networkEvents & handheld::NetworkCoordinator::AutoTimeout)
-        Serial.println("[AUTOIFACE] SLAAC timeout — no link-local after 10s");
+        Serial.println("[AUTOIFACE] Still waiting for IPv6 link-local; discovery will retry");
     if (networkEvents & handheld::NetworkCoordinator::AutoFailed)
-        Serial.println("[AUTOIFACE] Socket startup failed");
+        Serial.println("[AUTOIFACE] Socket startup failed; discovery will retry");
     if (networkEvents & handheld::NetworkCoordinator::TcpSkipped) ++diagTcpSkipEvents;
     if ((networkEvents & handheld::NetworkCoordinator::TcpReloaded) && announceManager)
         announceManager->clearTransientNodes();

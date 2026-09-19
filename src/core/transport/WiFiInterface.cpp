@@ -1,5 +1,15 @@
 #include "WiFiInterface.h"
 #include "config/Config.h"
+#include "config/NetworkTiming.h"
+
+namespace {
+// The pinned Arduino 2.0.x API exposes its shared scan deadline to subclasses.
+// Override it after scanNetworks sets dwell*20, without changing RF dwell time,
+// SDK headers, result ownership, or the boot-lifetime scan callback.
+struct ScanDeadline : WiFiScanClass {
+    static void apply() { _scanTimeout = handheld::network_timing::WifiScanMs; }
+};
+}
 
 WiFiInterface::WiFiInterface(const char* name)
     : _name(name ? name : "WiFiInterface"), _server(WIFI_AP_PORT)
@@ -197,6 +207,7 @@ bool WiFiInterface::startAsyncScan() {
     WiFi.scanDelete();
     const int result = WiFi.scanNetworks(true, false, false, 300, 0);
     const bool started = result == WIFI_SCAN_RUNNING || result >= 0;
+    if (started) ScanDeadline::apply();
     Serial.printf("[WIFI] Async scan %s (status=%d mode=%d heap=%lu largest=%lu)\n",
                   started ? "started" : "rejected", result, (int)scanMode,
                   (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());

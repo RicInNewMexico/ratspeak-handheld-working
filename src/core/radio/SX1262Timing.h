@@ -52,7 +52,7 @@ constexpr uint32_t tcxoTimeoutMs() {
 }
 
 constexpr uint32_t calibrationTimeoutMs(bool usesTcxo) {
-    return 500 + (usesTcxo ? tcxoStartupMs : 0);
+    return 500 + (usesTcxo ? tcxoTimeoutMs() : 0);
 }
 
 // SX126x SetModulationParams bandwidth codes, not the saved/UI labels.

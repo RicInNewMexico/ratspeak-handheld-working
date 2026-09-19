@@ -1,6 +1,7 @@
 #include "runtime/TaskOwner.h"
 #include "TCPClientInterface.h"
 #include "config/Config.h"
+#include "config/NetworkTiming.h"
 
 #include <WiFi.h>
 #include <algorithm>
@@ -79,6 +80,18 @@ bool TCPClientInterface::reapConnectTask() {
 void TCPClientInterface::connectTaskFn(void* arg) {
     auto* self = static_cast<TCPClientInterface*>(arg);
     bool ok = self->_client.connect(self->_host, self->_port, TCP_CONNECT_TIMEOUT_MS);
+    if (ok && self->_online) {
+        const int enabled = 1;
+        using namespace handheld::network_timing;
+        ok = self->_client.setSocketOption(SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0 &&
+             self->_client.setSocketOption(IPPROTO_TCP, TCP_KEEPIDLE, &TcpKeepIdleSeconds, sizeof(int)) == 0 &&
+             self->_client.setSocketOption(IPPROTO_TCP, TCP_KEEPINTVL, &TcpKeepIntervalSeconds, sizeof(int)) == 0 &&
+             self->_client.setSocketOption(IPPROTO_TCP, TCP_KEEPCNT, &TcpKeepCount, sizeof(int)) == 0;
+        if (!ok) {
+            Serial.println("[TCP] Keepalive configuration failed; connection will retry");
+            self->_client.stop();
+        }
+    }
     if (ok && !self->_online) {
         self->_client.stop();
         ok = false;
@@ -101,7 +114,7 @@ void TCPClientInterface::tryConnect() {
     if (ok != pdPASS) {
         _connectState = CS_IDLE;
         _connectTask = nullptr;
-        _reconnectBackoff = std::min(_reconnectBackoff * 2, (unsigned long)300000);
+        _reconnectBackoff = std::min(_reconnectBackoff * 2, (unsigned long)handheld::network_timing::ReconnectMaxMs);
         Serial.printf("[TCP] Failed to spawn connect task for %s:%d\n", _host, _port);
     }
 }
@@ -130,9 +143,11 @@ void TCPClientInterface::loop(unsigned long budgetMs, size_t byteBudget) {
         Serial.printf("[TCP] Connected to %s:%d\n", _host, _port);
     } else if (_connectState == CS_FAILED) {
         _connectState = CS_IDLE;
-        // Exponential backoff: 1s → 2s → 4s → ... → 5min max, with jitter
-        _reconnectBackoff = std::min(_reconnectBackoff * 2, (unsigned long)300000);
-        _reconnectBackoff = std::min(300000UL,
+        // A slow failed connect must not consume its subsequent retry delay.
+        _lastAttempt = millis();
+        // Exponential backoff, capped at one minute including jitter.
+        _reconnectBackoff = std::min(_reconnectBackoff * 2, (unsigned long)handheld::network_timing::ReconnectMaxMs);
+        _reconnectBackoff = std::min((unsigned long)handheld::network_timing::ReconnectMaxMs,
             _reconnectBackoff + (unsigned long)random(_reconnectBackoff / 5));
         Serial.printf("[TCP] Failed to connect to %s:%d (next retry in %lus)\n",
                       _host, _port, _reconnectBackoff / 1000);
@@ -148,17 +163,6 @@ void TCPClientInterface::loop(unsigned long budgetMs, size_t byteBudget) {
             tryConnect();
         }
         return;
-    }
-
-    // Keepalive: if no RX for 5 minutes, force reconnect (NAT timeout detection)
-    if (_lastRxTime > 0 && millis() - _lastRxTime >= TCP_KEEPALIVE_TIMEOUT_MS) {
-        Serial.printf("[TCP] No RX for %lus, forcing reconnect to %s:%d\n",
-                      (millis() - _lastRxTime) / 1000, _host, _port);
-        _client.stop();
-        _inFrame = false;
-        _escaped = false;
-        _rxPos = 0;
-        return;  // Will reconnect on next loop iteration
     }
 
     // Drain incoming frames per loop (up to 15, time-boxed)

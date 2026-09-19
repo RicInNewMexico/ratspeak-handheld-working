@@ -459,6 +459,11 @@ int sx126x::begin(long frequency) {
   #endif
 
   calibrate();
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
+    // Full calibration returns to RC standby. Settle the TCXO before the
+    // separate image-calibration work budget, as the Standalone driver does.
+    standby();
+  #endif
   calibrate_image(frequency);
   if (!loraMode()) { return false; }
   standby();

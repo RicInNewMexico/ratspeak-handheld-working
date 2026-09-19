@@ -26,7 +26,7 @@
 // --- TCP Client ---
 #define MAX_TCP_CONNECTIONS         4
 #define TCP_DEFAULT_PORT            4242
-#define TCP_CONNECT_TIMEOUT_MS      500
+#define TCP_CONNECT_TIMEOUT_MS      10000
 
 // --- Announce Flood Defense ---
 // Enforced inside the Rust lite transport before signature verification:

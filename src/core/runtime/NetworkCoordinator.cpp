@@ -1,10 +1,12 @@
 #include "NetworkCoordinator.h"
+#include "config/NetworkTiming.h"
 #include "protocol/RustInterfacePump.h"
 #include "transport/TcpClientSet.h"
 #include "transport/RnsAutoInterface.h"
 #include "transport/WiFiInterface.h"
 #include <esp_netif.h>
 #include <new>
+#include <algorithm>
 
 namespace handheld {
 namespace {
@@ -15,6 +17,13 @@ uint32_t staScope() {
     auto* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     return sta ? esp_netif_get_netif_impl_index(sta) : 1;
 }
+}
+void NetworkCoordinator::deferAuto(uint32_t now) {
+    WiFi.enableIpV6();
+    _deferred = true; _deferredAt = _autoCheckedAt = now;
+    _autoCheckMs = network_timing::AutoInitialMs;
+    _autoRetryMs = network_timing::AutoRetryMs;
+    _autoNoticeSent = false;
 }
 void NetworkCoordinator::retireTransports() {
     // Detach before driver stop/delete: late owned frames cannot use old keys.
@@ -59,27 +68,40 @@ uint8_t NetworkCoordinator::poll(const UserSettings& settings, unsigned long rns
     if (connectedNow && !_connected) {
         _connected = true; events |= Connected;
         _reload = true;
-        if (settings.autoIfaceEnabled) {
-            WiFi.enableIpV6(); _deferred = true; _deferredAt = uint32_t(millis());
-        }
     }
     const uint32_t now = uint32_t(millis());
-    if (_deferred && now - _deferredAt >= 1500) {
+    if (!settings.autoIfaceEnabled && (_deferred || _auto.isOnline())) {
+        _pump.attachAuto(nullptr); _auto.stop(); _deferred = false;
+    }
+    if (_connected && settings.autoIfaceEnabled && !_deferred && !_auto.isOnline())
+        deferAuto(now);
+    if (_deferred && now - _autoCheckedAt >= _autoCheckMs) {
+        _autoCheckedAt = now;
         const IPv6Address address = WiFi.localIPv6();
         if (linkLocal(address)) {
-            _deferred = false; _lastLinkCheck = now;
             if (_auto.start(settings.autoIfaceGroupId.c_str(), settings.autoIfaceMaxPeers,
                             (const uint8_t*)address, staScope())) {
+                _deferred = false; _lastLinkCheck = now;
                 _pump.attachAuto(&_auto); events |= AutoStarted;
-            } else { _auto.stop(); events |= AutoFailed; }
-        } else if (now - _deferredAt >= 10000) {
-            _deferred = false; events |= AutoTimeout;
+            } else {
+                _auto.stop(); events |= AutoFailed;
+                _autoCheckMs = _autoRetryMs;
+                _autoRetryMs = std::min(_autoRetryMs * 2, network_timing::AutoRetryMaxMs);
+            }
+        } else {
+            _autoCheckMs = network_timing::AutoPollMs;
+            if (!_autoNoticeSent && now - _deferredAt >= network_timing::AutoNoticeMs) {
+                _autoNoticeSent = true; events |= AutoTimeout;
+            }
         }
     }
-    if (_auto.isOnline() && _connected && now - _lastLinkCheck >= 2000) {
+    if (_auto.isOnline() && _connected && now - _lastLinkCheck >= network_timing::AutoPollMs) {
         _lastLinkCheck = now;
         const IPv6Address address = WiFi.localIPv6();
         if (linkLocal(address)) _auto.notifyLinkChange((const uint8_t*)address, staScope());
+        else {
+            _pump.attachAuto(nullptr); _auto.stop(); deferAuto(now);
+        }
     }
     if (_reload && _connected) {
         _reload = false;

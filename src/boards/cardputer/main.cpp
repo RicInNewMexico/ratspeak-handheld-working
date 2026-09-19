@@ -1001,9 +1001,9 @@ void loop() {
         if (events & handheld::NetworkCoordinator::Disconnected)
             Serial.println("[WIFI] STA disconnected, old transports detached");
         if (events & handheld::NetworkCoordinator::AutoTimeout)
-            Serial.println("[AUTOIFACE] SLAAC timeout — no link-local after 10s");
+            Serial.println("[AUTOIFACE] Still waiting for IPv6 link-local; discovery will retry");
         if (events & handheld::NetworkCoordinator::AutoFailed)
-            Serial.println("[AUTOIFACE] Socket startup failed");
+            Serial.println("[AUTOIFACE] Socket startup failed; discovery will retry");
     }
 
     // 7. Announce manager deferred saves (contacts + name cache)

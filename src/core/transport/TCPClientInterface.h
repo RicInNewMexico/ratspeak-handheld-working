@@ -75,7 +75,7 @@ private:
     static uint8_t _txBuffer[TX_BUFFER_SIZE];
     static uint8_t _wrapBuffer[WRAP_BUFFER_SIZE];
 
-    // Exponential reconnect backoff: 1s → ×2 (+0-20% jitter) → 5min cap
+    // Exponential reconnect backoff: 1s → ×2 (+0-20% jitter) → 1min cap
     unsigned long _reconnectBackoff = 1000;
 
     // Hub transport_id for Header2 wrapping (learned from incoming Header2 packets)
@@ -94,7 +94,6 @@ private:
     static constexpr uint8_t FRAME_START = 0x7E;
     static constexpr uint8_t FRAME_ESC   = 0x7D;
     static constexpr uint8_t FRAME_XOR   = 0x20;
-    static constexpr unsigned long TCP_KEEPALIVE_TIMEOUT_MS = 300000; // 5 min
 
 public:
     unsigned long lastRxTime() const { return _lastRxTime; }

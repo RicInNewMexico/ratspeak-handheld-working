@@ -1,4 +1,5 @@
 #include "WiFiConnection.h"
+#include "config/NetworkTiming.h"
 #include "transport/WiFiInterface.h"
 #include <esp_wifi.h>
 #include <atomic>
@@ -46,7 +47,7 @@ bool WiFiConnection::connected() const {
     return _state != State::Disabled && WiFi.status() == WL_CONNECTED && WiFi.SSID() == _ssid;
 }
 void WiFiConnection::retry(uint32_t now) {
-    static constexpr uint32_t backoff[] = {5000, 15000, 60000, 300000};
+    static constexpr uint32_t backoff[] = {5000, 15000, 30000, network_timing::ReconnectMaxMs};
     _deadline = now + backoff[std::min<unsigned>(_attempt, 3)];
     if (_attempt < 3) ++_attempt;
     _state = State::Waiting;
@@ -64,7 +65,7 @@ WiFiConnection::Transition WiFiConnection::poll() {
             _scanOutcome = ScanResult::Failed;
             releaseScan();
         } else {
-            _scanDeadline = static_cast<uint32_t>(millis()) + 15000;
+            _scanDeadline = static_cast<uint32_t>(millis()) + network_timing::WifiScanMs;
         }
         return Transition::None;
     }
@@ -89,7 +90,7 @@ WiFiConnection::Transition WiFiConnection::poll() {
     }
     if (!_scanRequested && static_cast<int32_t>(now - _deadline) >= 0) {
         WiFi.begin(_ssid.c_str(), _password.c_str());
-        _state = State::Connecting; _deadline = now + 8000;
+        _state = State::Connecting; _deadline = now + network_timing::WifiConnectMs;
     }
     return Transition::None;
 }
@@ -101,9 +102,8 @@ void WiFiConnection::releaseScan() {
 void WiFiConnection::pollActiveScan() {
     const auto result = WiFi.scanComplete();
     if (result == WIFI_SCAN_RUNNING && static_cast<int32_t>(static_cast<uint32_t>(millis()) - _scanDeadline) < 0) return;
-    // Arduino can report WIFI_SCAN_FAILED at its own six-second deadline
-    // without stopping the driver scan. Retire it before deleting results or
-    // allowing a retry, also when our longer owner deadline was not reached.
+    // A terminal SDK error need not stop the driver scan. Retire it before
+    // deleting results or allowing a retry, including the owner's deadline.
     if (result < 0) {
         esp_wifi_scan_stop();
         Serial.printf("[WIFI] Scan failed (status=%d elapsed=%lums heap=%lu largest=%lu)\n",
