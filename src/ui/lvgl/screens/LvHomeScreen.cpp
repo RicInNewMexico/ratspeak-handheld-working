@@ -4,6 +4,7 @@
 #include "LvInput.h"
 #include "LxmFaceAvatar.h"
 #include "config/UserConfig.h"
+#include "util/DisplayName.h"
 #include <Arduino.h>
 #include "fonts/fonts.h"
 
@@ -334,15 +335,11 @@ void LvHomeScreen::refreshUI() {
     _lastUptime = upMins;
     _lastHeap = heap;
 
-    String displayName;
-    if (_cfg && !_cfg->settings().displayName.isEmpty()) {
-        displayName = _cfg->settings().displayName;
-    } else if (_backend) {
-        String dh = _backend->destinationHashHex();
-        displayName = "Ratspeak.org-" + dh.substring(0, 3);
-    } else {
-        displayName = DEVICE_NAME;
-    }
+    const String destination = _backend ? _backend->destinationHashHex() : String();
+    char fallback[16];
+    const String displayName = handheld::deviceDisplayName(
+        _cfg ? _cfg->settings().displayName.c_str() : nullptr,
+        destination.c_str(), DEVICE_NAME, fallback);
     lv_label_set_text(_lblName, displayName.c_str());
 
     String avatarSeed = displayName;

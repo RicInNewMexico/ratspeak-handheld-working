@@ -547,6 +547,11 @@ void setup() {
     // Initialize radio
     bootScreen.setProgress(0.4f, "Starting radio...");
     ui.render();
+    // This board owns the LoRa/SD bus. The shared driver expects it to be
+    // initialized before its first probe; keep both chip selects idle.
+    pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
+    pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
+    loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
     if (flashReady && enableCapLoRaRfSwitch() && radio.begin(LORA_DEFAULT_FREQ)) {
         radio.setSpreadingFactor(LORA_DEFAULT_SF);
         radio.setSignalBandwidth(LORA_DEFAULT_BW);
@@ -568,11 +573,7 @@ void setup() {
     bool sdInitializationFailed = false;
     bootScreen.setProgress(0.65f, "Checking SD card...");
     ui.render();
-    if (!flashReady) {
-        // Recovery mounts only the SD bus; no modem/RF initialization runs.
-        loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
-        pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
-    }
+    // The bus is also ready for SD recovery when flash blocked modem startup.
     if (sdStore.begin(&loraSPI, SD_CS)) {
         if (flashReady) {
             sdInitializationFailed = !sdStore.formatForRsDeck();

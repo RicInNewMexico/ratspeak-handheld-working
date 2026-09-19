@@ -3,6 +3,7 @@
 #include "config/Config.h"
 #include "radio/RadioPresets.h"
 #include "protocol/ProtocolBackend.h"
+#include "util/DisplayName.h"
 #include <algorithm>
 
 static void drawFitted(M5Canvas& canvas, const char* text, int x, int y, int maxW) {
@@ -51,13 +52,12 @@ void HomeScreen::render(M5Canvas& canvas) {
 
     Theme::useUiFont(canvas);
     canvas.setTextColor(Theme::TEXT_PRIMARY);
-    if (_userConfig && !_userConfig->settings().displayName.isEmpty()) {
-        drawFitted(canvas, _userConfig->settings().displayName.c_str(),
-                   cardX + pad, cardY + headlineY, cardW - pad * 2);
-    } else {
-        canvas.setTextColor(Theme::MUTED);
-        canvas.drawString("(no name set)", cardX + pad, cardY + headlineY);
-    }
+    const String destination = _backend ? _backend->destinationHashHex() : String();
+    char fallback[16];
+    drawFitted(canvas, handheld::deviceDisplayName(
+                   _userConfig ? _userConfig->settings().displayName.c_str() : nullptr,
+                   destination.c_str(), DEVICE_NAME, fallback),
+               cardX + pad, cardY + headlineY, cardW - pad * 2);
 
     Theme::useSmallFont(canvas);
     canvas.setTextColor(Theme::SECONDARY);
