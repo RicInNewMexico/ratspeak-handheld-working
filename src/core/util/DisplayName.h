@@ -4,10 +4,13 @@
 #include <string.h>
 
 namespace handheld {
+inline constexpr char DEVICE_NAME_PREFIX[] = "Ratspeak.org-";
+inline constexpr size_t DEVICE_NAME_FALLBACK_SIZE = sizeof(DEVICE_NAME_PREFIX) + 3;
 // UI fallback only: an unnamed identity stays unnamed in storage and announces.
 // Share the same address-derived home label across both handheld renderers.
 inline const char* deviceDisplayName(const char* name, const char* destination,
-                                    const char* device, char (&fallback)[16]) {
+                                    const char* device,
+                                    char (&fallback)[DEVICE_NAME_FALLBACK_SIZE]) {
     if (name && *name) return name;
     if (destination && strlen(destination) == 32) {
         bool hexadecimal = true;
@@ -17,9 +20,10 @@ inline const char* deviceDisplayName(const char* name, const char* destination,
                   (c >= 'A' && c <= 'F'))) hexadecimal = false;
         }
         if (hexadecimal) {
-            memcpy(fallback, "Ratspeak.org-", 12);
-            memcpy(fallback + 12, destination, 3);
-            fallback[15] = '\0';
+            constexpr size_t prefixSize = sizeof(DEVICE_NAME_PREFIX) - 1;
+            memcpy(fallback, DEVICE_NAME_PREFIX, prefixSize);
+            memcpy(fallback + prefixSize, destination, 3);
+            fallback[prefixSize + 3] = '\0';
             return fallback;
         }
     }

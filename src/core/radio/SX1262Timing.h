@@ -41,8 +41,18 @@ namespace handheld::sx1262_timing {
 // Handheld TCXO startup is programmed in 15.625 us units. Calibration from
 // RC standby can restart it, then still needs the existing 500 ms work budget.
 constexpr uint32_t tcxoStartupTicks = 0x00A000;
+constexpr uint32_t tcxoStartupMs = (tcxoStartupTicks + 63) / 64;
+
+// BUSY covers the programmed clock delay plus the transition itself. Allow a
+// full second beyond that delay for device variation; an observed 806 ms
+// Cardputer cold start exceeded the old fixed 800 ms cap. This is an upper
+// bound only: callers proceed as soon as BUSY clears.
+constexpr uint32_t tcxoTimeoutMs() {
+    return tcxoStartupMs + 1000;
+}
+
 constexpr uint32_t calibrationTimeoutMs(bool usesTcxo) {
-    return 500 + (usesTcxo ? (tcxoStartupTicks + 63) / 64 : 0);
+    return 500 + (usesTcxo ? tcxoStartupMs : 0);
 }
 
 // SX126x SetModulationParams bandwidth codes, not the saved/UI labels.

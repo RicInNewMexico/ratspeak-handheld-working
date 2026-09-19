@@ -241,7 +241,7 @@ bool SX1262::startXoscRobust() {
             delay(10);
             standby();
         }
-        if (waitOnBusy(800)) {
+        if (waitOnBusy(handheld::sx1262_timing::tcxoTimeoutMs())) {
             clearDeviceErrors();
             return !_ioFailed;
         }
@@ -308,7 +308,7 @@ void SX1262::enableTCXO() {
         constexpr uint32_t ticks = handheld::sx1262_timing::tcxoStartupTicks;
         uint8_t buf[4] = {LORA_TCXO_VOLTAGE, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
         executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
-    waitOnBusy(800);
+        waitOnBusy(handheld::sx1262_timing::tcxoTimeoutMs());
     }
 }
 
@@ -846,7 +846,7 @@ void SX1262::handleLowDataRate() {
 void SX1262::standby() {
     uint8_t byte = _tcxo ? MODE_STDBY_XOSC_6X : MODE_STDBY_RC_6X;
     executeOpcode(OP_STANDBY_6X, &byte, 1);
-    waitOnBusy(_tcxo ? 800 : 100);
+    waitOnBusy(_tcxo ? handheld::sx1262_timing::tcxoTimeoutMs() : 100);
 }
 
 void SX1262::sleep() {

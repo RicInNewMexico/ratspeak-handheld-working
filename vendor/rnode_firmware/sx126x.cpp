@@ -832,7 +832,11 @@ void sx126x::receive(int size) {
 void sx126x::standby() {
   uint8_t byte = MODE_STDBY_XOSC_6X; // STDBY_XOSC
   executeOpcode(OP_STANDBY_6X, &byte, 1);
+  #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
+    waitOnBusy(handheld::sx1262_timing::tcxoTimeoutMs());
+  #else
   waitOnBusy(800);
+  #endif
 }
 
 void sx126x::sleep() {
@@ -868,7 +872,11 @@ void sx126x::enableTCXO() {
       uint8_t buf[4] = {MODE_TCXO_3_0V_6X, uint8_t(ticks >> 16), uint8_t(ticks >> 8), uint8_t(ticks)};
     #endif
     executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);
+    #if BOARD_MODEL == BOARD_TDECK || BOARD_MODEL == BOARD_TPAGER || BOARD_MODEL == BOARD_CARDPUTER_ADV
+      waitOnBusy(handheld::sx1262_timing::tcxoTimeoutMs());
+    #else
     waitOnBusy(800);
+    #endif
   #endif
 }
 

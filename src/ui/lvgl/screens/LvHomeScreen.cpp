@@ -336,7 +336,7 @@ void LvHomeScreen::refreshUI() {
     _lastHeap = heap;
 
     const String destination = _backend ? _backend->destinationHashHex() : String();
-    char fallback[16];
+    char fallback[handheld::DEVICE_NAME_FALLBACK_SIZE];
     const String displayName = handheld::deviceDisplayName(
         _cfg ? _cfg->settings().displayName.c_str() : nullptr,
         destination.c_str(), DEVICE_NAME, fallback);

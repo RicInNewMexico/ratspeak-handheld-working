@@ -53,7 +53,7 @@ void HomeScreen::render(M5Canvas& canvas) {
     Theme::useUiFont(canvas);
     canvas.setTextColor(Theme::TEXT_PRIMARY);
     const String destination = _backend ? _backend->destinationHashHex() : String();
-    char fallback[16];
+    char fallback[handheld::DEVICE_NAME_FALLBACK_SIZE];
     drawFitted(canvas, handheld::deviceDisplayName(
                    _userConfig ? _userConfig->settings().displayName.c_str() : nullptr,
                    destination.c_str(), DEVICE_NAME, fallback),
