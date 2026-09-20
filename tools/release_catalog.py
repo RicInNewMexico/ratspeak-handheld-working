@@ -28,7 +28,6 @@ class Partition:
 @dataclass(frozen=True)
 class Board:
     artifact_prefix: str
-    app_suffix: str
     flash_size: str
     partition_csv: str
     standalone_partition_csv: str
@@ -56,7 +55,7 @@ class Board:
     def app_name(self, mode: str) -> str:
         if mode not in APPLICATIONS:
             raise ValueError(f"unsupported application: {mode}")
-        return f"{self.artifact_prefix}-{mode}-{self.app_suffix}.bin"
+        return f"{self.package_name(mode)}.bin"
 
     def partitions(self, root: Path = ROOT, *, standalone: bool = False) -> dict[str, Partition]:
         path = self.standalone_partition_csv if standalone else self.partition_csv
@@ -142,7 +141,7 @@ def load_boards(path: Path = ROOT / "tools/release_boards.json") -> dict[str, Bo
                 continue
             if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_./-]+", value):
                 raise ValueError(f"{name}: invalid catalog value")
-        for value in (board.artifact_prefix, board.app_suffix, board.rnode_target, board.rnode_prep_target):
+        for value in (board.artifact_prefix, board.rnode_target, board.rnode_prep_target):
             if not re.fullmatch(r"[a-z][a-z0-9_-]*", value):
                 raise ValueError(f"{name}: invalid artifact name or build target")
         if not re.fullmatch(r"[a-z][a-z0-9_-]*\.bin", board.post_build_image):
@@ -225,8 +224,8 @@ def make_settings(device: str) -> dict[str, str]:
         "FLASH_SIZE": board.flash_size,
         "RNODE_TARGET": board.rnode_target,
         "RNODE_PREP_TARGET": board.rnode_prep_target,
-        "LAUNCHER_STANDALONE_NAME": board.app_name("standalone").removesuffix(".bin"),
-        "LAUNCHER_RNODE_NAME": board.app_name("rnode").removesuffix(".bin"),
+        "APP_STANDALONE_NAME": board.app_name("standalone").removesuffix(".bin"),
+        "APP_RNODE_NAME": board.app_name("rnode").removesuffix(".bin"),
         "POST_BUILD_IMAGE": board.post_build_image,
         "STANDALONE_FLASH_FREQ": board.standalone_flash_freq or "",
         "STANDALONE_FACTORY_OFFSET": hex(board.factory_app_offset("standalone")),

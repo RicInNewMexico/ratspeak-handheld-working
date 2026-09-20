@@ -78,6 +78,12 @@ updates. **Back up your identity and data before flashing**; see the
 [backup and installation guide](https://docs.ratspeak.org/docs/hardware/flashing-firmware#before-flashing)
 if your device already has firmware installed.
 
+Files use the device names `tdeck`, `pager`, and `cardputer`: for example,
+`pager-full.zip`, `pager-standalone.zip`, and `pager-rnode.zip`. Standalone and
+RNode also have raw application files, `pager-standalone.bin` and `pager-rnode.bin`.
+ZIPs install complete firmware layouts; the corresponding raw BIN contains only
+that application.
+
 Raw application BINs preserve data only when written to the matching application
 slot without erasing flash or changing the partition table. The correct slot
 depends on the installed layout; a raw BIN is not a replacement for a full

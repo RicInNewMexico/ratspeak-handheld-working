@@ -123,13 +123,13 @@ package: full-image standalone-image rnode-only-image
 	rm -f $(DIST_DIR)/$(FULL_NAME).zip \
 	      $(DIST_DIR)/$(STANDALONE_NAME).zip \
 	      $(DIST_DIR)/$(RNODE_ONLY_NAME).zip \
-	      $(DIST_DIR)/$(LAUNCHER_STANDALONE_NAME).bin \
-	      $(DIST_DIR)/$(LAUNCHER_RNODE_NAME).bin
+	      $(DIST_DIR)/$(APP_STANDALONE_NAME).bin \
+	      $(DIST_DIR)/$(APP_RNODE_NAME).bin
 	python3 tools/package_merged_zip.py --image $(FULL_BIN) --name $(FULL_NAME) --device $(DEVICE) --package full --flash-size $(FLASH_SIZE) --output $(DIST_DIR)/$(FULL_NAME).zip
 	python3 tools/package_merged_zip.py --image $(STANDALONE_BIN) --name $(STANDALONE_NAME) --device $(DEVICE) --package standalone --flash-size $(FLASH_SIZE) --output $(DIST_DIR)/$(STANDALONE_NAME).zip
 	python3 tools/package_merged_zip.py --image $(RNODE_ONLY_BIN) --name $(RNODE_ONLY_NAME) --device $(DEVICE) --package rnode --flash-size $(FLASH_SIZE) --output $(DIST_DIR)/$(RNODE_ONLY_NAME).zip
-	cp $(STANDALONE_APP_BIN) $(DIST_DIR)/$(LAUNCHER_STANDALONE_NAME).bin
-	cp $(RNODE_BIN) $(DIST_DIR)/$(LAUNCHER_RNODE_NAME).bin
+	cp $(STANDALONE_APP_BIN) $(DIST_DIR)/$(APP_STANDALONE_NAME).bin
+	cp $(RNODE_BIN) $(DIST_DIR)/$(APP_RNODE_NAME).bin
 
 package-all:
 	@for device in $(SUPPORTED_DEVICES); do \
