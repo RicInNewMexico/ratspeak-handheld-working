@@ -180,7 +180,7 @@ public:
     void reset() {
         _document.reset(); _arena.reset();
         if (_borrowed) legacyMessageArena().release();
-        else std::free(_memory);
+        else freeAlignedStorage(_memory);
         _memory = nullptr; _exceptional = _borrowed = false;
     }
     void normal() {
@@ -188,11 +188,11 @@ public:
         _document.reset(); _arena.reset();
         if (_exceptional) {
             if (_borrowed) legacyMessageArena().release();
-            else std::free(_memory);
+            else freeAlignedStorage(_memory);
             _memory = nullptr; _borrowed = false;
         }
         _exceptional = false;
-        if (!_memory) _memory = std::malloc(Budget::JsonAllocator);
+        if (!_memory) _memory = allocateAlignedStorage(Budget::JsonAllocator);
         if (_memory) {
             _arena.emplace(_memory, Budget::JsonAllocator); _document.emplace(&*_arena);
         } else _document.emplace(&_normal); // zero-budget allocator reports failure
@@ -219,7 +219,7 @@ public:
             if (!Budget::canReserveLegacy(ESP.getFreeHeap(), ESP.getMaxAllocHeap())) {
                 _document.emplace(&_normal); return Error::Allocation;
             }
-            _memory = std::malloc(Budget::LegacyScratch);
+            _memory = allocateAlignedStorage(Budget::LegacyScratch);
         }
         if (!_memory) { _document.emplace(&_normal); return Error::Allocation; }
         _exceptional = true;

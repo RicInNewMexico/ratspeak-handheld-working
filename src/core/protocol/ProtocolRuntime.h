@@ -68,6 +68,7 @@ public:
     const char* backendName() const override { return "rust"; }
 
     void loop() override;
+    bool pollRadioBeforeBlockingWork() override;
     // Shutdown / explicit persist: force the peer-ratchet table out (the ring is written
     // synchronously at rotation, so it is never pending here).
     bool persistData() override;

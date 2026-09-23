@@ -1,8 +1,10 @@
 #include "LvMemory.h"
 #include "runtime/FactoryResetRecovery.h"
 #include "runtime/DiscoveryStartup.h"
+#include "hal/NetworkTime.h"
 #include "radio/RadioSettings.h"
 #include "diagnostics/DeviceDiagnostics.h"
+#include "diagnostics/LvglUiSnapshot.h"
 // =============================================================================
 // rsDeck — Main Entry Point
 // LilyGo T-Deck Plus: LovyanGFX Direct UI + Rust Reticulum backend + LXMF Messaging
@@ -323,6 +325,7 @@ static void printAutoIface() {
         static_cast<unsigned long>(network.autoDeferredElapsed()));
     Serial.println("======================");
 }
+static handheld::diagnostics::RemoteUiBridge remoteUi;
 static handheld::DeviceDiagnostics diagnostics(radio, rustLoraIface, *backend, announceManager,
     radioOnline, "T-Deck Plus", "RSDECK-LXMF-TEST:", "RSDECK_TEST_1234567890", manualAnnounce);
 
@@ -370,6 +373,7 @@ static void bootTraceStage(const char* label) {
 // =============================================================================
 
 void setup() {
+    diagnostics.remoteUi = &remoteUi;
     ratspeakRetainComponentId(RATSPEAK_COMPONENT_ID("tdeck", "standalone"));
 #ifdef PROTOCOL_PACKET_TRACE
     diagnostics.traceWifi = [](const char* ssid, const char* password) {
@@ -398,7 +402,22 @@ void setup() {
     Power::enablePeripherals();
 
     // Step 2: Serial
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+    // Fit an entire semantic reply plus ordinary logs before any writer starts.
+    // HWCDC's default 256-byte queue forces large replies through its lossy
+    // disconnected fallback or blocking drain path.
+    const bool remoteUiTxReady = Serial.setTxBufferSize(
+        handheld::diagnostics::RemoteUiReplyDelivery::TxCapacity) ==
+        handheld::diagnostics::RemoteUiReplyDelivery::TxCapacity;
+    Serial.setTxTimeoutMs(handheld::diagnostics::RemoteUiReplyDelivery::WriteTimeoutMs);
+#endif
     Serial.begin(SERIAL_BAUD);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+    if (!remoteUiTxReady) {
+        remoteUi.close();
+        Serial.println("[SERIAL] USB UI unavailable: TX queue allocation failed");
+    }
+#endif
     delay(100);
     Serial.println();
     Serial.println("=================================");
@@ -891,6 +910,7 @@ void setup() {
     deviceService.startScan = []() { wifiConnection.startScan(); };
     deviceService.finishScan = [](String& json) { return wifiConnection.finishScan(json); };
     deviceService.closeAdmissions = []() {
+        remoteUi.close();
         announceScheduler.stop();
         network.closeAdmissions(); protocolRuntime.beginMaintenance(rustLoraIface);
     };
@@ -1195,6 +1215,96 @@ static void applyUiSettings() {
 
 }
 
+// UI owner only. Physical and USB keys use exactly the same screen, overlay,
+// shortcut and LVGL arbitration; USB has no separate settings/send path.
+static void dispatchKey(const KeyEvent& evt) {
+    LvInput::noteKeyActivity();
+
+    // Help overlay intercepts all keys when visible
+    if (lvHelpOverlay.isVisible()) {
+        lvHelpOverlay.handleKey(evt);
+    }
+    // QR controls own navigation while the overlay is visible.
+    else if (lvQrOverlay.isVisible()) {
+        lvQrOverlay.handleKey(evt);
+    }
+    else {
+        // Screen-local input owns the keyboard. This keeps message and
+        // settings text entry from being preempted by global shortcuts.
+        bool consumed = ui.handleKey(evt);
+        if (!consumed) {
+            bool hotkeyAllowed = !ui.isBootMode() || (evt.ctrl && evt.character == 'h');
+            bool hotkeyConsumed = hotkeyAllowed && hotkeys.process(evt);
+            if (!hotkeyConsumed) {
+
+                // Feed to LVGL input system only if the screen didn't consume it
+                const bool tabNavigation = !evt.ctrl && !ui.isBootMode() &&
+                    (evt.character == ',' || evt.character == '/' || evt.left || evt.right);
+                if (!tabNavigation) LvInput::feedKey(evt);
+
+                // Tab cycling: ,=left /=right OR trackball left/right (only if screen didn't consume)
+                if (!evt.ctrl && !ui.isBootMode()) {
+                    bool tabLeft  = (evt.character == ',') || evt.left;
+                    bool tabRight = (evt.character == '/') || evt.right;
+                    if (tabLeft) {
+                        ui.lvTabBar().cycleTab(-1);
+                        int tab = ui.lvTabBar().getActiveTab();
+                        if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
+                    }
+                    if (tabRight) {
+                        ui.lvTabBar().cycleTab(1);
+                        int tab = ui.lvTabBar().getActiveTab();
+                        if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Both input sources use the screen's existing hold action. QR keeps ownership;
+// an unconsumed hold blanks the screen, as the trackball hold always has.
+static void dispatchLongPress() {
+    if (lvQrOverlay.isVisible() || !ui.handleLongPress()) {
+        powerMgr.forceScreenOff();
+    }
+}
+
+static KeyEvent remoteKey(const handheld::diagnostics::RemoteUiRequest& request) {
+    using handheld::diagnostics::RemoteUiAction;
+    using handheld::diagnostics::RemoteUiKey;
+    KeyEvent event;
+    if (request.action == RemoteUiAction::Character) {
+        event.character = request.character;
+        event.space = request.character == ' ';
+        event.ctrl = request.ctrl;
+    } else switch (request.key) {
+        case RemoteUiKey::Up: event.up = true; break;
+        case RemoteUiKey::Down: event.down = true; break;
+        case RemoteUiKey::Left: event.left = true; break;
+        case RemoteUiKey::Right: event.right = true; break;
+        case RemoteUiKey::Enter: event.enter = true; break;
+        case RemoteUiKey::Backspace: event.del = true; break;
+        case RemoteUiKey::Escape: event.character = 0x1b; break;
+        case RemoteUiKey::Tab: event.tab = true; break;
+    }
+    return event;
+}
+
+static void finishRemoteUi(const handheld::diagnostics::RemoteUiRequest& request, bool wokeOnly) {
+    handheld::diagnostics::LvglUiState state;
+    state.title = ui.getScreen() ? ui.getScreen()->title() : "";
+    state.tab = ui.lvTabBar().getActiveTab();
+    state.asleep = !powerMgr.isScreenOn();
+    state.boot = ui.isBootMode();
+    state.overlay = lvHelpOverlay.isVisible() ? "help" : lvQrOverlay.isVisible() ? "qr" : "none";
+    state.focus = LvInput::group() ? lv_group_get_focused(LvInput::group()) : nullptr;
+    lv_obj_update_layout(lv_scr_act());
+    remoteUi.finish(handheld::diagnostics::LvglUiSnapshot::encode(
+        remoteUi.buffer(), handheld::diagnostics::RemoteUiBridge::Capacity,
+        request, state, wokeOnly, lv_scr_act(), lv_layer_top(), lv_layer_sys()));
+}
+
 static void serviceNetworkPoll() {
     // This callback runs only after successful storage/Service owner adoption.
     // Claim once before persistence; Failed startup must retain its boot count.
@@ -1227,7 +1337,9 @@ static void serviceNetworkPoll() {
     }
 
 
+    if (!backend->pollRadioBeforeBlockingWork()) return;
     if (bootComplete) pollScheduledAnnounces();
+    if (!backend->pollRadioBeforeBlockingWork()) return;
 
     // Protocol polling owns LXMF; flush deferred announce metadata here.
     if (announceManager) announceManager->loop();
@@ -1238,7 +1350,7 @@ static void serviceNetworkPoll() {
     if (networkEvents & handheld::NetworkCoordinator::Connected) {
         Serial.printf("[WIFI] STA connected: %s\n", WiFi.localIP().toString().c_str());
         const char* tz = currentPosixTZ();
-        configTzTime(tz, "pool.ntp.org", "time.nist.gov");
+        handheld::configureNetworkTime(tz);
         Serial.printf("[NTP] Time sync started (TZ=%s)\n", tz);
     }
     if (networkEvents & handheld::NetworkCoordinator::Disconnected)
@@ -1317,53 +1429,37 @@ void loop() {
 
     // 2. Long-press dispatch — screen blanking is the default if no screen consumes it
     if (inputManager.hadLongPress()) {
-        if (lvQrOverlay.isVisible() || !ui.handleLongPress()) {
-            powerMgr.forceScreenOff();
-        }
+        dispatchLongPress();
     }
 
     // 3. Key event dispatch
     if (inputManager.hasKeyEvent() && !wakeOnlyInput) {
         const KeyEvent& evt = inputManager.getKeyEvent();
-        LvInput::noteKeyActivity();
+        dispatchKey(evt);
+    }
 
-        // Help overlay intercepts all keys when visible
-        if (lvHelpOverlay.isVisible()) {
-            lvHelpOverlay.handleKey(evt);
-        }
-        // QR controls own navigation while the overlay is visible.
-        else if (lvQrOverlay.isVisible()) {
-            lvQrOverlay.handleKey(evt);
-        }
-        else {
-            // Screen-local input owns the keyboard. This keeps message and
-            // settings text entry from being preempted by global shortcuts.
-            bool consumed = ui.handleKey(evt);
-            if (!consumed) {
-                bool hotkeyAllowed = !ui.isBootMode() || (evt.ctrl && evt.character == 'h');
-                bool hotkeyConsumed = hotkeyAllowed && hotkeys.process(evt);
-                if (!hotkeyConsumed) {
-
-                    // Feed to LVGL input system only if the screen didn't consume it
-                    const bool tabNavigation = !evt.ctrl && !ui.isBootMode() &&
-                        (evt.character == ',' || evt.character == '/' || evt.left || evt.right);
-                    if (!tabNavigation) LvInput::feedKey(evt);
-
-                    // Tab cycling: ,=left /=right OR trackball left/right (only if screen didn't consume)
-                    if (!evt.ctrl && !ui.isBootMode()) {
-                        bool tabLeft  = (evt.character == ',') || evt.left;
-                        bool tabRight = (evt.character == '/') || evt.right;
-                        if (tabLeft) {
-                            ui.lvTabBar().cycleTab(-1);
-                            int tab = ui.lvTabBar().getActiveTab();
-                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
-                        }
-                        if (tabRight) {
-                            ui.lvTabBar().cycleTab(1);
-                            int tab = ui.lvTabBar().getActiveTab();
-                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
-                        }
-                    }
+    handheld::diagnostics::RemoteUiRequest remoteRequest;
+    bool remotePending = remoteUi.take(remoteRequest);
+    bool remoteInput = false, remoteWokeOnly = false;
+    if (remotePending) {
+        if (!remoteUi.accepting() || !serviceClient.available() ||
+            serviceClient.status().state != handheld::ServiceState::Running || serviceClient.lifecycleStarted) {
+            remoteUi.fail(remoteRequest.id, "unavailable");
+            remotePending = false;
+        } else if (remoteRequest.action != handheld::diagnostics::RemoteUiAction::View) {
+            if (inputManager.hadActivity() || !LvInput::canAcceptKey()) {
+                remoteUi.fail(remoteRequest.id, "busy");
+                remotePending = false;
+            } else {
+                remoteWokeOnly = !powerMgr.isScreenOn();
+                powerMgr.activity();
+                handheld::inputObserved(millis());
+                LvInput::setEnabled(true);
+                remoteInput = true;
+                // Match a physical first press while asleep: wake, never act.
+                if (!remoteWokeOnly) {
+                    if (remoteRequest.action == handheld::diagnostics::RemoteUiAction::Hold) dispatchLongPress();
+                    else dispatchKey(remoteKey(remoteRequest));
                 }
             }
         }
@@ -1375,7 +1471,7 @@ void loop() {
     {
         unsigned long now = millis();
         unsigned long lvglInterval = powerMgr.isDimmed() ? 200 : LVGL_INTERVAL_MS;
-        bool inputBurst = inputManager.hadActivity();
+        bool inputBurst = inputManager.hadActivity() || remoteInput;
         LvInput::setEnabled(powerMgr.isScreenOn());
         if (powerMgr.isScreenOn() && (inputBurst || now - lastLvglTime >= lvglInterval)) {
             lastLvglTime = now;
@@ -1406,5 +1502,6 @@ void loop() {
             ui.update();
         }
     }
+    if (remotePending) finishRemoteUi(remoteRequest, remoteWokeOnly);
     yield();
 }

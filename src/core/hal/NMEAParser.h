@@ -18,6 +18,7 @@ struct NMEAData {
     uint16_t year = 0;
     uint8_t month = 0, day = 0;
     bool timeValid = false;
+    bool timeFromFix = false;  // Active status in this RMC, independent of location tracking.
 
     // Position (from RMC + GGA)
     double latitude = 0.0;     // decimal degrees, negative = south
@@ -170,21 +171,32 @@ private:
     // $xxRMC — Recommended Minimum
     // fields: type,time,status,lat,N/S,lon,E/W,speed,course,date,magvar,E/W,mode
     bool parseRMC(char* fields[], int n) {
-        // Always parse time — module's battery-backed RTC provides time
-        // even without satellite fix (status='V'). Year/epoch validation
-        // in GPSManager::syncSystemTime() guards against garbage data.
-        if (strlen(fields[1]) >= 6) {
+        // A complete RMC may provide approximate battery-backed RTC time even
+        // with status V. Only this sentence's active status establishes a fix;
+        // satellite counts from an earlier GGA cannot validate its time.
+        _data.timeValid = false;
+        _data.timeUpdated = false;
+        _data.timeFromFix = false;
+        auto sixDigits = [](const char* value) {
+            if (strlen(value) < 6) return false;
+            for (int i = 0; i < 6; ++i) if (value[i] < '0' || value[i] > '9') return false;
+            return true;
+        };
+        if (sixDigits(fields[1]) && n >= 10 && sixDigits(fields[9])) {
             _data.hour   = (fields[1][0] - '0') * 10 + (fields[1][1] - '0');
             _data.minute = (fields[1][2] - '0') * 10 + (fields[1][3] - '0');
             _data.second = (fields[1][4] - '0') * 10 + (fields[1][5] - '0');
-        }
-        if (n >= 10 && strlen(fields[9]) >= 6) {
             _data.day   = (fields[9][0] - '0') * 10 + (fields[9][1] - '0');
             _data.month = (fields[9][2] - '0') * 10 + (fields[9][3] - '0');
             int yy      = (fields[9][4] - '0') * 10 + (fields[9][5] - '0');
             _data.year  = 2000 + yy;
-            _data.timeValid = true;
-            _data.timeUpdated = true;
+            const bool leap = (_data.year % 4 == 0 && (_data.year % 100 != 0 || _data.year % 400 == 0));
+            static constexpr uint8_t monthDays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            _data.timeValid = _data.hour < 24 && _data.minute < 60 && _data.second < 60 &&
+                _data.month >= 1 && _data.month <= 12 && _data.day >= 1 &&
+                _data.day <= monthDays[_data.month - 1] + (_data.month == 2 && leap);
+            _data.timeUpdated = _data.timeValid;
+            _data.timeFromFix = _data.timeValid && fields[2][0] == 'A';
         }
 
         // Location requires active fix (status='A')

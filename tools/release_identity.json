@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "product": "ratspeak-handheld",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "archive_toolchain": "rustc 1.95.0-nightly (95e5bda86 2026-04-15) (1.95.0.0)",
   "sources": {
     "rsReticulumLite": {
-      "commit": "afddf8a54ee15db979d3eebdb60b0fb70a428c60",
+      "commit": "fe9144945fa9cddb3aa6ae967bf8e0d0e5fa4227",
       "role": "firmware"
     },
     "rsLXMFLite": {
-      "commit": "4ba7a6ac42e3af1ba27fe9b9d9086427dd1e749e",
+      "commit": "e8c19f18338263be9bb801f563509759d91482f3",
       "role": "firmware"
     },
     "rsReticulum": {

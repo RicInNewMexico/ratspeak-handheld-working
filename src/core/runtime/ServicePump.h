@@ -8,6 +8,9 @@ class ServiceHandler {
 public:
     virtual ~ServiceHandler() = default;
     virtual void poll() = 0;
+    // Leave queued commands owned by the mailbox while the radio needs timely
+    // completion service; poll() still runs on every tick, including lifecycle.
+    virtual bool readyForCommand() { return true; }
     // A handler either completes the reserved slot, or retains it while a
     // nonblocking operation is pending. Retained slots are never re-dispatched.
     virtual void execute(uint8_t slot) = 0;
@@ -20,6 +23,7 @@ public:
     void tick(uint32_t generation) {
         _handler.poll();
         for (unsigned count = 0; count < 2; ++count) {
+            if (!_handler.readyForCommand()) break;
             const auto slot = _mailbox.take();
             if (slot == ServiceMailbox::NoSlot) break;
             if (_mailbox.request(slot).generation != generation) {

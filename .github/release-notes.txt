@@ -1,16 +1,12 @@
-Ratspeak Handheld beta for T-Deck Plus and T-Pager, combining rsDeck and rsPager
-with a Rust Reticulum/LXMF core. Networking and storage run separately from the
-interface. Cardputer Adv remains in testing.
+Fixes and improvements for T-Deck, T-Pager and Cardputer:
 
-For the launcher and both modes, download `rsdeck-full.zip` or `rspager-full.zip`
-and upload it to the [web flasher](https://ratspeak.org/download.html#dl-custom).
-The `*-standalone.zip` and `*-rnode.zip` packages install one mode only.
+- Fix valid saved messages sometimes showing “Message could not be read”.
+- Keep conversation loading responsive and chat previews up to date.
+- Remove the permanent conversation toolbar and restore the centered empty state.
+- Improve route discovery and retries when a direct LoRa path stops working.
+- Reject overheard packets addressed to another relay without blocking later delivery.
+- Restore radio reception before slow storage work and improve clock synchronization handling.
 
-These are fresh-install packages, not data-preserving updates. Back up before
-flashing, including when Full Erase is off. There is no automatic migration from
-rsDeck or rsPager. The [installation guide](https://docs.ratspeak.org/docs/hardware/flashing-firmware#before-flashing)
-covers backups, rollback and importing an existing identity key.
+Cardputer support remains beta and requires a Cap LoRa-1262 with an antenna.
 
-The separate application `.bin` files are for launcher or layout-specific use,
-not the normal web-flasher upload. Source, checksums and license notices are
-included with this release.
+Factory ZIP installs erase settings, identity and internal message history. Back up anything you want to keep before installing.

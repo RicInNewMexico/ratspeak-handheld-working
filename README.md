@@ -131,6 +131,28 @@ and cross-target checks. To rebuild the included libraries, install esp-rs
 already be cached. The script records source revisions and hashes in
 [`PROVENANCE.txt`](protocol/prebuilt/xtensa-esp32s3/PROVENANCE.txt).
 
+### T-Deck USB control
+
+Current source builds let you inspect and operate Standalone over USB on macOS
+or Linux. Close other serial monitors, then use the T-Deck's serial port:
+
+```sh
+python3 tools/handheld-control.py --port /dev/cu.usbmodemXXXX view
+python3 tools/handheld-control.py --port /dev/cu.usbmodemXXXX key down
+python3 tools/handheld-control.py --port /dev/cu.usbmodemXXXX hold
+python3 tools/handheld-control.py --port /dev/cu.usbmodemXXXX text 'Bench message'
+```
+
+`view` reads visible text and focus without waking the screen; use its `next`
+cursor with `view --offset N` for more text. Password fields are redacted.
+Navigation uses the normal keyboard handlers. `hold` performs the trackball's
+long-press action, including blanking the screen when no screen action applies.
+The first key or hold on a sleeping screen only wakes it; `text` accepts
+printable ASCII and never presses Enter.
+Use `key enter` to confirm, or `char h --ctrl` for Ctrl+H. If a response is lost,
+inspect with `view` before repeating input. The published 2.2.0 images predate
+these controls.
+
 ## License
 
 The standalone firmware, launcher, and build tools are

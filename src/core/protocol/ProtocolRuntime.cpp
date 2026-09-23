@@ -114,7 +114,7 @@ bool ProtocolRuntime::startEngines(FlashStore* flash, SDStore* sd, MessageStore*
     // Ratchet state must be restored BEFORE the first announce: the ring blob is
     // identity-signed, so this runs after the identity load, and announcing a ratchet
     // whose private key we no longer hold would strand peer traffic.
-    _ratchets.begin(flash, _ctx, _identityHash, RustClock::epochSecs(), _clock.nowMs());
+    _ratchets.begin(flash, _ctx, _identityHash, RustClock::synchronizedEpochSecs(), _clock.nowMs());
     // Seed the KeyMap with our own identity so self-continuity holds.
     _keymap.learn(_destHash, _publicKey, _clock.nowMs());
 
@@ -304,8 +304,9 @@ void ProtocolRuntime::beginMaintenance(LoRaInterface& radio) {
 void ProtocolRuntime::pollMaintenance() {
     handheld::assertDeviceOwner();
     if (!_maintenanceRadio) return;
-    pollReceive();
     _maintenanceRadio->pollMaintenance();
+    if (!_maintenanceRadio->pollBeforeBlockingWork()) return;
+    pollReceive();
 }
 
 bool ProtocolRuntime::maintenanceDrained() const {
@@ -359,11 +360,18 @@ void ProtocolRuntime::end() {
     _maintenanceRadio = nullptr;
 }
 
+bool ProtocolRuntime::pollRadioBeforeBlockingWork() {
+    handheld::assertDeviceOwner();
+    return _maintenanceRadio ? _maintenanceRadio->pollBeforeBlockingWork()
+                             : _pump.pollRadioBeforeBlockingWork();
+}
+
 void ProtocolRuntime::loop() {
     handheld::assertDeviceOwner();
     if (_maintenanceRadio) { pollMaintenance(); return; }
     if (!_ctx || !_nodeOpen) return;
     _pump.loop();
+    if (!pollRadioBeforeBlockingWork()) return;
     // Fire a scheduled path-response re-announce off the ingest callstack once the grace window
     // elapses (fix map §4) — a burst of requests inside the window collapses into this one answer.
     if ((_announceTiming & PathPending) && int32_t(uint32_t(millis()) - _pathRespPendingUntil) >= 0) {
@@ -371,6 +379,7 @@ void ProtocolRuntime::loop() {
         _pathRespPendingUntil = 0;
         sendPathResponseAnnounce();
     }
+    if (!pollRadioBeforeBlockingWork()) return;
     if ((_announceTiming & NormalPending) && int32_t(uint32_t(millis()) - _normalAnnouncePendingUntil) >= 0) {
         _announceTiming &= ~NormalPending;
         _normalAnnouncePendingUntil = 0;
@@ -381,11 +390,16 @@ void ProtocolRuntime::loop() {
             _announceTiming |= NormalPending;
         }
     }
+    if (!pollRadioBeforeBlockingWork()) return;
     if (_enginesUp) {
         _lxmf.loop();
+        if (!pollRadioBeforeBlockingWork()) return;
         _links.loop();
         _resources.loop();
     }
+    // TX is asynchronous. Do not hold the owner in flash while the modem
+    // finishes into standby and a remote peer immediately returns a proof.
+    if (!pollRadioBeforeBlockingWork()) return;
     _ratchets.flushPeers(_ctx, millis(), false);
     _keymap.loop(_clock.nowMs());
 }
@@ -426,7 +440,7 @@ void ProtocolRuntime::onAnnounceEvent(const rs_handheld_announce_event_t& ev, ui
     if (_maintenanceRadio) return;
     // Transport freshness was accepted before this event. KeyMap continuity must then accept
     // before the peer-ratchet table is allowed to change.
-    if (!RustAnnouncePolicy::accept(_ctx, _keymap, _ratchets, ev, RustClock::epochSecs(),
+    if (!RustAnnouncePolicy::accept(_ctx, _keymap, _ratchets, ev, RustClock::synchronizedEpochSecs(),
                                     _clock.nowMs())) {
         Serial.println("[RUST] announce key-change rejected (continuity defense)");
         return;
@@ -539,7 +553,7 @@ ProtocolRuntime::AnnounceResult ProtocolRuntime::emitAnnounce(const uint8_t* app
     uint64_t wireValue = 0;
     uint8_t ratchet[32] = {};
     const RustRatchetStore::AnnounceMode mode = _ratchets.prepareAnnounce(
-        _ctx, RustClock::epochSecs(), _clock.nowMs(), wireValue, ratchet);
+        _ctx, RustClock::synchronizedEpochSecs(), _clock.nowMs(), wireValue, ratchet);
     if (mode == RustRatchetStore::AnnounceMode::Deferred) {
         Serial.println("[RUST] announce coalesced until wire time advances");
         return AnnounceResult::Deferred;

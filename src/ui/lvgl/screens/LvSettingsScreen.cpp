@@ -1,4 +1,5 @@
 #include "LvSettingsScreen.h"
+#include "LvPrivacy.h"
 #include <new>
 #include "Theme.h"
 #include "LvTheme.h"
@@ -1501,6 +1502,7 @@ void LvSettingsScreen::rebuildItemList() {
 
         if (!valStr.isEmpty()) {
             lv_obj_t* valLbl = lv_label_create(row);
+            if (isWiFiPasswordLabel(item.label)) LvPrivacy::markSensitive(valLbl);
             lv_obj_set_style_text_font(valLbl, font, 0);
             lv_obj_set_style_text_color(valLbl, lv_color_hex(valColor), 0);
             lv_obj_set_style_text_align(valLbl, LV_TEXT_ALIGN_RIGHT, 0);

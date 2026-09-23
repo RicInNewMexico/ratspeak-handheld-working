@@ -20,6 +20,9 @@ public:
 
     // Lifecycle / tick.
     virtual void loop() = 0;
+    // Owner-only, bounded TX completion service. False defers blocking work
+    // until the active radio burst finishes and receive mode is restored.
+    virtual bool pollRadioBeforeBlockingWork() { return true; }
     virtual bool persistData() = 0;
 
     // Local endpoint identity + lxmf.delivery destination hashes.

@@ -51,6 +51,7 @@ public:
     void finishPeerDelete(const uint8_t peer[16], const handheld::storage::Result&);
     int queuedCount() const;
     void loop();
+    void onLinkSetupFailure(const uint8_t peer[16], const rs_handheld_route_t& failedRoute);
     void onResourceOutcome(Ticket, bool delivered);
     handheld::TxOffer offerResource(Ticket, uint8_t iface, const uint8_t* raw, size_t length, uint64_t bornMs);
     uint64_t resourceSendBinding(Ticket, uint8_t iface, const uint8_t linkId[16]) const;
@@ -113,6 +114,7 @@ private:
     void preparePacket(Ticket, const uint8_t*, size_t, uint8_t interfaceId, bool broadcast);
     void offerPrepared(Ticket);
     void setStatus(Ticket, LXMFStatus);
+    void finishRouteFailure(Ticket);
     bool validatesReceipt(const OutgoingRow&, const rs_handheld_local_frame_t&) const;
     bool buildPacketProof(const uint8_t packetHash[32], uint8_t raw[128], size_t& length);
     void requestUnknownSource(const uint8_t source[16]);

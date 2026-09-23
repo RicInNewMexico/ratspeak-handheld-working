@@ -90,7 +90,7 @@ public:
             return Result::None;
         }
         if (c == '\r' || c == '\n' || c == ' ' || c == '\t') return Result::None;
-        if (c && std::strchr("FPLHJKYWC", c)) {
+        if (c && std::strchr("FPLHJKYWCU", c)) {
             _line[0] = c;
             _length = 1;
             _active = true;

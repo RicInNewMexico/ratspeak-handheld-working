@@ -109,6 +109,7 @@ private:
     Link* findByLinkId(const uint8_t linkId[16]);
     Link* allocLink();
     void closeLink(Link& l);
+    void failSetup(Link& l);
     bool sendLinkFrame(Link& l, uint8_t context, const uint8_t* payload, size_t len,
                        uint8_t* outHash = nullptr);
     bool frameToDest(uint8_t ifaceId, const uint8_t dest[16], uint8_t headerType,

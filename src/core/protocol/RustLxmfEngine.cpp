@@ -470,6 +470,34 @@ uint64_t RustLxmfEngine::resourceSendBinding(Ticket ticket, uint8_t iface, const
     return (uint64_t(generation) << 8) | slot;
 }
 
+void RustLxmfEngine::finishRouteFailure(Ticket ticket) {
+    auto* value = row(ticket);
+    if (!value) return;
+    value->flags &= ~Rediscover;
+    releaseBody(ticket);
+    if (value->proofCount) {
+        value->phase = Phase::Grace; value->flags |= ProofGrace;
+        value->receiptSince = _d.clock->nowMs();
+        setStatus(ticket, LXMFStatus::UNCONFIRMED);
+    } else {
+        value->phase = Phase::Settled;
+        setStatus(ticket, LXMFStatus::FAILED);
+    }
+}
+
+void RustLxmfEngine::onLinkSetupFailure(const uint8_t peer[16], const rs_handheld_route_t& failedRoute) {
+    if (!_accepting) return;
+    for (auto& value : _rows) {
+        if ((value.phase != Phase::Ready && value.phase != Phase::Reading) ||
+            !(value.flags & (PreferLink | ViaLink)) || value.flags & Suppressed ||
+            value.desired == LXMFStatus::DELIVERED || memcmp(value.peer, peer, 16)) continue;
+        // The Link manager owns the failed handshake. Its waiting messages
+        // reuse the same route-recovery operation as a failed packet receipt.
+        value.route = failedRoute; value.flags |= Rediscover;
+        value.discoveryCount = 0; value.nextAttempt = 0;
+    }
+}
+
 void RustLxmfEngine::attempt(Ticket ticket) {
     auto* value = row(ticket);
     if (!value || !_accepting || value->flags & Suppressed || _body.slot != ticket.slot ||
@@ -479,18 +507,33 @@ void RustLxmfEngine::attempt(Ticket ticket) {
     if (rs_handheld_rns_route(_d.ctx, value->peer, now, &route) != RS_HANDHELD_OK) {
         value->nextAttempt = now + TX_RETRY_MS; releaseBody(ticket); value->phase = Phase::Ready; return;
     }
+    if (value->linkSince && _d.links && !_d.links->linkActive(value->peer) &&
+        now - value->linkSince > LINK_WAIT_TIMEOUT_MS + _d.pump->interfaceTxWaitMs(value->route.interface_id, 4)) {
+        finishRouteFailure(ticket); return;
+    }
+    if ((value->flags & (PreferLink | ViaLink)) && route.kind == RS_HANDHELD_ROUTE_BROADCAST)
+        value->flags |= Rediscover;
     if (value->flags & Rediscover) {
         const auto& old = value->route;
         const bool same = route.kind == old.kind && route.interface_id == old.interface_id &&
             route.header_type == old.header_type && route.hops == old.hops && !memcmp(route.next_hop, old.next_hop, 16);
-        value->flags &= ~Rediscover;
-        if (route.kind == RS_HANDHELD_ROUTE_BROADCAST || same) {
+        // A remembered public key does not make a failed radio route usable.
+        // Keep this bounded discovery operation alive if its response is lost;
+        // otherwise the two remaining packet attempts become unroutable
+        // HEADER_1 broadcasts. Only the first request retires the failed path.
+        // Any path learned after that retirement is new, even if its fields
+        // happen to match the old route.
+        if (route.kind == RS_HANDHELD_ROUTE_BROADCAST || (!value->discoveryCount && same)) {
+            if (value->discoveryCount >= DISCOVERY_MAX_ATTEMPTS) {
+                finishRouteFailure(ticket); return;
+            }
             uint8_t tag[16]; RustEntropy::fill(tag, sizeof(tag));
-            rs_handheld_rns_drop_path(_d.ctx, value->peer);
-            rs_handheld_rns_request_path(_d.ctx, value->peer, tag, route.interface_id, now);
-            value->discoveryCount = 1; value->nextAttempt = now + DISCOVERY_RETRY_MS;
+            if (!value->discoveryCount) rs_handheld_rns_drop_path(_d.ctx, value->peer);
+            rs_handheld_rns_request_path(_d.ctx, value->peer, tag, old.interface_id, now);
+            ++value->discoveryCount; value->nextAttempt = now + DISCOVERY_RETRY_MS;
             releaseBody(ticket); value->phase = Phase::Ready; return;
         }
+        value->flags &= ~Rediscover;
     }
     bool havePub = _d.keymap && _d.keymap->recall(value->peer, value->publicKey);
     int32_t hasPath = 0, hasNext = 0; uint8_t hops = 0, next[16], pathPub[64];
@@ -516,7 +559,7 @@ void RustLxmfEngine::attempt(Ticket ticket) {
         uint8_t ephemeral[32], iv[16], cipher[600], destination[16], messageId[32]; size_t cipherLength = 0;
         RustEntropy::fill(ephemeral, sizeof(ephemeral)); RustEntropy::fill(iv, sizeof(iv));
         const auto built = rs_handheld_rns_lxmf_build(_d.ctx, value->publicKey, value->timestamp,
-            RustClock::epochSecs(), now, _body.bytes, header.titleLength, _body.bytes + header.titleLength,
+            RustClock::synchronizedEpochSecs(), now, _body.bytes, header.titleLength, _body.bytes + header.titleLength,
             header.contentLength, ephemeral, iv, cipher, sizeof(cipher), &cipherLength, destination, messageId);
         secureZero(ephemeral, sizeof(ephemeral)); secureZero(iv, sizeof(iv));
         if (built == RS_HANDHELD_OK && !memcmp(destination, value->peer, 16)) {
@@ -535,13 +578,11 @@ void RustLxmfEngine::attempt(Ticket ticket) {
     if (!_d.links || !_d.resources || route.kind != RS_HANDHELD_ROUTE_DIRECT) {
         releaseBody(ticket); value->phase = Phase::Settled; setStatus(ticket, LXMFStatus::FAILED); return;
     }
+    value->route = route;
     if (!_d.links->ensureLink(value->peer, value->publicKey, route)) {
         releaseBody(ticket); value->phase = Phase::Ready;
         if (!value->linkSince) value->linkSince = now;
         value->nextAttempt = now + TX_RETRY_MS;
-        if (now - value->linkSince > LINK_WAIT_TIMEOUT_MS + _d.pump->interfaceTxWaitMs(route.interface_id, 4)) {
-            value->phase = Phase::Settled; setStatus(ticket, LXMFStatus::FAILED);
-        }
         return;
     }
     // Resource assembly and outgoing encoding share one synchronous workspace.
@@ -624,7 +665,7 @@ void RustLxmfEngine::advance(Ticket ticket) {
                 value->receiptSince = now; setStatus(ticket, LXMFStatus::UNCONFIRMED);
         } else {
             value->phase = Phase::Ready; value->discoveryCount = 0;
-            if (value->proofCount == 1 && !(value->flags & PreferLink)) value->flags |= Rediscover;
+            if (!(value->flags & PreferLink)) value->flags |= Rediscover;
             setStatus(ticket, LXMFStatus::QUEUED);
         }
     }
@@ -653,15 +694,19 @@ void RustLxmfEngine::advance(Ticket ticket) {
     }
 }
 void RustLxmfEngine::loop() {
-    if (_polling) return;
+    if (_polling || (_d.pump && !_d.pump->pollRadioBeforeBlockingWork())) return;
     _polling = true;
     _incoming.poll();
+    if (_d.pump && !_d.pump->pollRadioBeforeBlockingWork()) { _polling = false; return; }
     if (!_d.store || !_d.clock) { _polling = false; return; }
     _d.store->poll();
     for (uint8_t i = 0; i < RowCount; ++i) settleStorage({_rows[i].generation, i});
     // One bounded attempt/read/status admission per selected row. A rotating
     // cursor gives backpressured and failed work the same finite loop budget.
     for (uint8_t processed = 0; processed < 3; ++processed) {
+        // An earlier row can start TX. Leave subsequent status/read writes for
+        // the next radio-ready pass, including the immediate storage profile.
+        if (_d.pump && !_d.pump->pollRadioBeforeBlockingWork()) break;
         const uint8_t index = _cursor; _cursor = (_cursor + 1) % RowCount;
         advance({_rows[index].generation, index});
     }

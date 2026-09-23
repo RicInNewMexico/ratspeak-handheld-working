@@ -26,6 +26,7 @@ public:
     void bindOwner();
     void tick();
     void poll() override;
+    bool readyForCommand() override;
     void execute(uint8_t slot) override;
     ServiceMailbox& mailbox() { return _mailbox; }
     Status& ownerStatus() { return _status; }

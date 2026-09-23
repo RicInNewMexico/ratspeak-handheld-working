@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "AlignedStorageMemory.h"
 
 namespace handheld::storage {
 
@@ -160,7 +161,8 @@ struct Budget {
     static constexpr size_t WorkerStack = 8192;
     static constexpr size_t RtosBookkeeping = 640; // Worker queue/task costs and reserve
     // Both profiles: MessageStore state216 + queue metadata56 + FS mutex84,
-    // plus156 bytes for allocator/descriptor reserve (measured Xtensa sizes).
+    // plus156 bytes for allocator/descriptor reserve (measured Xtensa sizes),
+    // including the normal arena's aligned-allocation padding/pointer.
     static constexpr size_t StoreBookkeeping = 512;
     static constexpr size_t IncomingRows = 4 * 80;
     static constexpr size_t ProofContexts = 12 * 160;
@@ -169,6 +171,7 @@ struct Budget {
     // ArduinoJson7 parses strings by ownership even from mutable input. Reserve
     // one arena and stream the file; no complete input/output JSON copy.
     static constexpr size_t LegacyScratch = 56 * 1024;
+    static constexpr size_t LegacyAllocation = LegacyScratch + AlignedStorageOverhead;
 
     static constexpr size_t payloadCapacity(bool cardputer, uint8_t slot) {
         return slot >= NormalSlots ? 0 :
@@ -183,7 +186,7 @@ struct Budget {
                IncomingRows + ProofContexts;
     }
     static constexpr bool canReserveLegacy(size_t freeBytes, size_t largestBlock) {
-        return freeBytes >= LegacyScratch + CardHeapFloor && largestBlock >= LegacyScratch;
+        return freeBytes >= LegacyAllocation + CardHeapFloor && largestBlock >= LegacyAllocation;
     }
 };
 

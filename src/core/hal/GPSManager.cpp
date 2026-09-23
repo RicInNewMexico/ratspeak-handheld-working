@@ -1,5 +1,6 @@
 #include "GPSManager.h"
 #include "runtime/TaskOwner.h"
+#include "hal/ClockConfidence.h"
 
 #if HAS_GPS
 
@@ -66,14 +67,12 @@ void GPSManager::loop() {
     NMEAData& d = _parser.data();
     if (d.timeUpdated) {
         d.timeUpdated = false;
-        // Prefer satellite-verified time (sats > 0), but allow the module's
-        // battery-backed RTC for the first sync so the clock appears on boot
-        // even without satellite lock (e.g., indoors). Year/epoch validation
-        // in syncSystemTime() guards against garbage data.
-        bool hasSatFix = (d.satellites > 0);
-        bool allowSync = hasSatFix || (_timeSyncCount == 0);
-        if (_timeEnabled && d.timeValid && allowSync && (millis() - _lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS || _timeSyncCount == 0)) {
-            syncSystemTime();
+        const bool allowSync = d.timeFromFix ||
+            (_timeSyncCount == 0 && handheld::ClockConfidence::canSeedApproximate());
+        const bool firstFix = d.timeFromFix && !handheld::ClockConfidence::synchronized();
+        if (_timeEnabled && d.timeValid && allowSync &&
+            (millis() - _lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS || _timeSyncCount == 0 || firstFix) &&
+            syncSystemTime()) {
             // Persist time to NVS so reboots without WiFi/GPS have approximate time
             persistToNVS();
             _lastPersistMs = millis();
@@ -119,14 +118,14 @@ uint32_t GPSManager::fixAgeMs() const {
     return millis() - _lastFixMs;
 }
 
-void GPSManager::syncSystemTime() {
+bool GPSManager::syncSystemTime() {
     const NMEAData& d = _parser.data();
-    if (!d.timeValid) return;
+    if (!d.timeValid || (!d.timeFromFix && !handheld::ClockConfidence::canSeedApproximate())) return false;
 
     // Sanity check year range (reject spoofed/garbage data)
     if (d.year < 2024 || d.year > 2030) {
         Serial.printf("[GPS] Rejected time: year %d out of range\n", d.year);
-        return;
+        return false;
     }
 
     // Convert GPS UTC date/time to Unix epoch using arithmetic
@@ -145,15 +144,16 @@ void GPSManager::syncSystemTime() {
     time_t epoch = (time_t)days * 86400 + d.hour * 3600 + d.minute * 60 + d.second;
     if (epoch < 1700000000) {
         Serial.printf("[GPS] Rejected time: epoch %ld too low\n", (long)epoch);
-        return;
+        return false;
     }
 
     struct timeval tv = {};
     tv.tv_sec = epoch;
     tv.tv_usec = 0;
-    settimeofday(&tv, nullptr);
+    if (settimeofday(&tv, nullptr) != 0) return false;
 
-    _timeValid = true;
+    _timeValid = d.timeFromFix;
+    if (d.timeFromFix) handheld::ClockConfidence::markSynchronized(epoch);
     _lastTimeSyncMs = millis();
     _timeSyncCount++;
 
@@ -161,12 +161,15 @@ void GPSManager::syncSystemTime() {
     setenv("TZ", _posixTZ, 1);
     tzset();
 
-    Serial.printf("[GPS] System time synced: %04d-%02d-%02d %02d:%02d:%02d UTC (sync #%lu, sats=%d)\n",
+    Serial.printf("[GPS] System time %s: %04d-%02d-%02d %02d:%02d:%02d UTC (sync #%lu, sats=%d)\n",
+                  d.timeFromFix ? "synced" : "approximate",
                   d.year, d.month, d.day, d.hour, d.minute, d.second,
                   (unsigned long)_timeSyncCount, (int)d.satellites);
+    return true;
 }
 
 void GPSManager::restoreTimeFromNVS() {
+    if (!handheld::ClockConfidence::canSeedApproximate()) return;
     Preferences prefs;
     if (!prefs.begin(NVS_NAMESPACE, true)) return;  // read-only
 
@@ -177,7 +180,7 @@ void GPSManager::restoreTimeFromNVS() {
         struct timeval tv = {};
         tv.tv_sec = (time_t)storedEpoch;
         tv.tv_usec = 0;
-        settimeofday(&tv, nullptr);
+        if (settimeofday(&tv, nullptr) != 0) return;
 
         // Set TZ
         setenv("TZ", _posixTZ, 1);

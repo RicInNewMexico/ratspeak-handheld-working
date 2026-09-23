@@ -107,6 +107,20 @@ void RustLinkManager::closeLink(Link& l) {
     l.state = State::Closed;
 }
 
+void RustLinkManager::failSetup(Link& l) {
+    // Full Rust expires failed endpoint Link routes and queues LXMF recovery.
+    // Report the failed route to that same outgoing owner instead of starting
+    // another handshake against a route already known to have failed.
+    rs_handheld_route_t failedRoute = {};
+    failedRoute.kind = RS_HANDHELD_ROUTE_DIRECT;
+    failedRoute.interface_id = l.iface;
+    failedRoute.header_type = l.hasNextHop ? 1 : 0;
+    failedRoute.hops = l.hops;
+    if (l.hasNextHop) memcpy(failedRoute.next_hop, l.nextHop, 16);
+    closeLink(l);
+    if (_d.lxmf) _d.lxmf->onLinkSetupFailure(l.peerDest, failedRoute);
+}
+
 void RustLinkManager::endAll() {
     for (auto& l : _links) closeLink(l);
 }
@@ -164,8 +178,8 @@ bool RustLinkManager::ensureLink(const uint8_t dest[16], const uint8_t pubkey[64
     if (l && l->state == State::InitRequested) {
         if (millis() - l->requestMs < l->establishmentTimeoutMs)
             return false;  // still establishing
-        closeLink(*l);  // timed out; re-establish below
-        l = nullptr;
+        failSetup(*l);
+        return false; // Let its owner recover the route before another handshake.
     }
     if (l && l->state == State::Stale) {
         closeLink(*l);  // peer went quiet past 2*keepalive; tear down and re-establish
@@ -585,7 +599,7 @@ void RustLinkManager::loop() {
         } else if (l.state == State::InitRequested) {
             if (now - l.requestMs > l.establishmentTimeoutMs) {
                 Serial.println("[RUST-LINK] link establishment timed out");
-                closeLink(l);
+                failSetup(l);
             }
         }
     }

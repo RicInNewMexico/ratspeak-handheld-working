@@ -104,6 +104,10 @@ void DeviceService::notice(const char* text) {
     ++_status.noticeRevision;
 }
 
+bool DeviceService::readyForCommand() {
+    return !_storageOwnerBound || _backend.pollRadioBeforeBlockingWork();
+}
+
 void DeviceService::poll() {
     // Start the reserved request's admission clock even while an older normal
     // command is retained. Claiming control does not grant teardown permission.
@@ -118,12 +122,17 @@ void DeviceService::poll() {
     // Only the reserved explicit recovery result is ours after refusal. The
     // setup owner retains every storage/engine/driver and outstanding credit.
     if (!_storageOwnerBound) return;
+    // Poll TX completion before even entering the storage executor. This also
+    // covers the immediate-I/O profile, where messages.poll can write flash.
+    if (!_backend.pollRadioBeforeBlockingWork()) { pollMaintenance(); return; }
     // Publish durable completions before protocol or UI consumers observe them.
     _messages.poll();
     // Observe UI cancellation before the pump can start another queued frame.
     pollSends();
     if (_status.state == ServiceState::Running && pollNetwork) pollNetwork();
     else if (!_maintenance.accepting() && pollSettlements) pollSettlements();
+    // Network/protocol work can have started a fresh asynchronous TX above.
+    if (!_backend.pollRadioBeforeBlockingWork()) { pollMaintenance(); return; }
     pollSends();
     pollStorageWrites();
     pollSettings();
@@ -270,7 +279,8 @@ void DeviceService::refreshStatus() {
     _status.statusRevision = _backend.lxmfStatusRevision();
     _status.flash = _flash.isReady();
     _status.sd = _sd.isReady();
-    if (!_lastStorageStatus || _lastStatus - _lastStorageStatus >= 5000) {
+    if ((!_lastStorageStatus || _lastStatus - _lastStorageStatus >= 5000) &&
+        _backend.pollRadioBeforeBlockingWork()) {
         storage::StorageLease lease;
         // The storage worker may own a long scan. Preserve the last sample
         // until it finishes; lease contention is not an empty filesystem.

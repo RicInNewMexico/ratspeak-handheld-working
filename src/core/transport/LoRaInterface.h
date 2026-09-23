@@ -20,6 +20,9 @@ public:
     bool start();
     void stop();
     void loop();
+    // Service only an already-started burst before the owner enters blocking
+    // storage work. Never start a queued packet here; completion restores RX.
+    bool pollBeforeBlockingWork();
 
     // Close admission without aborting an already-started burst. Only its
     // remaining physical frame/completion may progress until explicit stop.
@@ -82,7 +85,7 @@ private:
     handheld::TxOffer send_outgoing(const uint8_t* data, size_t len,
                                    const handheld::TxLease* lease = nullptr);
     bool transmitNow(const uint8_t* data, size_t len);
-    void pollActiveTx(bool completionOnly);
+    void pollActiveTx(bool completionOnly, bool drainQueued = true);
     bool drainTx();
     void discardExpired();
     void removeQueued(size_t index, handheld::TxReceiptEvent event = handheld::TxReceiptEvent::Dropped,

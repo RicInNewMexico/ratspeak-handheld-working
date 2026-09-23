@@ -76,6 +76,7 @@ public:
 
     // One pass: LoRa driver loop (TCP loops stay in the mains), tick, TX drain.
     void loop();
+    bool pollRadioBeforeBlockingWork();
 
     // Hardware-only TX primitives. Engines select one with rs_handheld_rns_route();
     // announces and genuinely pathless endpoint traffic use sendAll().

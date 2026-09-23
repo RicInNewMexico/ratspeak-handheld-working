@@ -1,6 +1,7 @@
 #pragma once
 #include "diagnostics/SerialCommand.h"
 #include "diagnostics/TraceCommand.h"
+#include "diagnostics/RemoteUi.h"
 #include "protocol/ProtocolBackend.h"
 #include "reticulum/AnnounceManager.h"
 #include "transport/LoRaInterface.h"
@@ -20,6 +21,7 @@ public:
     void (*extraDump)() = nullptr;
     bool (*boardCommand)(char) = nullptr;
     const char* boardHelp = nullptr;
+    diagnostics::RemoteUiBridge* remoteUi = nullptr;
 #ifdef PROTOCOL_PACKET_TRACE
     void (*traceWifi)(const char*, const char*) = nullptr;
     void (*traceTcp)(const char*, uint16_t) = nullptr;
@@ -27,7 +29,7 @@ public:
     void poll();
     // Settlement only: never reads serial bytes or admits another command.
     void pollResults();
-    bool resultsDrained() const { return !diagnosticSend.valid(); }
+    bool resultsDrained() const { return !diagnosticSend.valid() && (!remoteUi || remoteUi->drained()); }
     void pollSamples();
     void printDiagnostics();
     void runRadioTest();
@@ -47,6 +49,7 @@ private:
     const char* rawPayload;
     void (*manualAnnounce)();
     diagnostics::SerialCommand commands;
+    diagnostics::RemoteUiReplyDelivery remoteUiDelivery;
     diagnostics::SampleWindow rssiWindow, irqWindow;
     int rssiMin = 0, rssiMax = -200, rssiSamples = 0;
     rs::Bytes diagnosticLiteLinkId;

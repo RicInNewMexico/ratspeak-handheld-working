@@ -184,6 +184,10 @@ void RustInterfacePump::detachTcpAll() {
         invalidateInterface(id);
 }
 
+bool RustInterfacePump::pollRadioBeforeBlockingWork() {
+    return !_lora || _lora->pollBeforeBlockingWork();
+}
+
 void RustInterfacePump::loop() {
     if (!_ctx || !_clock) return;
     const auto* context = _ctx;

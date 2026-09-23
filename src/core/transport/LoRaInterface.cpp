@@ -307,7 +307,20 @@ bool LoRaInterface::transmitNow(const uint8_t* data, size_t len) {
     return true;
 }
 
-void LoRaInterface::pollActiveTx(bool completionOnly) {
+bool LoRaInterface::pollBeforeBlockingWork() {
+    if (_maintenanceTxFailed) return false;
+    if (_txPending && !_changingOwner && !_notifying) {
+        if (!_online || !_radio || !_radio->isRadioOnline()) {
+            // Maintenance must retain an incomplete burst for its failure/reset
+            // policy; losing the radio does not make that burst drained.
+            if (_maintenance) _maintenanceTxFailed = true;
+            else stop();
+        } else pollActiveTx(_maintenance, false);
+    }
+    return !_txPending && !_splitTxPending;
+}
+
+void LoRaInterface::pollActiveTx(bool completionOnly, bool drainQueued) {
     if (_txPending) {
         if (!_radio->isTxBusy()) {
             if (_radio->txFailed()) {
@@ -348,7 +361,7 @@ void LoRaInterface::pollActiveTx(bool completionOnly) {
 
             _txLength = 0;
 
-            if (!completionOnly && !drainTx()) _radio->receive();
+            if (!completionOnly && !(drainQueued && drainTx())) _radio->receive();
         }
         return;
     }

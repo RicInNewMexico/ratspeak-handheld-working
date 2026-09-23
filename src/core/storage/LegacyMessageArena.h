@@ -1,6 +1,7 @@
 #pragma once
 
 #include "StorageContract.h"
+#include "AlignedStorageMemory.h"
 #include <Arduino.h>
 #include <atomic>
 #include <cstdlib>
@@ -15,11 +16,11 @@ public:
     bool reserve() {
         if (_memory) return true;
         if (!Budget::canReserveLegacy(ESP.getFreeHeap(), ESP.getMaxAllocHeap())) return false;
-        void* memory = std::malloc(Budget::LegacyScratch);
+        void* memory = allocateAlignedStorage(Budget::LegacyScratch);
         if (!memory) return false;
         if (ESP.getFreeHeap() < Budget::CardHeapFloor ||
             ESP.getMaxAllocHeap() < Budget::CardLargestBlockFloor) {
-            std::free(memory); return false;
+            freeAlignedStorage(memory); return false;
         }
         _memory = memory;
         return true;

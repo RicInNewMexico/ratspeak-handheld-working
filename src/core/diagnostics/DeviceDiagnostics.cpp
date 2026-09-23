@@ -221,11 +221,11 @@ bool DeviceDiagnostics::sendDiagnosticLxmf(size_t length, const char* explicitDe
         reinterpret_cast<const uint8_t*>(payload), length, false);
     const bool ok = submitted.accepted();
     if (ok) diagnosticSend = submitted.ticket;
-    Serial.printf("[SERIAL] LXMF test %s: len=%u dest=%s queue=%d\n",
+    Serial.printf("[SERIAL] LXMF test %s: len=%u dest=%s queue=%d rejection=%u\n",
                   ok ? "save pending" : "rejected",
                   (unsigned)length,
                   peerLabel.c_str(),
-                  backend->lxmfQueuedCount());
+                  backend->lxmfQueuedCount(), static_cast<unsigned>(submitted.rejection));
     return ok;
 }
 
@@ -357,6 +357,20 @@ void DeviceDiagnostics::handleSerialLineCommand(const char* line) {
     if (!line || !*line) return;
 
     switch ((char)std::toupper((unsigned char)line[0])) {
+        case 'U': {
+            diagnostics::RemoteUiRequest request;
+            const char* error = nullptr;
+            if (!diagnostics::parseRemoteUi(line, request)) error = "invalid";
+            else if (!remoteUi) error = "unsupported";
+            else {
+                const auto admission = remoteUi->submit(request);
+                if (admission == diagnostics::RemoteUiBridge::Admission::Busy) error = "busy";
+                if (admission == diagnostics::RemoteUiBridge::Admission::Unavailable) error = "unavailable";
+            }
+            if (error) Serial.printf("[UICTRL] {\"id\":%lu,\"ok\":false,\"error\":\"%s\"}\n",
+                static_cast<unsigned long>(request.id), error);
+            break;
+        }
         case 'F': {
             int32_t value = 0;
             if (!diagnostics::parseInteger(line + 1, value) || value < 0) {
@@ -432,6 +446,7 @@ void DeviceDiagnostics::printSerialHelp() {
     Serial.println("[SERIAL] commands: ? help | a announce | t raw-test | d diag | r rssi | i irq | p tx-power-cycle | m min-power | q iq | +/- freq");
     Serial.println("[SERIAL] line commands: F<hz> exact-frequency | P<dBm> exact-tx-power | L<len> [dest_hash] LXMF test");
     Serial.println("[SERIAL] lite relay diag: H<len> [dest] Header2 data | J [dest] linkreq | K<ctx_hex> link-data | Y<ctx_hex> link-proof");
+    if (remoteUi) Serial.println("[SERIAL] UI: U <id> view [offset] | U <id> hold | U <id> key <up/down/left/right/enter/backspace/escape/tab> | U <id> char <32..126> [ctrl]");
     if (boardHelp) Serial.println(boardHelp);
 }
 
@@ -528,6 +543,25 @@ void DeviceDiagnostics::printMemory() const {
 }
 void DeviceDiagnostics::pollResults() {
     assertDeviceOwner();
+    const char* readyData = nullptr;
+    size_t readyLength = 0;
+    if (remoteUi && remoteUi->result(readyData, readyLength)) {
+        bool connected = true;
+        size_t available = diagnostics::RemoteUiReplyDelivery::TxCapacity;
+#if defined(RSDECK) && ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+        // The ESP32-S3 HWCDC offline FIFO path can silently discard a reply.
+        // Waiting here also lets its native IN_EMPTY handshake establish the
+        // connection. Never enter write's slow drain loop with a large frame.
+        connected = static_cast<bool>(Serial);
+        const int writable = connected ? Serial.availableForWrite() : 0;
+        available = writable > 0 ? static_cast<size_t>(writable) : 0;
+#endif
+        remoteUiDelivery.poll(*remoteUi, static_cast<uint32_t>(millis()), connected, available,
+            [](const char* data, size_t length) {
+                // One mutex-protected write preserves framing beside logs.
+                return Serial.write(reinterpret_cast<const uint8_t*>(data), length);
+            });
+    }
     if (diagnosticSend.valid()) {
         outgoing::InitialResult result;
         const auto state = backend->lxmfPoll(diagnosticSend, result);

@@ -456,16 +456,17 @@ pub unsafe extern "C" fn rs_handheld_rns_packet_ingest_with_mode(
         };
         let mut action_code = ingest_action_code(action);
 
-        // Python 1.3.8 (Packet.py:247) parse-rejects raw hops >= PATHFINDER_M outright; the
-        // relay core drops them, and none of the endpoint post-processing below (contact
-        // surfacing, local delivery, path-request self-answer) may resurrect such a packet.
-        let hops_valid = PacketView::parse(raw)
-            .is_ok_and(|v| v.header.hops < rns_lite_core::constants::PATHFINDER_M);
+        // Endpoint post-processing must preserve core admission: an invalid hop count
+        // or another relay's next-hop address cannot be resurrected as a local packet.
+        let endpoint_admitted = PacketView::parse(raw).is_ok_and(|v| {
+            v.header.hops < rns_lite_core::constants::PATHFINDER_M
+                && node.accepts_transport_address(&v.header)
+        });
 
         // Surface only an announce the transport freshness/quality policy actually accepted.
         // A signature-valid replay returns AnnounceIgnored (12) and must not reach KeyMap or the
         // peer-ratchet table. Other accepted aspects are still suppressed as contacts.
-        if hops_valid
+        if endpoint_admitted
             && matches!(
                 action,
                 IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
@@ -497,13 +498,13 @@ pub unsafe extern "C" fn rs_handheld_rns_packet_ingest_with_mode(
         // Local-delivery detection: an endpoint (transport_enabled=0) drops packets addressed
         // to it as non-forwardable. Re-classify a Dropped frame as a LocalFrame for our own
         // destination / a registered link / any proof, so C++ can run the LXMF/link/resource path.
-        if hops_valid
+        if endpoint_admitted
             && action == IngestAction::Dropped
             && !out_local.is_null()
             && classify_local_frame(ctx, raw, unsafe { &mut *out_local })
         {
             action_code = INGEST_LOCAL_FRAME;
-        } else if hops_valid && action == IngestAction::Dropped {
+        } else if endpoint_admitted && action == IngestAction::Dropped {
             if let Some(request) = classify_own_path_request(ctx, raw) {
                 // Endpoint path-request self-answer: the relay core has no cached path to us, so C++
                 // re-announces our lxmf.delivery dest as a PATH_RESPONSE (throttled). A literal

@@ -1,5 +1,6 @@
 #include "runtime/FactoryResetRecovery.h"
 #include "runtime/DiscoveryStartup.h"
+#include "hal/NetworkTime.h"
 #include "radio/RadioSettings.h"
 #include "diagnostics/DeviceDiagnostics.h"
 // =============================================================================
@@ -911,19 +912,22 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
-    messageStore.poll(); // owner settles durable results before protocol/UI work
+    // Keep the cooperative UI running, but service TX completion before
+    // background storage/settings work can occupy the radio owner.
+    const bool radioReady = backend->pollRadioBeforeBlockingWork();
+    if (radioReady) messageStore.poll();
     M5.update();
-    pollCardSettings();
-    pollCardRadioSettings();
-    if (maintenance.accepting()) {
+    if (radioReady) { pollCardSettings(); pollCardRadioSettings(); }
+    if (maintenance.accepting() && radioReady) {
         diagnostics.poll();
         diagnostics.pollSamples();
-    } else {
+    } else if (!maintenance.accepting()) {
         protocolRuntime.pollMaintenance();
         diagnostics.pollResults();
     }
     static unsigned long lastMetadataRetry = 0;
-    if (maintenance.accepting() && now - lastMetadataRetry >= 30000) {
+    if (maintenance.accepting() && now - lastMetadataRetry >= 30000 &&
+        backend->pollRadioBeforeBlockingWork()) {
         lastMetadataRetry = now;
         if (!identityMgr.flushPending()) Serial.println("[STORAGE] Identity metadata retry pending");
         if (!userConfig.flushPending(sdStore, flash)) Serial.println("[STORAGE] Settings backup retry pending");
@@ -976,16 +980,18 @@ void loop() {
         backend->loop();
         rnsDuration = millis() - rnsStart;
     }
-    if (messageView.pollSubmission()) ui.markContentDirty();
-    if (messageView.pollReadMarker()) ui.markContentDirty();
-    if (settingsScreen.pollNetworkResults()) ui.markContentDirty();
-    if (messageView.pollHistory(maintenance.accepting())) ui.markContentDirty();
-    if (messagesScreen.pollConversations(maintenance.accepting())) ui.markContentDirty();
-    if (messagesScreen.pollDeletion()) ui.markContentDirty();
+    if (backend->pollRadioBeforeBlockingWork()) {
+        if (messageView.pollSubmission()) ui.markContentDirty();
+        if (messageView.pollReadMarker()) ui.markContentDirty();
+        if (settingsScreen.pollNetworkResults()) ui.markContentDirty();
+        if (messageView.pollHistory(maintenance.accepting())) ui.markContentDirty();
+        if (messagesScreen.pollConversations(maintenance.accepting())) ui.markContentDirty();
+        if (messagesScreen.pollDeletion()) ui.markContentDirty();
+    }
     pollMaintenance();
 
     // Saved periodic cadence; startup begins only after committed onboarding.
-    if (maintenance.accepting() && bootComplete) pollScheduledAnnounces();
+    if (maintenance.accepting() && bootComplete && backend->pollRadioBeforeBlockingWork()) pollScheduledAnnounces();
 
     if (maintenance.accepting()) {
         const auto events = network.poll(userConfig.settings(), rnsDuration,
@@ -994,7 +1000,7 @@ void loop() {
             Serial.printf("[WIFI] STA connected: %s\n", WiFi.localIP().toString().c_str());
             static bool ntpStarted = false;
             if (!ntpStarted) {
-                configTzTime(currentPosixTZ(), "pool.ntp.org", "time.nist.gov");
+                handheld::configureNetworkTime(currentPosixTZ());
                 ntpStarted = true;
             }
         }
@@ -1007,7 +1013,7 @@ void loop() {
     }
 
     // 7. Announce manager deferred saves (contacts + name cache)
-    if (maintenance.accepting() && announceManager) {
+    if (maintenance.accepting() && announceManager && backend->pollRadioBeforeBlockingWork()) {
         announceManager->loop();
 
         // Periodic stale node eviction (every 30 min)

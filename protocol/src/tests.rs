@@ -4,6 +4,9 @@ use core::ffi::CStr;
 #[path = "tx_lifetime_tests.rs"]
 mod tx_lifetime;
 
+#[path = "routing_admission_tests.rs"]
+mod routing_admission;
+
 #[test]
 fn version_is_valid_cstring() {
     let p = rs_handheld_rns_version();

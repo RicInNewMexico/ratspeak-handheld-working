@@ -1,6 +1,7 @@
 #include "LvMemory.h"
 #include "runtime/FactoryResetRecovery.h"
 #include "runtime/DiscoveryStartup.h"
+#include "hal/NetworkTime.h"
 #include "radio/RadioSettings.h"
 #include "diagnostics/DeviceDiagnostics.h"
 // =============================================================================
@@ -1233,7 +1234,9 @@ static void serviceNetworkPoll() {
     }
 
 
+    if (!backend->pollRadioBeforeBlockingWork()) return;
     if (bootComplete) pollScheduledAnnounces();
+    if (!backend->pollRadioBeforeBlockingWork()) return;
 
     // Protocol polling owns LXMF; flush deferred announce metadata here.
     if (announceManager) announceManager->loop();
@@ -1244,7 +1247,7 @@ static void serviceNetworkPoll() {
     if (networkEvents & handheld::NetworkCoordinator::Connected) {
         Serial.printf("[WIFI] STA connected: %s\n", WiFi.localIP().toString().c_str());
         const char* tz = currentPosixTZ();
-        configTzTime(tz, "pool.ntp.org", "time.nist.gov");
+        handheld::configureNetworkTime(tz);
         Serial.printf("[NTP] Time sync started (TZ=%s)\n", tz);
     }
     if (networkEvents & handheld::NetworkCoordinator::Disconnected)

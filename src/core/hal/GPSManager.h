@@ -48,7 +48,7 @@ public:
     }
 
 private:
-    void syncSystemTime();
+    bool syncSystemTime();
     void restoreTimeFromNVS();
     void persistToNVS();
     bool tryBaudRate(uint32_t baud);

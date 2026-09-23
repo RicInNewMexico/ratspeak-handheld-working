@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include "AlignedStorageMemory.h"
 
 namespace handheld::storage {
 
@@ -20,13 +21,13 @@ public:
     JsonAllocator& operator=(const JsonAllocator&) = delete;
 
     void* allocate(size_t size) override {
-        if (size > _limit || sizeof(Header) > _limit - size ||
-            size + sizeof(Header) > _limit - _used || _attempts++ >= _failAfter)
+        if (size > _limit || headerBytes() > _limit - size ||
+            size + headerBytes() > _limit - _used || _attempts++ >= _failAfter)
             return nullptr;
-        auto* header = static_cast<Header*>(std::malloc(sizeof(Header) + size));
+        auto* header = static_cast<Header*>(allocateAlignedStorage(sizeof(Header) + size));
         if (!header) return nullptr;
         header->bytes = size;
-        _used += sizeof(Header) + size;
+        _used += headerBytes() + size;
         if (_used > _peak) _peak = _used;
         return header + 1;
     }
@@ -34,8 +35,8 @@ public:
     void deallocate(void* pointer) override {
         if (!pointer) return;
         auto* header = static_cast<Header*>(pointer) - 1;
-        _used -= sizeof(Header) + header->bytes;
-        std::free(header);
+        _used -= headerBytes() + header->bytes;
+        freeAlignedStorage(header);
     }
 
     void* reallocate(void* pointer, size_t size) override {
@@ -55,7 +56,7 @@ public:
     size_t used() const { return _used; }
     size_t peak() const { return _peak; }
     size_t attempts() const { return _attempts; }
-    static constexpr size_t headerBytes() { return sizeof(Header); }
+    static constexpr size_t headerBytes() { return sizeof(Header) + AlignedStorageOverhead; }
 
 private:
     struct alignas(std::max_align_t) Header { size_t bytes; };
