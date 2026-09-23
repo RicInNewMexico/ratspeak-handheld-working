@@ -177,10 +177,11 @@ bool MessageTransactions::nextPeer(const char* after, char output[33], Error& er
 }
 
 Error MessageTransactions::inspect(const RecordKey& key, unsigned which, const char* suffix,
-                                   MessageDocument& document, StoredRecordHeader& header) {
+                                   MessageDocument& document, StoredRecordHeader& header, bool* parsed) {
     char filePath[128]; path(key, which, filePath, suffix);
     auto store = medium(which); File file = store.open(filePath);
     if (!file) return Error::Read;
+    if (parsed) *parsed = true;
     const auto error = document.parse(file);
     if (error != Error::None) return error;
     header = {};
@@ -195,13 +196,19 @@ Error MessageTransactions::load(const RecordKey& key, MessageDocument& document,
     const auto cutoff = deletedThrough(key.peer, document, nullptr, &markerError);
     if (markerError != Error::None) return markerError;
     if (key.counter <= cutoff) return Error::Stale;
-    int best = -1; uint32_t revision = 0; _blockedMedia = _preferBackup = 0;
-    uint32_t primaryRevision[2] = {}; bool primaryValid[2] = {};
+    int best = -1, loaded = -1; uint32_t revision = 0; _blockedMedia = _preferBackup = 0;
+    uint32_t primaryRevision[2] = {}, backupRevision[2] = {};
+    bool primaryValid[2] = {}, backupValid[2] = {};
     Error failure = Error::Read;
-    for (unsigned candidate = 0; candidate < 4; ++candidate) {
+    // Inspect every copy, leaving the preferred (flash primary) copy last.
+    // The selected document usually remains in the existing scratch owner,
+    // avoiding another complete parse for every preview/status/body slice.
+    for (unsigned candidate : {3u, 2u, 1u, 0u}) {
         const unsigned which = candidate / 2; const char* suffix = candidate % 2 ? ".bak" : "";
         StoredRecordHeader current;
-        const auto error = inspect(key, which, suffix, document, current);
+        bool parsed = false;
+        const auto error = inspect(key, which, suffix, document, current, &parsed);
+        if (parsed) loaded = int(candidate); // Even an invalid parse replaces scratch.
         if (error != Error::None) {
             // An unreadable candidate may have a newer revision. Do not build
             // a mutation on an older mirror merely because memory/I/O failed.
@@ -218,10 +225,17 @@ Error MessageTransactions::load(const RecordKey& key, MessageDocument& document,
             continue;
         }
         if (candidate % 2 == 0) { primaryValid[which] = true; primaryRevision[which] = current.revision; }
-        else if (primaryValid[which] && current.revision > primaryRevision[which]) _preferBackup |= uint8_t(1u << which);
-        if (best < 0 || current.revision > revision) { best = int(candidate); revision = current.revision; }
+        else { backupValid[which] = true; backupRevision[which] = current.revision; }
+        if (best < 0 || current.revision > revision ||
+            (current.revision == revision && int(candidate) < best)) {
+            best = int(candidate); revision = current.revision; header = current;
+        }
     }
     if (best < 0) return failure;
+    for (unsigned which = 0; which < 2; ++which)
+        if (primaryValid[which] && backupValid[which] && backupRevision[which] > primaryRevision[which])
+            _preferBackup |= uint8_t(1u << which);
+    if (loaded == best) return Error::None;
     return inspect(key, unsigned(best) / 2, best % 2 ? ".bak" : "", document, header);
 }
 
@@ -500,8 +514,9 @@ static void conversationPreview(ConversationView& row, const char* content, size
 }
 
 Error MessageTransactions::summarize(const uint8_t peer[16], ConversationView& row, ConversationSelector& selector,
-    RecentIds* recent, size_t recentCapacity) {
+    RecentIds* recent, size_t recentCapacity, uint32_t* latestRevision) {
     row = {}; selector = {};
+    if (latestRevision) *latestRevision = 0;
     memcpy(row.peer, peer, 16); memcpy(selector.cursor.peer, peer, 16);
     Cursor cursor; beginRecords(cursor, peer);
     MessageDocument document; StoredRecordHeader header; RecordKey key;
@@ -511,6 +526,7 @@ Error MessageTransactions::summarize(const uint8_t peer[16], ConversationView& r
         if (row.totalCount < UINT32_MAX) ++row.totalCount;
         if (!selector.counter || historyLess({selector.counter, bool(selector.incoming)}, {key.counter, key.incoming})) {
             selector.counter = key.counter; selector.incoming = key.incoming;
+            if (latestRevision) *latestRevision = header.revision;
             selector.cursor.timestamp = row.timestamp = header.timestamp;
             row.flags = (row.flags & ~ConversationView::LastIncoming) | (header.incoming ? ConversationView::LastIncoming : 0);
             const auto content = document.document()["content"].as<JsonString>();
@@ -591,8 +607,16 @@ void MessageTransactions::conversation(const Request& request, uint8_t* bytes, s
         result.error = Error::InvalidRecord; return;
     }
     ConversationView row; ConversationSelector latest;
-    result.error = summarize(request.key.peer, row, latest);
+    uint32_t latestRevision = 0;
+    result.error = summarize(request.key.peer, row, latest, nullptr, 0, &latestRevision);
     if (result.error != Error::None) return;
+    // The normal selector is still the newest record. Its validated preview
+    // and revision are already in the summary; don't open and parse it again.
+    if (latest.counter == request.key.counter && bool(latest.incoming) == request.key.incoming) {
+        if (row.timestamp != request.timestamp) { result.error = Error::Stale; return; }
+        memcpy(bytes, &row, sizeof(row)); result.length = sizeof(row);
+        result.revision = latestRevision; result.outcome = Outcome::Committed; return;
+    }
     MessageDocument document; StoredRecordHeader anchor;
     result.error = load(request.key, document, anchor);
     if (result.error != Error::None) {

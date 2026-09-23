@@ -48,7 +48,7 @@ bool MessageStore::begin(FlashStore* flash, SDStore* sd, bool externalStorageEna
         marker.end();
     }
 #endif
-    if (!transactions().begin(_flash, _sd, _externalStorageEnabled, STORAGE_ASYNC_WRITES != 0)) return false;
+    if (!transactions().begin(_flash, _sd, _externalStorageEnabled, STORAGE_DEFERRED_IO != 0)) return false;
     try {
         if (!loadStartupMetadata()) {
             Serial.println("[MSGSTORE] Initialization deferred: incomplete startup message metadata"); return false;
@@ -57,7 +57,7 @@ bool MessageStore::begin(FlashStore* flash, SDStore* sd, bool externalStorageEna
         releaseStartupSeeds();
         Serial.println("[MSGSTORE] Initialization deferred: insufficient memory"); return false;
     }
-    return _writeQueue.begin(transactions(), STORAGE_ASYNC_WRITES ? WriteQueue::Execution::Deferred : WriteQueue::Execution::Immediate);
+    return _writeQueue.begin(transactions(), STORAGE_DEFERRED_IO ? WriteQueue::Execution::Deferred : WriteQueue::Execution::Immediate);
 }
 
 int MessageStore::messageCount(const std::string& peer) const {
@@ -73,7 +73,7 @@ int MessageStore::messageCount(const std::string& peer) const {
 
 bool MessageStore::updateMessageStatus(const std::string& peer, double timestamp, bool incoming, LXMFStatus status) {
     handheld::assertDeviceOwner();
-#if STORAGE_ASYNC_WRITES
+#if STORAGE_DEFERRED_IO
     (void)peer; (void)timestamp; (void)incoming; (void)status;
     Serial.println("[MSGSTORE] Deferred status requires a stable record ticket"); return false;
 #else

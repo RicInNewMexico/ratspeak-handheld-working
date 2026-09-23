@@ -241,34 +241,9 @@ void LvMessageView::createUI(lv_obj_t* parent) {
         self->goBack();
     }, LV_EVENT_CLICKED, this);
 
-    _historyBar = lv_obj_create(parent);
-    lv_obj_set_size(_historyBar, lv_pct(100), 23);
-    makeTransparent(_historyBar);
-    lv_obj_set_style_pad_left(_historyBar, 3, 0);
-    lv_obj_set_style_pad_column(_historyBar, 3, 0);
-    lv_obj_set_flex_flow(_historyBar, LV_FLEX_FLOW_ROW);
-    for (size_t i = 0; i < 4; ++i) {
-        auto* button = _historyButtons[i] = lv_btn_create(_historyBar);
-        lv_obj_set_size(button, i == 2 ? 61 : i == 3 ? 39 : 53, 20);
-        lv_obj_add_style(button, LvTheme::styleBtn(), 0);
-        lv_obj_set_style_pad_all(button, 0, 0);
-        lv_obj_set_user_data(button, (void*)(uintptr_t)i);
-        lv_obj_add_event_cb(button, [](lv_event_t* e) {
-            auto* self = static_cast<LvMessageView*>(lv_event_get_user_data(e));
-            self->historyAction(uintptr_t(lv_obj_get_user_data(lv_event_get_target(e))));
-        }, LV_EVENT_CLICKED, this);
-        _historyLabels[i] = lv_label_create(button);
-        lv_obj_set_style_text_font(_historyLabels[i], &lv_font_rsdeck_10, 0);
-        lv_obj_center(_historyLabels[i]);
-    }
-    _historyStateLabel = lv_label_create(_historyBar);
-    lv_obj_set_flex_grow(_historyStateLabel, 1);
-    lv_label_set_long_mode(_historyStateLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(_historyStateLabel, &lv_font_rsdeck_10, 0);
-    lv_obj_set_style_text_color(_historyStateLabel, lv_color_hex(Theme::TEXT_SECONDARY), 0);
-
     // Message scroll area (middle, grows to fill)
     _msgScroll = lv_obj_create(parent);
+    lv_obj_clear_flag(_msgScroll, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_set_width(_msgScroll, lv_pct(100));
     lv_obj_set_flex_grow(_msgScroll, 1);
     lv_obj_set_style_bg_color(_msgScroll, lv_color_hex(Theme::BG), 0);
@@ -282,8 +257,61 @@ void LvMessageView::createUI(lv_obj_t* parent) {
     lv_obj_add_style(_msgScroll, LvTheme::styleScrollbar(), LV_PART_SCROLLBAR);
 
     lv_obj_add_event_cb(_msgScroll, [](lv_event_t* e) {
-        static_cast<LvMessageView*>(lv_event_get_user_data(e))->saveScroll(true);
-    }, LV_EVENT_SCROLL, this);
+        auto* self = static_cast<LvMessageView*>(lv_event_get_user_data(e));
+        const auto code = lv_event_get_code(e);
+        if (code == LV_EVENT_GESTURE && self->boundWindow() &&
+            lv_obj_get_scroll_y(self->_msgScroll) <= 0 && lv_obj_get_scroll_bottom(self->_msgScroll) <= 1) {
+            // A short final page has no scroll overflow, so LVGL reports a
+            // gesture instead. It must still reach the adjacent history page.
+            auto* input = lv_indev_get_act();
+            if (input && lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER) {
+                const auto direction = lv_indev_get_gesture_dir(input);
+                if (direction == LV_DIR_BOTTOM) self->historyAction(0);
+                else if (direction == LV_DIR_TOP) self->historyAction(1);
+            }
+        } else if (code == LV_EVENT_SCROLL_BEGIN) {
+            auto* input = lv_indev_get_act();
+            // Elastic rebound emits nested animation begin/end events. Only
+            // the input-owned scroll starts a gesture; keep its original peak.
+            if (!self->_touchScrolling && !self->_binding && !lv_event_get_param(e) &&
+                input && lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER &&
+                lv_indev_get_scroll_obj(input) == self->_msgScroll) {
+                self->_touchScrolling = true;
+                self->_touchScrollStart = lv_obj_get_scroll_y(self->_msgScroll);
+                self->_touchScrollPeak = 0;
+            }
+        } else if (code == LV_EVENT_SCROLL) {
+            if (self->_touchScrolling) {
+                const auto delta = lv_obj_get_scroll_y(self->_msgScroll) - self->_touchScrollStart;
+                // Keep the gesture direction through LVGL's elastic rebound.
+                if (std::abs(delta) > std::abs(self->_touchScrollPeak)) self->_touchScrollPeak = delta;
+            }
+            self->saveScroll(self->_touchScrolling);
+        } else if (code == LV_EVENT_SCROLL_END && self->_touchScrolling && lv_event_get_param(e)) {
+            self->_touchScrolling = false;
+            if (!self->boundWindow()) return;
+            self->saveScroll(true);
+            if (self->_touchScrollPeak < -8 && lv_obj_get_scroll_y(self->_msgScroll) <= 0)
+                self->historyAction(0);
+            else if (self->_touchScrollPeak > 8 && lv_obj_get_scroll_bottom(self->_msgScroll) <= 1)
+                self->historyAction(1);
+        }
+    }, LV_EVENT_ALL, this);
+
+    // A notice only occupies space when new arrivals or a failed read need an
+    // action. Ordinary history navigation follows touch/wheel scrolling.
+    _historyNotice = lv_btn_create(parent);
+    lv_obj_set_size(_historyNotice, lv_pct(100), 28);
+    lv_obj_add_style(_historyNotice, LvTheme::styleBtn(), 0);
+    lv_obj_set_style_pad_all(_historyNotice, 0, 0);
+    lv_obj_add_flag(_historyNotice, LV_OBJ_FLAG_HIDDEN);
+    _historyNoticeLabel = lv_label_create(_historyNotice);
+    lv_obj_set_style_text_font(_historyNoticeLabel, &lv_font_rsdeck_12, 0);
+    lv_obj_center(_historyNoticeLabel);
+    lv_obj_add_event_cb(_historyNotice, [](lv_event_t* e) {
+        auto* self = static_cast<LvMessageView*>(lv_event_get_user_data(e));
+        self->historyAction(self->_noticeAction);
+    }, LV_EVENT_CLICKED, this);
 
     // Input row (bottom, just above tab bar)
     _inputRow = lv_obj_create(parent);
@@ -391,6 +419,7 @@ void LvMessageView::clearMessages() {
     if (_msgScroll) lv_obj_clean(_msgScroll);
     _statusLabels.fill(nullptr); _textLabels.fill(nullptr);
     _bubbleBoxes.fill(nullptr); _readButtons.fill(nullptr);
+    _emptyLabel = nullptr; _touchScrolling = false;
     _rowCount = 0; _lastHistoryRevision = 0; _lastStatusRevision = 0;
     _boundMode = HistoryWindow::Mode::Closed; _boundIdentity = 0;
     _binding = false;
@@ -484,29 +513,39 @@ void LvMessageView::updateHistoryFocus() {
 }
 
 void LvMessageView::updateHistoryControls() {
-    if (!_historyStateLabel || !_service) return;
+    if (!_historyNotice || !_service) return;
     auto& window = _service->historyWindow();
-    const bool matches = windowMatches(), visible = matches && window.visible();
-    const bool full = window.mode() == HistoryWindow::Mode::Full;
-    const char* labels[] = {full ? "Prev" : "Older", full ? "Next" : "Newer",
-                            full ? "Back" : window.newBelow() ? "Newest *" : "Newest", "Retry"};
-    const bool enabled[] = {boundWindow() && window.canOlder(), boundWindow() && window.canNewer(),
-                            matches, matches};
-    for (size_t i = 0; i < 4; ++i) {
-        lv_label_set_text(_historyLabels[i], labels[i]);
-        if (enabled[i]) lv_obj_clear_state(_historyButtons[i], LV_STATE_DISABLED);
-        else lv_obj_add_state(_historyButtons[i], LV_STATE_DISABLED);
+    const bool matches = windowMatches();
+    const bool ready = matches && window.visible() && window.statusReady();
+    const char* notice = nullptr;
+    _noticeAction = 3;
+    if (matches && window.state() != HistoryWindow::State::Exhausted) {
+        if (window.error() == HistoryWindow::Error::Busy) notice = "Storage busy; retry";
+        else if (window.error() != HistoryWindow::Error::None) notice = "Read failed; retry";
+        else if (!window.freshnessAvailable()) notice = "Updates unavailable; refresh";
+        else if (ready && window.newBelow() && window.mode() == HistoryWindow::Mode::Chat) {
+            notice = "New messages"; _noticeAction = 2;
+        }
     }
-    const char* state = "";
-    if (!matches) state = "Loading...";
-    else if (window.state() == HistoryWindow::State::Exhausted) state = "Reopen chat";
-    else if (window.error() == HistoryWindow::Error::Busy) state = "Busy; retrying";
-    else if (window.error() != HistoryWindow::Error::None) state = "Read failed";
-    else if (!window.freshnessAvailable()) state = "Updates unknown";
-    else if (!visible || !window.statusReady() || window.loading()) state = "Loading...";
-    else if (!window.spanCount()) state = "No messages";
-    else if (full) state = "Full text";
-    lv_label_set_text(_historyStateLabel, state);
+    if (notice) {
+        if (strcmp(lv_label_get_text(_historyNoticeLabel), notice)) lv_label_set_text(_historyNoticeLabel, notice);
+        lv_obj_clear_flag(_historyNotice, LV_OBJ_FLAG_HIDDEN);
+    } else lv_obj_add_flag(_historyNotice, LV_OBJ_FLAG_HIDDEN);
+
+    if (!_rowCount) {
+        if (!_emptyLabel) {
+            _emptyLabel = lv_label_create(_msgScroll);
+            lv_obj_add_flag(_emptyLabel, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_style_text_font(_emptyLabel, &lv_font_rsdeck_12, 0);
+            lv_obj_set_style_text_color(_emptyLabel, lv_color_hex(Theme::TEXT_MUTED), 0);
+            lv_obj_set_style_text_align(_emptyLabel, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(_emptyLabel);
+        }
+        const char* text = matches && window.state() == HistoryWindow::State::Exhausted ? "Reopen conversation" :
+            matches && window.error() != HistoryWindow::Error::None ? "Messages unavailable" :
+            !ready || window.loading() ? "Loading messages..." : "No messages yet";
+        if (strcmp(lv_label_get_text(_emptyLabel), text)) lv_label_set_text(_emptyLabel, text);
+    }
 }
 
 void LvMessageView::destroyUI() {
@@ -514,8 +553,7 @@ void LvMessageView::destroyUI() {
     clearMessages();
     if (_service) _service->historyWindow().acknowledgePublication(_service->historyWindow().revision());
     _header = _lblHeader = _lblHeaderMeta = _msgScroll = nullptr;
-    _historyBar = _historyStateLabel = nullptr;
-    _historyButtons.fill(nullptr); _historyLabels.fill(nullptr);
+    _historyNotice = _historyNoticeLabel = _emptyLabel = nullptr;
     _inputRow = _textarea = _btnSend = nullptr;
     for (size_t i = 0; i < 3; ++i) { _sendRows[i] = nullptr; _sendLabels[i] = nullptr; }
     LvScreen::destroyUI();
@@ -706,12 +744,6 @@ void LvMessageView::rebuildMessages() {
     clearMessages(); _binding = true;
     _rowCount = window.spanCount();
     for (size_t i = 0; i < _rowCount; ++i) appendMessage(i, *window.span(i), window.text(i));
-    if (!_rowCount) {
-        auto* label = lv_label_create(_msgScroll);
-        lv_label_set_text(label, "No messages yet");
-        lv_obj_set_style_text_font(label, &lv_font_rsdeck_12, 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(Theme::TEXT_MUTED), 0);
-    }
     lv_obj_update_layout(_msgScroll);
     for (size_t i = 0; i < _rowCount; ++i)
         lv_obj_set_height(lv_obj_get_parent(_bubbleBoxes[i]), lv_obj_get_height(_bubbleBoxes[i]));
@@ -896,6 +928,9 @@ bool LvMessageView::handleKey(const KeyEvent& event) {
         // The Pager has no Tab key or touch. An empty composer lets a wheel
         // click enter Read full selection; typing returns to composing.
         if (_inputText.empty()) {
+            if (_historyNotice && !lv_obj_has_flag(_historyNotice, LV_OBJ_FLAG_HIDDEN)) {
+                historyAction(_noticeAction); return true;
+            }
             focusNextRead();
             if (hasReadFocus() && _ui)
                 _ui->lvStatusBar().showToast("Wheel: select  Enter: read  Back: cancel", 2000);

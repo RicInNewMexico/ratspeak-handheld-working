@@ -113,13 +113,17 @@ template<size_t N> void ConversationWindow<N>::setViewportAtFirst(bool atTop) {
     const bool follow = atTop && !canPrevious();
     if (follow == c.followFirst) return;
     c.followFirst = follow;
-    if (follow) c.updated = false;
     if (((c.phase == Phase::Page || c.phase == Phase::Detail) && c.buildingIntent == Intent::Refresh) ||
         c.intent == Intent::Refresh) {
         if (!changeView()) return;
-        c.intent = Intent::None; c.state = State::Ready; c.updated = true;
+        c.intent = follow ? Intent::Refresh : Intent::None;
+        c.state = follow ? State::Loading : State::Ready; c.updated = true;
         if (!c.awaiting) c.phase = Phase::Idle;
     }
+    // Returning to the top resumes updates missed while browsing. Clearing the
+    // indicator alone would leave the old preview until another store mutation.
+    if (follow && freshnessAvailable() &&
+        (c.updated || live().info.value.sourceRevision != c.observedRevision)) refresh();
 }
 template<size_t N> void ConversationWindow<N>::acknowledgePublication(uint32_t revision) {
     if (revision == _control.value.publication) _control.value.held = false;
@@ -201,6 +205,9 @@ template<size_t N> void ConversationWindow<N>::rejected(uint32_t nonce, storage:
     if (!c.awaiting || c.copied || c.owner.valid() || nonce != c.nonce) return;
     c.awaiting = false;
     if (c.pendingView != c.view) { c.phase = Phase::Idle; return; }
+    // No ticket was accepted. Keep this exact page/detail/status position and
+    // try on the next owner tick rather than imposing an I/O failure backoff.
+    if (reason == storage::Rejection::Busy) return;
     if (c.phase == Phase::Status) {
         unavailableStatus(storage::Error::Unavailable); ++c.index; c.statusFailed = true; return;
     }

@@ -208,8 +208,10 @@ void MessageView::render(M5Canvas& canvas) {
     });
     if (!_history.spanCount()) {
         canvas.setTextColor(Theme::TEXT_SECONDARY);
-        canvas.drawString(_history.state() == History::State::Retrying ? "Read failed; retrying..." :
-                          _history.loading() ? "Loading messages..." : "No messages yet", 2, chatY);
+        const char* text = _history.state() == History::State::Retrying ? "Read failed; retrying..." :
+                           _history.loading() ? "Loading messages..." : "No messages yet";
+        canvas.drawString(text, (Theme::CONTENT_W - canvas.textWidth(text)) / 2,
+                          chatY + (inputY - chatY - Theme::CHAR_H) / 2);
     }
     if (_history.newBelow()) {
         canvas.setTextColor(Theme::WARNING);

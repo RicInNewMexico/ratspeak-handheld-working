@@ -194,7 +194,7 @@ bool MessageStore::consumeImmediate(Submission submission, Result& result) {
 }
 
 bool MessageStore::saveMessage(LXMFMessage& message) {
-#if STORAGE_ASYNC_WRITES
+#if STORAGE_DEFERRED_IO
     (void)message;
     Serial.println("[MSGSTORE] Deferred save requires requestSave/ticket settlement");
     return false;
@@ -206,7 +206,7 @@ bool MessageStore::saveMessage(LXMFMessage& message) {
 }
 
 bool MessageStore::deleteConversation(const std::string& peer) {
-#if STORAGE_ASYNC_WRITES
+#if STORAGE_DEFERRED_IO
     (void)peer; Serial.println("[MSGSTORE] Deferred delete requires requestDelete/ticket settlement"); return false;
 #else
     Result result; return consumeImmediate(requestDelete(peer), result);
@@ -214,7 +214,7 @@ bool MessageStore::deleteConversation(const std::string& peer) {
 }
 
 bool MessageStore::markConversationRead(const std::string& peer) {
-#if STORAGE_ASYNC_WRITES
+#if STORAGE_DEFERRED_IO
     (void)peer; Serial.println("[MSGSTORE] Deferred read marker requires requestMarkRead/ticket settlement"); return false;
 #else
     Result result; return consumeImmediate(requestMarkRead(peer), result);
@@ -223,7 +223,7 @@ bool MessageStore::markConversationRead(const std::string& peer) {
 
 bool MessageStore::updateMessageStatusByCounter(const std::string& peer, uint32_t counter,
                                                bool incoming, LXMFStatus status) {
-#if STORAGE_ASYNC_WRITES
+#if STORAGE_DEFERRED_IO
     (void)peer; (void)counter; (void)incoming; (void)status;
     Serial.println("[MSGSTORE] Deferred status requires requestStatus/ticket settlement"); return false;
 #else

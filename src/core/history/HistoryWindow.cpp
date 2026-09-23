@@ -254,6 +254,7 @@ void HistoryWindow::rejected(uint32_t nonce, storage::Rejection reason, uint32_t
     if (!c.awaiting || c.copied || c.owner.valid() || nonce != c.query) return;
     c.awaiting = false;
     if (c.pendingView != c.view) { c.phase = Phase::Idle; return; }
+    if (reason == storage::Rejection::Busy) return;
     if (c.phase == Phase::Status) {
         statusUnavailable({span(c.buildIndex)->counter, false}, storage::Error::Unavailable);
         ++c.buildIndex; c.statusFailed = true;

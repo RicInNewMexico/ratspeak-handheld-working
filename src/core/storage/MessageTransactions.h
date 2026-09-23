@@ -42,7 +42,7 @@ public:
     // Shared aggregate semantics. Optional bounded startup hints
     // run on the boot owner only; ordinary queries pass no heap-owning outputs.
     Error summarize(const uint8_t peer[16], ConversationView&, ConversationSelector&,
-        RecentIds* recent = nullptr, size_t recentCapacity = 0);
+        RecentIds* recent = nullptr, size_t recentCapacity = 0, uint32_t* latestRevision = nullptr);
 
 private:
     struct Medium {
@@ -61,7 +61,8 @@ private:
     void directory(const uint8_t peer[16], unsigned medium, char output[96]) const;
     Error openDirectory(unsigned medium, const char* path, bool required, File&);
     static bool filename(const char*, uint32_t&, bool&);
-    Error inspect(const RecordKey&, unsigned medium, const char* suffix, MessageDocument&, StoredRecordHeader&);
+    Error inspect(const RecordKey&, unsigned medium, const char* suffix, MessageDocument&, StoredRecordHeader&,
+                  bool* parsed = nullptr);
     Error commit(const RecordKey&, MessageDocument&, bool creating, Result&);
     void create(const Request&, uint8_t*, Result&);
     void update(const Request&, Result&);

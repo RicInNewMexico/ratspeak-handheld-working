@@ -158,7 +158,7 @@ struct Budget {
     static constexpr size_t JsonAllocator = 7168;
     static constexpr size_t IoScratch = 1024;
     static constexpr size_t WorkerStack = 8192;
-    static constexpr size_t RtosBookkeeping = 640; // Card worker queue/task costs and reserve
+    static constexpr size_t RtosBookkeeping = 640; // Worker queue/task costs and reserve
     // Both profiles: MessageStore state216 + queue metadata56 + FS mutex84,
     // plus156 bytes for allocator/descriptor reserve (measured Xtensa sizes).
     static constexpr size_t StoreBookkeeping = 512;
@@ -179,7 +179,7 @@ struct Budget {
     }
     static constexpr size_t storageWorkingSet(bool cardputer) {
         return (cardputer ? CardPayloadBytes : LargeBoardPayloadBytes) + SlotCeiling +
-               JsonAllocator + IoScratch + StoreBookkeeping + (cardputer ? WorkerStack + RtosBookkeeping : 0) +
+               JsonAllocator + IoScratch + StoreBookkeeping + WorkerStack + RtosBookkeeping +
                IncomingRows + ProofContexts;
     }
     static constexpr bool canReserveLegacy(size_t freeBytes, size_t largestBlock) {
@@ -190,7 +190,7 @@ struct Budget {
 static_assert(sizeof(Slot) <= 256, "Storage slot descriptor/result exceeds its byte budget");
 static_assert(Budget::SlotBytes <= Budget::SlotCeiling, "Storage slots exceed their pool budget");
 static_assert(Budget::storageWorkingSet(true) == 26944, "Review Cardputer storage budget changes");
-static_assert(Budget::storageWorkingSet(false) == 28864, "Review Deck/Pager storage budget changes");
+static_assert(Budget::storageWorkingSet(false) == 37696, "Review Deck/Pager storage budget changes");
 static_assert(Budget::MaxNewJson <= Budget::MaxJsonFile, "New records must fit the retained schema");
 static_assert(std::is_trivially_copyable<Request>::value && std::is_trivially_copyable<Result>::value,
               "Storage requests/results cannot retain heap or callback ownership");

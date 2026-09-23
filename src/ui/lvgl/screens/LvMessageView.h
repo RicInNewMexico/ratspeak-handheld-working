@@ -89,9 +89,12 @@ private:
     lv_obj_t* _lblHeader = nullptr;
     lv_obj_t* _lblHeaderMeta = nullptr;
     lv_obj_t* _msgScroll = nullptr;
-    lv_obj_t* _historyBar = nullptr;
-    lv_obj_t* _historyStateLabel = nullptr;
-    std::array<lv_obj_t*, 4> _historyButtons{}, _historyLabels{};
+    lv_obj_t* _historyNotice = nullptr;
+    lv_obj_t* _historyNoticeLabel = nullptr;
+    lv_obj_t* _emptyLabel = nullptr;
+    bool _touchScrolling = false;
+    int32_t _touchScrollStart = 0, _touchScrollPeak = 0;
+    unsigned _noticeAction = 3;
     lv_obj_t* _inputRow = nullptr;
     lv_obj_t* _textarea = nullptr;
     lv_obj_t* _btnSend = nullptr;

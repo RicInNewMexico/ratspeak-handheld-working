@@ -8,6 +8,7 @@
 #include "util/Bytes.h"
 #include "config/Timezones.h"
 #include "storage/MessageRecord.h"
+#include "storage/StorageLease.h"
 #include <esp_heap_caps.h>
 #include <cassert>
 #include <cstring>
@@ -270,9 +271,14 @@ void DeviceService::refreshStatus() {
     _status.flash = _flash.isReady();
     _status.sd = _sd.isReady();
     if (!_lastStorageStatus || _lastStatus - _lastStorageStatus >= 5000) {
-        _lastStorageStatus = _lastStatus;
-        _status.flashUsed = _flash.usedBytes();
-        _status.flashTotal = _flash.totalBytes();
+        storage::StorageLease lease;
+        // The storage worker may own a long scan. Preserve the last sample
+        // until it finishes; lease contention is not an empty filesystem.
+        if (lease.held()) {
+            _lastStorageStatus = _lastStatus;
+            _status.flashUsed = _flash.usedBytes();
+            _status.flashTotal = _flash.totalBytes();
+        }
     }
     if (_owner) _status.stackFree = uxTaskGetStackHighWaterMark(_owner);
     strlcpy(_status.identity, _backend.identityHash().c_str(), sizeof(_status.identity));
@@ -682,7 +688,11 @@ void DeviceService::pollHistory() {
         _messages.requestRecord(key, request.operation == Operation::HistoryStatus ? 0 : request.offset,
             request.operation == Operation::HistoryStatus ? sizeof(storage::StoredRecordHeader) : 512);
     if (submitted.accepted()) { _queryTicket = submitted.ticket; return; }
-    if (submitted.rejection == storage::Rejection::Busy || submitted.rejection == storage::Rejection::NoMemory) {
+    // Busy means another bounded ticket owns the slot. Poll admission again
+    // after owner settlement; a one-second timer here delays ordinary reads
+    // even when that slot is released on the very next service tick.
+    if (submitted.rejection == storage::Rejection::Busy) return;
+    if (submitted.rejection == storage::Rejection::NoMemory) {
         _queryRetryAt = millis() + 1000; return;
     }
     const auto slot = _querySlot; _querySlot = ServiceMailbox::NoSlot;

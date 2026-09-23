@@ -53,7 +53,12 @@
 #define ANNOUNCE_MAX_GLOBAL_PER_SEC  10
 #endif
 #ifndef STORAGE_ASYNC_WRITES
-#define STORAGE_ASYNC_WRITES         0     // 1 = MessageStore writes via WriteQueue task
+#define STORAGE_ASYNC_WRITES         0     // Legacy compact Cardputer storage/memory profile
+#endif
+#ifndef STORAGE_DEFERRED_IO
+// Firmware enables the existing worker for both memory profiles. Keep the
+// immediate executor available to host tests and explicit diagnostic builds.
+#define STORAGE_DEFERRED_IO          STORAGE_ASYNC_WRITES
 #endif
 #ifndef USERCONFIG_NVS_BACKUP
 #define USERCONFIG_NVS_BACKUP        0     // 1 = mirror full user config JSON to NVS (ns NVS_NS_CFG)

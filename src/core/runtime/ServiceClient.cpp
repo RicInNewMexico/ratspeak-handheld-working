@@ -211,6 +211,8 @@ void ServiceClient::closeHistory() {
 }
 
 void ServiceClient::requestHistory() {
+    if (_conversationWindow.state() == history::ConversationWindow<64>::State::Closed &&
+        _conversationWindow.ownerTicket().valid()) return;
     const auto query = _history.next(millis());
     using Window = history::HistoryWindow;
     if (query.kind == Window::Kind::None) return;
@@ -228,6 +230,9 @@ void ServiceClient::watchConversations() { _conversationWindow.resume(_status.ge
 void ServiceClient::closeConversations() { _conversationWindow.close(); }
 
 void ServiceClient::requestConversationWindow() {
+    // A hidden chat still owns its accepted read until the mailbox releases it.
+    // Let that credit retire before asking the shared reader for the list.
+    if (_history.state() == history::HistoryWindow::State::Closed && _history.ownerTicket().valid()) return;
     using Window = history::ConversationWindow<64>;
     const auto query = _conversationWindow.next(millis());
     if (query.kind == Window::Kind::None) return;
