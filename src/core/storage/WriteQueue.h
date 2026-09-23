@@ -47,6 +47,7 @@ public:
         bytes = sampled;
         return true;
     }
+    bool deferred() const { return _execution == Execution::Deferred; }
     bool accepting() const { assertOwner(); return _accepting; }
     int drainCount() const { assertOwner(); return _outstanding; }
     bool isFull() const;

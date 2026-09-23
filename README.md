@@ -17,8 +17,8 @@ T-Deck Plus, T-Pager and Cardputer Adv. Its Rust core uses rsReticulumLite and
 rsLXMFLite, with shared C++ storage, transport and device services. T-Deck and
 T-Pager share the LVGL interface; Cardputer uses a compact Canvas interface.
 
-Version **2.2.0** brings the unified beta to all three devices. See the
-[release notes](https://github.com/ratspeak/ratspeak-handheld/releases/tag/v2.2.0)
+Version **2.2.1** improves conversations, saved-message reads and delivery recovery. See the
+[release notes](https://github.com/ratspeak/ratspeak-handheld/releases/tag/v2.2.1)
 for changes and download the package for your device and preferred mode.
 
 ## Devices

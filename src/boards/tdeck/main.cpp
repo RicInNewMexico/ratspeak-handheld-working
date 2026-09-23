@@ -1309,7 +1309,7 @@ static void serviceNetworkPoll() {
     // This callback runs only after successful storage/Service owner adoption.
     // Claim once before persistence; Failed startup must retain its boot count.
     static bool successRecorded = false;
-    if (!successRecorded) {
+    if (!successRecorded && backend->pollRadioBeforeBlockingWork()) {
         successRecorded = true;
         Preferences prefs;
         bool saved = false;
@@ -1322,7 +1322,7 @@ static void serviceNetworkPoll() {
 #if HAS_GPS
     if (gps.isRunning()) gps.loop();
 #endif
-    diagnostics.poll();
+    if (backend->pollRadioBeforeBlockingWork()) diagnostics.poll();
     // Poll protocol/radio no more often than every 10 ms; owner work can delay a poll.
     unsigned long rnsDuration = 0;
     {
@@ -1337,12 +1337,10 @@ static void serviceNetworkPoll() {
     }
 
 
-    if (!backend->pollRadioBeforeBlockingWork()) return;
-    if (bootComplete) pollScheduledAnnounces();
-    if (!backend->pollRadioBeforeBlockingWork()) return;
+    if (bootComplete && backend->pollRadioBeforeBlockingWork()) pollScheduledAnnounces();
 
-    // Protocol polling owns LXMF; flush deferred announce metadata here.
-    if (announceManager) announceManager->loop();
+    // Metadata persistence can block; TCP/AutoInterface progress below cannot.
+    if (announceManager && backend->pollRadioBeforeBlockingWork()) announceManager->loop();
 
     // The shared owner retains this board's TCP budget and always polls AutoInterface.
     const auto networkEvents = network.poll(userConfig.settings(), rnsDuration,
@@ -1365,7 +1363,7 @@ static void serviceNetworkPoll() {
 
     // Publish sampled diagnostics after network work.
 
-    diagnostics.pollSamples();
+    if (backend->pollRadioBeforeBlockingWork()) diagnostics.pollSamples();
     if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeat = millis();
         const auto& status = deviceService.ownerStatus();

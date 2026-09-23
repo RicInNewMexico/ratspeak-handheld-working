@@ -105,7 +105,16 @@ void DeviceService::notice(const char* text) {
 }
 
 bool DeviceService::readyForCommand() {
-    return !_storageOwnerBound || _backend.pollRadioBeforeBlockingWork();
+    if (!_storageOwnerBound || _backend.pollRadioBeforeBlockingWork()) return true;
+    const auto* request = _mailbox.nextRequest();
+    if (!request || !_messages.deferredIO()) return false;
+    switch (request->operation) {
+        case Operation::Send: case Operation::MarkRead: case Operation::DeleteConversation:
+        case Operation::ConversationPage: case Operation::ConversationDetail:
+        case Operation::HistoryPage: case Operation::ReadRecord: case Operation::HistoryStatus:
+            return true; // Typed worker submissions and result copies only.
+        default: return false; // Settings, contacts and callbacks may write inline.
+    }
 }
 
 void DeviceService::poll() {
@@ -122,26 +131,24 @@ void DeviceService::poll() {
     // Only the reserved explicit recovery result is ours after refusal. The
     // setup owner retains every storage/engine/driver and outstanding credit.
     if (!_storageOwnerBound) return;
-    // Poll TX completion before even entering the storage executor. This also
-    // covers the immediate-I/O profile, where messages.poll can write flash.
-    if (!_backend.pollRadioBeforeBlockingWork()) { pollMaintenance(); return; }
-    // Publish durable completions before protocol or UI consumers observe them.
+    _backend.pollRadioBeforeBlockingWork();
+    // Settlement only publishes completed worker results; it never performs I/O.
+    // Keep it and network polling live while an independent radio is busy.
     _messages.poll();
     // Observe UI cancellation before the pump can start another queued frame.
     pollSends();
     if (_status.state == ServiceState::Running && pollNetwork) pollNetwork();
     else if (!_maintenance.accepting() && pollSettlements) pollSettlements();
-    // Network/protocol work can have started a fresh asynchronous TX above.
-    if (!_backend.pollRadioBeforeBlockingWork()) { pollMaintenance(); return; }
     pollSends();
     pollStorageWrites();
-    pollSettings();
-    if (_status.state == ServiceState::Running && millis() - _lastIdentityRetry >= 30000) {
+    if (_backend.pollRadioBeforeBlockingWork()) pollSettings();
+    if (_status.state == ServiceState::Running && millis() - _lastIdentityRetry >= 30000 &&
+        _backend.pollRadioBeforeBlockingWork()) {
         _lastIdentityRetry = millis();
         if (!_identities.flushPending()) notice("Identity metadata save failed; retry pending");
         if (!_config.flushPending(_sd, _flash)) notice("Settings saved on device; backup retry pending");
     }
-    pollHistory();
+    if (_backend.pollRadioBeforeBlockingWork() || _messages.deferredIO()) pollHistory();
     if (_scanSlot != ServiceMailbox::NoSlot && finishScan) {
         String json;
         const auto scan = finishScan(json);

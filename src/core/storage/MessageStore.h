@@ -81,6 +81,7 @@ public:
     bool historyRevisionExhausted() const { return _historyRevision == UINT32_MAX; }
 
     // Diagnostics accessor (HEART writeQ token)
+    bool deferredIO() const { return _writeQueue.deferred(); }
     WriteQueue& writeQueue() { return _writeQueue; }
 
 private:

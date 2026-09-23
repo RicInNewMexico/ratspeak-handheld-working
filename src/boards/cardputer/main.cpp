@@ -915,7 +915,7 @@ void loop() {
     // Keep the cooperative UI running, but service TX completion before
     // background storage/settings work can occupy the radio owner.
     const bool radioReady = backend->pollRadioBeforeBlockingWork();
-    if (radioReady) messageStore.poll();
+    messageStore.poll(); // Completed result settlement never performs storage I/O.
     M5.update();
     if (radioReady) { pollCardSettings(); pollCardRadioSettings(); }
     if (maintenance.accepting() && radioReady) {
@@ -980,7 +980,7 @@ void loop() {
         backend->loop();
         rnsDuration = millis() - rnsStart;
     }
-    if (backend->pollRadioBeforeBlockingWork()) {
+    if (backend->pollRadioBeforeBlockingWork() || messageStore.deferredIO()) {
         if (messageView.pollSubmission()) ui.markContentDirty();
         if (messageView.pollReadMarker()) ui.markContentDirty();
         if (settingsScreen.pollNetworkResults()) ui.markContentDirty();

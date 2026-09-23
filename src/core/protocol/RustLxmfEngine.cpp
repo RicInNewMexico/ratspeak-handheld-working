@@ -694,19 +694,20 @@ void RustLxmfEngine::advance(Ticket ticket) {
     }
 }
 void RustLxmfEngine::loop() {
-    if (_polling || (_d.pump && !_d.pump->pollRadioBeforeBlockingWork())) return;
+    if (_polling) return;
+    if (_d.pump) _d.pump->pollRadioBeforeBlockingWork();
     _polling = true;
     _incoming.poll();
-    if (_d.pump && !_d.pump->pollRadioBeforeBlockingWork()) { _polling = false; return; }
     if (!_d.store || !_d.clock) { _polling = false; return; }
     _d.store->poll();
     for (uint8_t i = 0; i < RowCount; ++i) settleStorage({_rows[i].generation, i});
     // One bounded attempt/read/status admission per selected row. A rotating
     // cursor gives backpressured and failed work the same finite loop budget.
     for (uint8_t processed = 0; processed < 3; ++processed) {
-        // An earlier row can start TX. Leave subsequent status/read writes for
-        // the next radio-ready pass, including the immediate storage profile.
-        if (_d.pump && !_d.pump->pollRadioBeforeBlockingWork()) break;
+        // Settlement above only consumes completed results. New requests may
+        // run inline in the fallback executor; only those need an idle modem.
+        // The normal worker keeps healthy interfaces moving during LoRa TX.
+        if (_d.pump && !_d.pump->pollRadioBeforeBlockingWork() && !_d.store->deferredIO()) break;
         const uint8_t index = _cursor; _cursor = (_cursor + 1) % RowCount;
         advance({_rows[index].generation, index});
     }

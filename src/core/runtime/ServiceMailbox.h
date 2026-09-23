@@ -83,6 +83,14 @@ public:
         return Admission::Admitted;
     }
 
+    // Service owner: inspect the next immutable FIFO request without consuming
+    // its credit. No later command may bypass one waiting for safe dispatch.
+    const Request* nextRequest() const {
+        const auto head = _readyHead.load(std::memory_order_relaxed);
+        if (head == _readyTail.load(std::memory_order_acquire)) return nullptr;
+        return &_slots[_readySlots[head % NormalSlots]].request;
+    }
+
     // Close normal admission as soon as a lifecycle request is observed, then
     // finish older work before dispatching it. UI result consumption is not a
     // prerequisite for settling a durable mutation.

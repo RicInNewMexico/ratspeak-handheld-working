@@ -371,16 +371,16 @@ void ProtocolRuntime::loop() {
     if (_maintenanceRadio) { pollMaintenance(); return; }
     if (!_ctx || !_nodeOpen) return;
     _pump.loop();
-    if (!pollRadioBeforeBlockingWork()) return;
     // Fire a scheduled path-response re-announce off the ingest callstack once the grace window
     // elapses (fix map §4) — a burst of requests inside the window collapses into this one answer.
-    if ((_announceTiming & PathPending) && int32_t(uint32_t(millis()) - _pathRespPendingUntil) >= 0) {
+    if ((_announceTiming & PathPending) && int32_t(uint32_t(millis()) - _pathRespPendingUntil) >= 0 &&
+        pollRadioBeforeBlockingWork()) {
         _announceTiming &= ~PathPending;
         _pathRespPendingUntil = 0;
         sendPathResponseAnnounce();
     }
-    if (!pollRadioBeforeBlockingWork()) return;
-    if ((_announceTiming & NormalPending) && int32_t(uint32_t(millis()) - _normalAnnouncePendingUntil) >= 0) {
+    if ((_announceTiming & NormalPending) && int32_t(uint32_t(millis()) - _normalAnnouncePendingUntil) >= 0 &&
+        pollRadioBeforeBlockingWork()) {
         _announceTiming &= ~NormalPending;
         _normalAnnouncePendingUntil = 0;
         const uint8_t* app = _normalAnnouncePendingLen ? _lastAppData : nullptr;
@@ -390,10 +390,8 @@ void ProtocolRuntime::loop() {
             _announceTiming |= NormalPending;
         }
     }
-    if (!pollRadioBeforeBlockingWork()) return;
     if (_enginesUp) {
         _lxmf.loop();
-        if (!pollRadioBeforeBlockingWork()) return;
         _links.loop();
         _resources.loop();
     }

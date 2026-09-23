@@ -5,7 +5,8 @@ Fixes and improvements for T-Deck, T-Pager and Cardputer:
 - Remove the permanent conversation toolbar and restore the centered empty state.
 - Improve route discovery and retries when a direct LoRa path stops working.
 - Reject overheard packets addressed to another relay without blocking later delivery.
-- Restore radio reception before slow storage work and improve clock synchronization handling.
+- Keep TCP and chat history moving during LoRa transmission, while protecting reception from slow storage work.
+- Improve GPS and network clock synchronization handling.
 
 Cardputer support remains beta and requires a Cap LoRa-1262 with an antenna.
 
